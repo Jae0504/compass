@@ -1,0 +1,60 @@
+Memory Breakdown Profiling
+========================
+HNSW config: M=32, efConstruction=128
+
+Dataset: hnm
+Rows: 105100
+Metadata included columns: 22/23
+Included column names: colour_group_code, colour_group_name, department_name, department_no, garment_group_name, garment_group_no, graphical_appearance_name, graphical_appearance_no, index_code, index_group_name, index_group_no, index_name, perceived_colour_master_id, perceived_colour_master_name, perceived_colour_value_id, perceived_colour_value_name, product_code, product_group_name, product_type_name, product_type_no, section_name, section_no
+Excluded column names: prod_name
+Raw: total=907350917 bytes
+  HNSW graph=28611224 bytes (3.15%), embedding=860979200 bytes (94.89%), metadata=17760493 bytes (1.96%)
+Binary: total=891902624 bytes
+  HNSW graph=28611224 bytes (3.21%), embedding=860979200 bytes (96.53%), metadata=2312200 bytes (0.26%)
+Compressed(raw): total=891820589 bytes
+  HNSW graph=28611224 bytes (3.21%), embedding=860979200 bytes (96.54%), metadata=2230165 bytes (0.25%)
+Compressed(after binary): total=890828214 bytes
+  HNSW graph=28611224 bytes (3.21%), embedding=860979200 bytes (96.65%), metadata=1237790 bytes (0.14%)
+Column details:
+  colour_group_code: type=int, unique=50, included=True, reason=int unique<=256 mapped, text_bytes=281155
+  colour_group_name: type=string/other, unique=50, included=True, reason=string unique<=256 mapped, text_bytes=891277
+  department_name: type=string/other, unique=250, included=True, reason=string unique<=256 mapped, text_bytes=1485870
+  department_no: type=int, unique=299, included=True, reason=int unique>256 range->0..255, text_bytes=525500
+  garment_group_name: type=string/other, unique=21, included=True, reason=string unique<=256 mapped, text_bytes=1256621
+  garment_group_no: type=int, unique=21, included=True, reason=int unique<=256 mapped, text_bytes=525500
+  graphical_appearance_name: type=string/other, unique=30, included=True, reason=string unique<=256 mapped, text_bytes=976456
+  graphical_appearance_no: type=int, unique=30, included=True, reason=int unique<=256 mapped, text_bytes=840545
+  index_code: type=string/other, unique=10, included=True, reason=string unique<=256 mapped, text_bytes=210200
+  index_group_name: type=string/other, unique=5, included=True, reason=string unique<=256 mapped, text_bytes=1172672
+  index_group_no: type=int, unique=5, included=True, reason=int unique<=256 mapped, text_bytes=213581
+  index_name: type=string/other, unique=10, included=True, reason=string unique<=256 mapped, text_bytes=1550421
+  perceived_colour_master_id: type=int, unique=20, included=True, reason=int unique<=256 mapped, text_bytes=242479
+  perceived_colour_master_name: type=string/other, unique=20, included=True, reason=string unique<=256 mapped, text_bytes=622675
+  perceived_colour_value_id: type=int, unique=8, included=True, reason=int unique<=256 mapped, text_bytes=210228
+  perceived_colour_value_name: type=string/other, unique=8, included=True, reason=string unique<=256 mapped, text_bytes=821272
+  prod_name: type=string/other, unique=45728, included=False, reason=string unique>256, text_bytes=1737721
+  product_code: type=int, unique=47072, included=True, reason=int unique>256 range->0..255, text_bytes=735700
+  product_group_name: type=string/other, unique=19, included=True, reason=string unique<=256 mapped, text_bytes=1729853
+  product_type_name: type=string/other, unique=131, included=True, reason=string unique<=256 mapped, text_bytes=895938
+  product_type_no: type=int, unique=132, included=True, reason=int unique<=256 mapped, text_bytes=402485
+  section_name: type=string/other, unique=56, included=True, reason=string unique<=256 mapped, text_bytes=1863973
+  section_no: type=int, unique=57, included=True, reason=int unique<=256 mapped, text_bytes=306092
+
+Dataset: laion
+Rows: 100000
+Metadata included columns: 3/4
+Included column names: NSFW, original_width, original_height
+Excluded column names: similarity
+Raw: total=233709013 bytes
+  HNSW graph=27220616 bytes (11.65%), embedding=204800000 bytes (87.63%), metadata=1688397 bytes (0.72%)
+Binary: total=232320616 bytes
+  HNSW graph=27220616 bytes (11.72%), embedding=204800000 bytes (88.15%), metadata=300000 bytes (0.13%)
+Compressed(raw): total=232318320 bytes
+  HNSW graph=27220616 bytes (11.72%), embedding=204800000 bytes (88.15%), metadata=297704 bytes (0.13%)
+Compressed(after binary): total=232136690 bytes
+  HNSW graph=27220616 bytes (11.73%), embedding=204800000 bytes (88.22%), metadata=116074 bytes (0.05%)
+Column details:
+  NSFW: type=string/other, unique=10, included=True, reason=string unique<=256 mapped, text_bytes=881605
+  similarity: type=string/other, unique=97798, included=False, reason=string unique>256, text_bytes=1287407
+  original_width: type=int, unique=1674, included=True, reason=int unique>256 range->0..255, text_bytes=404510
+  original_height: type=int, unique=1848, included=True, reason=int unique>256 range->0..255, text_bytes=402282

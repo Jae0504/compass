@@ -1,0 +1,333 @@
+{
+  "hnsw": {
+    "M": 32,
+    "efConstruction": 128
+  },
+  "datasets": [
+    {
+      "name": "hnm",
+      "rows": 105100,
+      "metadata_columns": {
+        "included": 22,
+        "total": 23,
+        "included_names": [
+          "colour_group_code",
+          "colour_group_name",
+          "department_name",
+          "department_no",
+          "garment_group_name",
+          "garment_group_no",
+          "graphical_appearance_name",
+          "graphical_appearance_no",
+          "index_code",
+          "index_group_name",
+          "index_group_no",
+          "index_name",
+          "perceived_colour_master_id",
+          "perceived_colour_master_name",
+          "perceived_colour_value_id",
+          "perceived_colour_value_name",
+          "product_code",
+          "product_group_name",
+          "product_type_name",
+          "product_type_no",
+          "section_name",
+          "section_no"
+        ],
+        "excluded_names": [
+          "prod_name"
+        ]
+      },
+      "sizes": {
+        "raw": {
+          "graph": 28611224,
+          "embedding": 860979200,
+          "metadata": 17760493,
+          "total": 907350917
+        },
+        "binary": {
+          "graph": 28611224,
+          "embedding": 860979200,
+          "metadata": 2312200,
+          "total": 891902624
+        },
+        "compressed_raw": {
+          "graph": 28611224,
+          "embedding": 860979200,
+          "metadata": 2230165,
+          "total": 891820589
+        },
+        "compressed_after_binary": {
+          "graph": 28611224,
+          "embedding": 860979200,
+          "metadata": 1237790,
+          "total": 890828214
+        }
+      },
+      "notes": [],
+      "columns": [
+        {
+          "name": "colour_group_code",
+          "dtype": "int",
+          "unique_count": 50,
+          "included": true,
+          "reason": "int unique<=256 mapped",
+          "text_bytes": 281155
+        },
+        {
+          "name": "colour_group_name",
+          "dtype": "string/other",
+          "unique_count": 50,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 891277
+        },
+        {
+          "name": "department_name",
+          "dtype": "string/other",
+          "unique_count": 250,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 1485870
+        },
+        {
+          "name": "department_no",
+          "dtype": "int",
+          "unique_count": 299,
+          "included": true,
+          "reason": "int unique>256 range->0..255",
+          "text_bytes": 525500
+        },
+        {
+          "name": "garment_group_name",
+          "dtype": "string/other",
+          "unique_count": 21,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 1256621
+        },
+        {
+          "name": "garment_group_no",
+          "dtype": "int",
+          "unique_count": 21,
+          "included": true,
+          "reason": "int unique<=256 mapped",
+          "text_bytes": 525500
+        },
+        {
+          "name": "graphical_appearance_name",
+          "dtype": "string/other",
+          "unique_count": 30,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 976456
+        },
+        {
+          "name": "graphical_appearance_no",
+          "dtype": "int",
+          "unique_count": 30,
+          "included": true,
+          "reason": "int unique<=256 mapped",
+          "text_bytes": 840545
+        },
+        {
+          "name": "index_code",
+          "dtype": "string/other",
+          "unique_count": 10,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 210200
+        },
+        {
+          "name": "index_group_name",
+          "dtype": "string/other",
+          "unique_count": 5,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 1172672
+        },
+        {
+          "name": "index_group_no",
+          "dtype": "int",
+          "unique_count": 5,
+          "included": true,
+          "reason": "int unique<=256 mapped",
+          "text_bytes": 213581
+        },
+        {
+          "name": "index_name",
+          "dtype": "string/other",
+          "unique_count": 10,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 1550421
+        },
+        {
+          "name": "perceived_colour_master_id",
+          "dtype": "int",
+          "unique_count": 20,
+          "included": true,
+          "reason": "int unique<=256 mapped",
+          "text_bytes": 242479
+        },
+        {
+          "name": "perceived_colour_master_name",
+          "dtype": "string/other",
+          "unique_count": 20,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 622675
+        },
+        {
+          "name": "perceived_colour_value_id",
+          "dtype": "int",
+          "unique_count": 8,
+          "included": true,
+          "reason": "int unique<=256 mapped",
+          "text_bytes": 210228
+        },
+        {
+          "name": "perceived_colour_value_name",
+          "dtype": "string/other",
+          "unique_count": 8,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 821272
+        },
+        {
+          "name": "prod_name",
+          "dtype": "string/other",
+          "unique_count": 45728,
+          "included": false,
+          "reason": "string unique>256",
+          "text_bytes": 1737721
+        },
+        {
+          "name": "product_code",
+          "dtype": "int",
+          "unique_count": 47072,
+          "included": true,
+          "reason": "int unique>256 range->0..255",
+          "text_bytes": 735700
+        },
+        {
+          "name": "product_group_name",
+          "dtype": "string/other",
+          "unique_count": 19,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 1729853
+        },
+        {
+          "name": "product_type_name",
+          "dtype": "string/other",
+          "unique_count": 131,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 895938
+        },
+        {
+          "name": "product_type_no",
+          "dtype": "int",
+          "unique_count": 132,
+          "included": true,
+          "reason": "int unique<=256 mapped",
+          "text_bytes": 402485
+        },
+        {
+          "name": "section_name",
+          "dtype": "string/other",
+          "unique_count": 56,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 1863973
+        },
+        {
+          "name": "section_no",
+          "dtype": "int",
+          "unique_count": 57,
+          "included": true,
+          "reason": "int unique<=256 mapped",
+          "text_bytes": 306092
+        }
+      ]
+    },
+    {
+      "name": "laion",
+      "rows": 100000,
+      "metadata_columns": {
+        "included": 3,
+        "total": 4,
+        "included_names": [
+          "NSFW",
+          "original_width",
+          "original_height"
+        ],
+        "excluded_names": [
+          "similarity"
+        ]
+      },
+      "sizes": {
+        "raw": {
+          "graph": 27220616,
+          "embedding": 204800000,
+          "metadata": 1688397,
+          "total": 233709013
+        },
+        "binary": {
+          "graph": 27220616,
+          "embedding": 204800000,
+          "metadata": 300000,
+          "total": 232320616
+        },
+        "compressed_raw": {
+          "graph": 27220616,
+          "embedding": 204800000,
+          "metadata": 297704,
+          "total": 232318320
+        },
+        "compressed_after_binary": {
+          "graph": 27220616,
+          "embedding": 204800000,
+          "metadata": 116074,
+          "total": 232136690
+        }
+      },
+      "notes": [],
+      "columns": [
+        {
+          "name": "NSFW",
+          "dtype": "string/other",
+          "unique_count": 10,
+          "included": true,
+          "reason": "string unique<=256 mapped",
+          "text_bytes": 881605
+        },
+        {
+          "name": "similarity",
+          "dtype": "string/other",
+          "unique_count": 97798,
+          "included": false,
+          "reason": "string unique>256",
+          "text_bytes": 1287407
+        },
+        {
+          "name": "original_width",
+          "dtype": "int",
+          "unique_count": 1674,
+          "included": true,
+          "reason": "int unique>256 range->0..255",
+          "text_bytes": 404510
+        },
+        {
+          "name": "original_height",
+          "dtype": "int",
+          "unique_count": 1848,
+          "included": true,
+          "reason": "int unique>256 range->0..255",
+          "text_bytes": 402282
+        }
+      ]
+    }
+  ]
+}
