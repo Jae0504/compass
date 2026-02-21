@@ -1,0 +1,4 @@
+[submodule "ACORN"]
+	path = ACORN
+	url = https://github.com/guestrin-lab/ACORN.git
+	branch = main
