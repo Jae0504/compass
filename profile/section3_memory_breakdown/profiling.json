@@ -1,0 +1,78 @@
+{
+  "params": {
+    "m": 32,
+    "ef_construction": 128,
+    "acorn_gamma": 12,
+    "acorn_mbeta": 64,
+    "max_rows": 0,
+    "metadata_compression_block_bytes": 2097152
+  },
+  "datasets": [
+    {
+      "name": "hnm",
+      "rows": 105100,
+      "dim": 2048,
+      "selected_metadata_columns": 22,
+      "unique_metadata_ids": 98654,
+      "selected_keys": ["colour_group_code", "colour_group_name", "department_name", "department_no", "garment_group_name", "garment_group_no", "graphical_appearance_name", "graphical_appearance_no", "index_code", "index_group_name", "index_group_no", "index_name", "perceived_colour_master_id", "perceived_colour_master_name", "perceived_colour_value_id", "perceived_colour_value_name", "product_code", "product_group_name", "product_type_name", "product_type_no", "section_name", "section_no"],
+      "raw_sizes": {
+        "embedding_bytes": 860979200,
+        "metadata_original_bytes": 17823132,
+        "metadata_lz4_bytes": 3485978,
+        "metadata_deflate_bytes": 1824761,
+        "hnsw_index_bytes": 889590642,
+        "hnsw_graph_bytes": 28611442,
+        "acorn_index_bytes": 914658462,
+        "acorn_graph_bytes": 53679262
+      },
+      "categories": {
+        "original_metadata": 46434574,
+        "compressed_metadata_lz4": 32097420,
+        "compressed_metadata_deflate": 30436203,
+        "acorn_metadata": 53679262,
+        "embedding": 860979200
+      },
+      "bars": [
+        {"label": "Original metadata + HNSW graph", "bytes": 46434574, "mb": 44.283461, "pct_of_embedding": 5.393228},
+        {"label": "Compressed metadata (LZ4) + HNSW graph", "bytes": 32097420, "mb": 30.610485, "pct_of_embedding": 3.728013},
+        {"label": "Compressed metadata (Deflate) + HNSW graph", "bytes": 30436203, "mb": 29.026225, "pct_of_embedding": 3.535068},
+        {"label": "ACORN metadata (graph size)", "bytes": 53679262, "mb": 51.192533, "pct_of_embedding": 6.234676},
+        {"label": "Embedding", "bytes": 860979200, "mb": 821.093750, "pct_of_embedding": 100.000000}
+      ],
+      "notes": []
+    },
+    {
+      "name": "laion",
+      "rows": 100000,
+      "dim": 512,
+      "selected_metadata_columns": 4,
+      "unique_metadata_ids": 99942,
+      "selected_keys": ["NSFW", "similarity", "original_width", "original_height"],
+      "raw_sizes": {
+        "embedding_bytes": 204800000,
+        "metadata_original_bytes": 2918566,
+        "metadata_lz4_bytes": 1518223,
+        "metadata_deflate_bytes": 874154,
+        "hnsw_index_bytes": 232020834,
+        "hnsw_graph_bytes": 27220834,
+        "acorn_index_bytes": 255847566,
+        "acorn_graph_bytes": 51047566
+      },
+      "categories": {
+        "original_metadata": 30139400,
+        "compressed_metadata_lz4": 28739057,
+        "compressed_metadata_deflate": 28094988,
+        "acorn_metadata": 51047566,
+        "embedding": 204800000
+      },
+      "bars": [
+        {"label": "Original metadata + HNSW graph", "bytes": 30139400, "mb": 28.743172, "pct_of_embedding": 14.716504},
+        {"label": "Compressed metadata (LZ4) + HNSW graph", "bytes": 28739057, "mb": 27.407701, "pct_of_embedding": 14.032743},
+        {"label": "Compressed metadata (Deflate) + HNSW graph", "bytes": 28094988, "mb": 26.793468, "pct_of_embedding": 13.718256},
+        {"label": "ACORN metadata (graph size)", "bytes": 51047566, "mb": 48.682753, "pct_of_embedding": 24.925569},
+        {"label": "Embedding", "bytes": 204800000, "mb": 195.312500, "pct_of_embedding": 100.000000}
+      ],
+      "notes": []
+    }
+  ]
+}

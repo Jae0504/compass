@@ -1,0 +1,43 @@
+Section3 Memory Breakdown (Filtering)
+====================================
+HNSW params: M=32, efConstruction=128
+ACORN params: gamma=12, M_beta=64
+Max rows: all
+Metadata compression: 2MB blocks (LZ4, Deflate)
+
+Dataset: hnm
+Rows: 105100, Dim: 2048
+Selected metadata columns: 22 (unique row metadata IDs: 98654)
+Keys: colour_group_code, colour_group_name, department_name, department_no, garment_group_name, garment_group_no, graphical_appearance_name, graphical_appearance_no, index_code, index_group_name, index_group_no, index_name, perceived_colour_master_id, perceived_colour_master_name, perceived_colour_value_id, perceived_colour_value_name, product_code, product_group_name, product_type_name, product_type_no, section_name, section_no
+Raw sizes (bytes):
+  embedding: 860979200
+  metadata original: 17823132
+  metadata LZ4(2MB): 3485978
+  metadata Deflate(2MB): 1824761
+  HNSW index: 889590642, HNSW graph=index-embedding: 28611442
+  ACORN index: 914658462, ACORN graph=index-embedding: 53679262
+Plot categories (MB, and % of embedding):
+  - Original metadata + HNSW graph: 44.283 MB (5.39% of embedding)
+  - Compressed metadata (LZ4) + HNSW graph: 30.610 MB (3.73% of embedding)
+  - Compressed metadata (Deflate) + HNSW graph: 29.026 MB (3.54% of embedding)
+  - ACORN metadata (graph size): 51.193 MB (6.23% of embedding)
+  - Embedding: 821.094 MB (100.00% of embedding)
+
+Dataset: laion
+Rows: 100000, Dim: 512
+Selected metadata columns: 4 (unique row metadata IDs: 99942)
+Keys: NSFW, similarity, original_width, original_height
+Raw sizes (bytes):
+  embedding: 204800000
+  metadata original: 2918566
+  metadata LZ4(2MB): 1518223
+  metadata Deflate(2MB): 874154
+  HNSW index: 232020834, HNSW graph=index-embedding: 27220834
+  ACORN index: 255847566, ACORN graph=index-embedding: 51047566
+Plot categories (MB, and % of embedding):
+  - Original metadata + HNSW graph: 28.743 MB (14.72% of embedding)
+  - Compressed metadata (LZ4) + HNSW graph: 27.408 MB (14.03% of embedding)
+  - Compressed metadata (Deflate) + HNSW graph: 26.793 MB (13.72% of embedding)
+  - ACORN metadata (graph size): 48.683 MB (24.93% of embedding)
+  - Embedding: 195.312 MB (100.00% of embedding)
+
