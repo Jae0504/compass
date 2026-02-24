@@ -1,0 +1,64 @@
+Profiling completed. queries_used=100, ef_search=64, log=/home/jykang5/compass/profile/section3_decompresison_traversal/profile.log
+
+[Run Config]
+queries_used: 100
+num_elements: 1000000
+query_dim: 128
+graph_dim: 128
+k: 10
+ef_search_effective: 64
+block_size: 4096
+
+[Totals - Decompression]
+(1) naive_lz4_ns: 353031809 (353.031809 ms)
+(1) naive_deflate_ns: 3268747903 (3268.747903 ms)
+(2) common_lz4_ns: 258703687 (258.703687 ms)
+(2) common_deflate_ns: 2616307515 (2616.307515 ms)
+
+[Totals - Traversal Pipeline]
+(3) graph_traversal_ns: 165379573 (165.379573 ms)
+    upper_traversal_ns: 1288958 (1.288958 ms)
+    level0_traversal_ns: 164090615 (164.090615 ms)
+(4) distance_calculation_ns: 327473493 (327.473493 ms)
+    upper_distance_ns: 18448891 (18.448891 ms)
+    level0_distance_ns: 309024602 (309.024602 ms)
+(5) candidate_update_ns: 6180323 (6.180323 ms)
+baseline_sum_ns=(3)+(4)+(5): 499033389 (499.033389 ms)
+
+[Node Access Counts]
+expanded_nodes_upper: 607
+expanded_nodes_level0: 6549
+
+[Portion of Decompression vs Baseline Sum]
+naive_lz4 / baseline_sum: 70.743124%
+naive_deflate / baseline_sum: 655.015872%
+common_lz4 / baseline_sum: 51.840957%
+common_deflate / baseline_sum: 524.275043%
+
+[Traversal/Distance/Candidate Percentage of Baseline Sum]
+(3) graph_traversal_pct: 33.139982%
+(4) distance_calculation_pct: 65.621560%
+(5) candidate_update_pct: 1.238459%
+
+[Per-Node Access Averages (Level-0)]
+node_access_denominator: 6549
+(1) naive_lz4_ns_per_node: 53906
+(1) naive_deflate_ns_per_node: 499121
+(2) common_lz4_ns_per_node: 39502
+(2) common_deflate_ns_per_node: 399497
+(3) graph_traversal_ns_per_node: 25055
+(4) distance_calculation_ns_per_node: 47186
+(5) candidate_update_ns_per_node: 943
+
+[Per-Query Averages]
+avg_naive_lz4_ns: 3530318
+avg_naive_deflate_ns: 32687479
+avg_common_lz4_ns: 2587036
+avg_common_deflate_ns: 26163075
+avg_upper_traversal_ns: 12889
+avg_level0_traversal_ns: 1640906
+avg_upper_distance_ns: 184488
+avg_level0_distance_ns: 3090246
+avg_candidate_update_ns: 61803
+avg_expanded_nodes_upper: 6
+avg_expanded_nodes_level0: 65
