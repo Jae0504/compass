@@ -1,0 +1,8 @@
+Running build_FID_TB with:
+  graph: /home/jykang5/compass/end_to_end/vectordb/dataset/hnsw_graph/sift1m/sift_m128_efc200.bin
+  base: /fast-lab-share/benchmarks/VectorDB/ANN/sift1m/base.fvecs
+  out:  /home/jykang5/compass/end_to_end/vectordb/dataset/fid_tb/sift1m
+  nfilters=256 steiner=4 ep=4 isolated=5 threads=64
+Built FID/TB for attribute: synthetic_id_bucket
+Done. Outputs under: /home/jykang5/compass/end_to_end/vectordb/dataset/fid_tb/sift1m
+Done. Outputs under: /home/jykang5/compass/end_to_end/vectordb/dataset/fid_tb/sift1m

@@ -137,3 +137,29 @@ fi
 "${CMD[@]}"
 
 echo "Done. Outputs under: $OUT_DIR/$BENCHMARK"
+
+# /home/jykang5/compass/end_to_end/vectordb/cpp_examples/build_examples/build_FID_TB.run \
+#   --dataset-type laion \
+#   --benchmark laion \
+#   --graph /home/jykang5/compass/end_to_end/vectordb/dataset/hnsw_graph/laion/laion_m128_efc200.bin \
+#   --base /fast-lab-share/benchmarks/VectorDB/FILTER/LAION/base.fvecs \
+#   --payload /fast-lab-share/benchmarks/VectorDB/FILTER/LAION/payloads.jsonl\
+#   --out-dir /home/jykang5/compass/end_to_end/vectordb/dataset/fid_tb \
+#   --threads 64 \
+#   --nfilters 256 \
+#   --steiner-factor 4 \
+#   --ep-factor 4 \
+#   --isolated-connection-factor 5
+
+# /home/jykang5/compass/end_to_end/vectordb/cpp_examples/build_examples/build_FID_TB.run \
+#   --dataset-type hnm \
+#   --benchmark hnm \
+#   --graph /home/jykang5/compass/end_to_end/vectordb/dataset/hnsw_graph/hnm/hnm_m128_efc200.bin \
+#   --base /fast-lab-share/benchmarks/VectorDB/FILTER/HnM/base.fvecs\
+#   --payload /fast-lab-share/benchmarks/VectorDB/FILTER/HnM/payloads.jsonl \
+#   --out-dir /home/jykang5/compass/end_to_end/vectordb/dataset/fid_tb \
+#   --threads 64 \
+#   --nfilters 256 \
+#   --steiner-factor 4 \
+#   --ep-factor 4 \
+#   --isolated-connection-factor 5

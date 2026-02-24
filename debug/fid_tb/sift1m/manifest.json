@@ -1,0 +1,29 @@
+{
+  "attributes": [
+    {
+      "encoding": "numeric_minmax_quantized",
+      "fid_file": "sift1m_synthetic_id_bucket_fid.bin",
+      "key": "synthetic_id_bucket",
+      "max_value": 255.0,
+      "min_value": 0.0,
+      "missing_count": 0,
+      "numeric": true,
+      "tb_file": "sift1m_synthetic_id_bucket_tb.bin",
+      "unique_non_missing": 256,
+      "used_bins": 255
+    }
+  ],
+  "base_path": "/fast-lab-share/benchmarks/VectorDB/ANN/sift1m/base.fvecs",
+  "benchmark": "sift1m",
+  "dataset_type": "sift",
+  "dimension": 128,
+  "ep_factor": 4,
+  "filters_path": "",
+  "graph_path": "/home/jykang5/compass/end_to_end/vectordb/dataset/hnsw_graph/sift1m/sift_m128_efc200.bin",
+  "isolated_connection_factor": 5,
+  "n_elements": 1000000,
+  "nfilters": 256,
+  "payload_path": "",
+  "steiner_factor": 4,
+  "threads": 64
+}

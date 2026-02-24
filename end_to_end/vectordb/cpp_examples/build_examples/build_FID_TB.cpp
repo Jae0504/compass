@@ -633,12 +633,15 @@ std::vector<std::bitset<256>> build_tb_for_attribute(
     int steiner_factor_local,
     int ep_factor_local,
     float random_rate) {
+    // post_proc utilities still read these globals directly.
+    filter_ids = fid_values;
+
     std::vector<std::bitset<256>> local_connector_bits(nElements);
     std::vector<std::bitset<256>> connections = analyze_graph_connections(index, fid_values);
 
     std::vector<int> group_counts(nfilters_local, 0);
     for (uint8_t g : fid_values) {
-        if (g < static_cast<uint8_t>(nfilters_local)) {
+        if (static_cast<size_t>(g) < group_counts.size()) {
             ++group_counts[g];
         }
     }
@@ -661,6 +664,8 @@ std::vector<std::bitset<256>> build_tb_for_attribute(
             }
         }
 
+        // Keep global connector_bits aligned for helper routines that rely on globals.
+        connector_bits = local_connector_bits;
         std::vector<std::vector<int>> cluster_node_info = find_num_cluster(index, node_indices, static_cast<size_t>(group_id));
         if (cluster_node_info.size() > 1) {
             std::vector<int> terminal_nodes = getTerminalNodes(cluster_node_info, steiner_factor_local);

@@ -1,0 +1,21 @@
+build_FID_TB log
+dataset_type: sift
+benchmark: sift1m
+nElements: 1000000
+base_dim: 128
+threads: 64
+nfilters: 256
+steiner_factor: 4
+ep_factor: 4
+isolated_connection_factor: 5
+
+attributes_used: 1
+- key: synthetic_id_bucket
+  encoding: numeric_minmax_quantized
+  unique_non_missing: 256
+  missing_count: 0
+  used_bins: 255
+  min: 0
+  max: 255
+  fid: sift1m_synthetic_id_bucket_fid.bin
+  tb: sift1m_synthetic_id_bucket_tb.bin
