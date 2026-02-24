@@ -15,6 +15,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <queue>
 #include <stdexcept>
 #include <string>
@@ -125,7 +126,7 @@ struct AggregateTiming {
 
 void usage(const char* argv0) {
     std::cerr << "Usage:\n"
-              << "  " << argv0 << " <graph.bin> <query(.fvecs|.bvecs)> <k> <num_queries>\n";
+              << "  " << argv0 << " <graph(.bin|.index)> <query(.fvecs|.bvecs)> <k> <num_queries>\n";
 }
 
 bool parse_size_t(const std::string& s, size_t* out) {
@@ -174,6 +175,23 @@ bool ends_with(const std::string& s, const std::string& suffix) {
         return false;
     }
     return std::equal(suffix.rbegin(), suffix.rend(), s.rbegin());
+}
+
+template <typename DistT, typename SpaceT>
+std::unique_ptr<hnswlib::HierarchicalNSW<DistT>> load_graph_index_or_throw(
+        SpaceT* space,
+        const std::string& graph_path,
+        const std::string& query_format) {
+    try {
+        return std::make_unique<hnswlib::HierarchicalNSW<DistT>>(space, graph_path);
+    } catch (const std::exception& e) {
+        std::ostringstream oss;
+        oss << "Failed to load graph index: " << graph_path
+            << ". Expected an HNSWlib serialized graph file (commonly .bin or .index) "
+            << "compatible with " << query_format << " queries. "
+            << "Underlying error: " << e.what();
+        throw std::runtime_error(oss.str());
+    }
 }
 
 DenseFvecs load_queries_fvecs(const std::string& path) {
@@ -695,9 +713,9 @@ int main(int argc, char** argv) {
             }
 
             hnswlib::L2Space space(static_cast<size_t>(queries.dim));
-            hnswlib::HierarchicalNSW<float> index(&space, args.graph_path);
+            auto index = load_graph_index_or_throw<float>(&space, args.graph_path, ".fvecs");
 
-            const size_t graph_data_bytes = index.label_offset_ - index.offsetData_;
+            const size_t graph_data_bytes = index->label_offset_ - index->offsetData_;
             const size_t expected_data_bytes = static_cast<size_t>(queries.dim) * sizeof(float);
             if (graph_data_bytes != expected_data_bytes) {
                 throw std::runtime_error(
@@ -707,13 +725,13 @@ int main(int argc, char** argv) {
             }
             const size_t graph_dim = graph_data_bytes / sizeof(float);
 
-            const size_t n = index.getCurrentElementCount();
+            const size_t n = index->getCurrentElementCount();
             nElements = static_cast<int>(n);
             std::vector<uint8_t> metadata = build_synthetic_metadata(n);
             CompressedMetadata cm = compress_metadata_blocks(metadata);
 
             const size_t effective_ef = std::max<size_t>(64, args.k);
-            index.setEf(effective_ef);
+            index->setEf(effective_ef);
 
             const size_t queries_to_run = std::min<size_t>(args.num_queries, static_cast<size_t>(queries.num));
             if (queries_to_run == 0) {
@@ -734,7 +752,7 @@ int main(int argc, char** argv) {
             for (size_t qid = 0; qid < queries_to_run; ++qid) {
                 const float* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
                 QueryTiming qt = profile_single_query(
-                    index,
+                    *index,
                     qptr,
                     effective_ef,
                     args.k,
@@ -761,9 +779,9 @@ int main(int argc, char** argv) {
             }
 
             hnswlib::L2SpaceI space(static_cast<size_t>(queries.dim));
-            hnswlib::HierarchicalNSW<int> index(&space, args.graph_path);
+            auto index = load_graph_index_or_throw<int>(&space, args.graph_path, ".bvecs");
 
-            const size_t graph_data_bytes = index.label_offset_ - index.offsetData_;
+            const size_t graph_data_bytes = index->label_offset_ - index->offsetData_;
             const size_t expected_data_bytes = static_cast<size_t>(queries.dim) * sizeof(uint8_t);
             if (graph_data_bytes != expected_data_bytes) {
                 throw std::runtime_error(
@@ -773,13 +791,13 @@ int main(int argc, char** argv) {
             }
             const size_t graph_dim = graph_data_bytes / sizeof(uint8_t);
 
-            const size_t n = index.getCurrentElementCount();
+            const size_t n = index->getCurrentElementCount();
             nElements = static_cast<int>(n);
             std::vector<uint8_t> metadata = build_synthetic_metadata(n);
             CompressedMetadata cm = compress_metadata_blocks(metadata);
 
             const size_t effective_ef = std::max<size_t>(64, args.k);
-            index.setEf(effective_ef);
+            index->setEf(effective_ef);
 
             const size_t queries_to_run = std::min<size_t>(args.num_queries, static_cast<size_t>(queries.num));
             if (queries_to_run == 0) {
@@ -800,7 +818,7 @@ int main(int argc, char** argv) {
             for (size_t qid = 0; qid < queries_to_run; ++qid) {
                 const uint8_t* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
                 QueryTiming qt = profile_single_query(
-                    index,
+                    *index,
                     qptr,
                     effective_ef,
                     args.k,

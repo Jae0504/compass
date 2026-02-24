@@ -39,16 +39,9 @@ def parse_metrics(log_path: Path) -> dict:
     return out
 
 
-def resolve_laion_log(input_dir: Path, laion_arg: str) -> Path:
-    if laion_arg:
-        p = Path(laion_arg)
-        return p if p.is_absolute() else input_dir / p
-
-    preferred = input_dir / "laion_proflie.log"  # Typo kept intentionally for compatibility.
-    fallback = input_dir / "laion_profile.log"
-    if preferred.exists():
-        return preferred
-    return fallback
+def resolve_input_log_path(input_dir: Path, log_arg: str) -> Path:
+    p = Path(log_arg)
+    return p if p.is_absolute() else input_dir / p
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -60,13 +53,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(Path(__file__).resolve().parent),
         help="Directory containing benchmark logs.",
     )
-    p.add_argument("--sift-log", default="sift_profile.log")
+    p.add_argument("--sift1m-log", default="sift1m_profile.log")
+    p.add_argument("--sift1b-log", default="sift1b_profile.log")
+    p.add_argument("--laion-log", default="laion_profile.log")
     p.add_argument("--hnm-log", default="hnm_profile.log")
-    p.add_argument(
-        "--laion-log",
-        default="",
-        help="Optional explicit LAION log path. If omitted, tries laion_proflie.log then laion_profile.log.",
-    )
     p.add_argument(
         "--output",
         default="per_node_normalized_bars.png",
@@ -102,7 +92,7 @@ def _try_plot_matplotlib(
         return False
 
     plt.rcParams["font.family"] = "Arial"
-    plt.rcParams["font.size"] = 8
+    plt.rcParams["font.size"] = 10
     plt.rcParams["font.weight"] = "bold"
     plt.rcParams["axes.labelweight"] = "bold"
     plt.rcParams["axes.titleweight"] = "bold"
@@ -120,55 +110,60 @@ def _try_plot_matplotlib(
         "candidate": "#BFBFBF",
     }
 
-    fig, ax = plt.subplots(figsize=(16.0 / 2.54, 4.0 / 2.54))
+    fig, ax = plt.subplots(figsize=(16.0 / 2.54, 5.0 / 2.54))
     # Stacked bar is placed as the first bar in each benchmark group.
     stack_x = [v - 2 * w for v in x]
-    ax.bar(stack_x, dist, width=w, label="Dist. Calc.", color=colors["distance"])
-    ax.bar(stack_x, trav, width=w, bottom=dist, label="Graph Trav.", color=colors["traversal"])
+    ax.bar(stack_x, dist, width=w, label="G2.", color=colors["distance"])
+    ax.bar(stack_x, trav, width=w, bottom=dist, label="G1", color=colors["traversal"])
     ax.bar(
         stack_x,
         cand,
         width=w,
         bottom=[dist[i] + trav[i] for i in range(len(dist))],
-        label="Cand. Update",
+        label="G3.",
         color=colors["candidate"],
     )
 
-    ax.bar([v - 1 * w for v in x], naive_lz4, width=w, label="(N) LZ4", color=colors["naive_lz4"])
+    ax.bar([v - 1 * w for v in x], naive_lz4, width=w, label="(N)LZ4", color=colors["naive_lz4"])
     ax.bar(
         [v + 0 * w for v in x],
         naive_deflate,
         width=w,
-        label="(N) Deflate",
+        label="(N)Deflate",
         color=colors["naive_deflate"],
     )
-    ax.bar([v + 1 * w for v in x], common_lz4, width=w, label="(G) LZ4", color=colors["common_lz4"])
+    ax.bar([v + 1 * w for v in x], common_lz4, width=w, label="(G)LZ4", color=colors["common_lz4"])
     ax.bar(
         [v + 2 * w for v in x],
         common_deflate,
         width=w,
-        label="(G) Deflate",
+        label="(G)Deflate",
         color=colors["common_deflate"],
     )
     ax.set_xticks(x)
     ax.set_xticklabels(bench_names)
-    ax.set_xlabel("Benchmark", labelpad=1)
-    ax.set_ylabel("Normalized \n per-node latency")
+    ax.set_xlabel("Benchmark", labelpad=-1, fontsize=10, fontweight="bold", fontfamily="Arial")
+    ax.set_ylabel(
+        "Normalized \n per-node latency",
+        fontsize=10,
+        fontweight="bold",
+        fontfamily="Arial",
+    )
     for label in ax.get_xticklabels() + ax.get_yticklabels():
         label.set_fontweight("bold")
     ax.grid(axis="y", linestyle=":", alpha=0.35)
-    fig.legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, 0.995),
+    ax.legend(
+        loc="lower center",
+        bbox_to_anchor=(0.46, 0.995),
         ncol=7,
-        fontsize=8,
-        prop={"family": "Arial", "size": 8, "weight": "bold"},
+        fontsize=10,
+        prop={"family": "Arial", "size": 10, "weight": "bold"},
         frameon=False,
         handlelength=1.2,
         columnspacing=0.85,
     )
-    # Expand drawable axis area to make bars larger within the fixed PNG canvas.
-    fig.subplots_adjust(left=0.095, right=0.995, bottom=0.17, top=0.80)
+    # Keep plotting-area geometry aligned with the memory-breakdown figure.
+    fig.subplots_adjust(left=0.095, right=0.995, bottom=0.17, top=0.87)
     ax.tick_params(axis="x", pad=1)
     fig.savefig(out_path, dpi=200)
     return True
@@ -240,7 +235,7 @@ def _plot_svg(
             'stroke="#dddddd" stroke-width="1"/>'
         )
         parts.append(
-            '<text x="{x}" y="{y}" font-size="8" font-family="Arial" font-weight="bold" '
+            '<text x="{x}" y="{y}" font-size="10" font-family="Arial" font-weight="bold" '
             'text-anchor="end" dominant-baseline="middle">{t}</text>'.format(
                 x=margin_left - 8,
                 y=f"{y:.2f}",
@@ -302,7 +297,7 @@ def _plot_svg(
             )
 
         parts.append(
-            '<text x="{x}" y="{y}" font-size="8" font-family="Arial" font-weight="bold" text-anchor="middle">'
+            '<text x="{x}" y="{y}" font-size="10" font-family="Arial" font-weight="bold" text-anchor="middle">'
             "{t}</text>".format(
                 x=f"{cx:.2f}",
                 y=f"{(y0 + 28):.2f}",
@@ -312,11 +307,11 @@ def _plot_svg(
 
     # Axis labels.
     parts.append(
-        '<text x="{x}" y="{y}" font-size="8" font-family="Arial" font-weight="bold" text-anchor="middle">'
+        '<text x="{x}" y="{y}" font-size="10" font-family="Arial" font-weight="bold" text-anchor="middle">'
         "Benchmark</text>".format(x=margin_left + plot_w / 2, y=height - 70)
     )
     parts.append(
-        '<text x="{x}" y="{y}" font-size="8" font-family="Arial" font-weight="bold" text-anchor="middle" '
+        '<text x="{x}" y="{y}" font-size="10" font-family="Arial" font-weight="bold" text-anchor="middle" '
         'transform="rotate(-90 {x} {y})">{t}</text>'.format(
             x=30,
             y=margin_top + plot_h / 2,
@@ -326,13 +321,13 @@ def _plot_svg(
 
     # Legend.
     legend_items = [
-        ("Dist. Calc.", colors["distance"]),
-        ("Graph Trav.", colors["traversal"]),
-        ("Cand. Update", colors["candidate"]),
-        ("(N) LZ4", colors["naive_lz4"]),
-        ("(N) Deflate", colors["naive_deflate"]),
-        ("(G) LZ4", colors["common_lz4"]),
-        ("(G) Deflate", colors["common_deflate"]),
+        ("G2.", colors["distance"]),
+        ("G1", colors["traversal"]),
+        ("G3.", colors["candidate"]),
+        ("(N)LZ4", colors["naive_lz4"]),
+        ("(N)Deflate", colors["naive_deflate"]),
+        ("(G)LZ4", colors["common_lz4"]),
+        ("(G)Deflate", colors["common_deflate"]),
     ]
     legend_cols = 4
     cell_w = 290
@@ -347,7 +342,7 @@ def _plot_svg(
             f'<rect x="{xx}" y="{yy - 11}" width="15" height="15" fill="{color}" stroke="#222222" stroke-width="0.5"/>'
         )
         parts.append(
-            '<text x="{x}" y="{y}" font-size="8" font-family="Arial" font-weight="bold" dominant-baseline="middle">{t}</text>'.format(
+            '<text x="{x}" y="{y}" font-size="10" font-family="Arial" font-weight="bold" dominant-baseline="middle">{t}</text>'.format(
                 x=xx + 22,
                 y=yy - 3,
                 t=_svg_escape(label),
@@ -362,29 +357,20 @@ def main() -> None:
     args = build_parser().parse_args()
     input_dir = Path(args.input_dir).resolve()
 
-    sift_log = Path(args.sift_log)
-    if not sift_log.is_absolute():
-        sift_log = input_dir / sift_log
+    logs_in_order = [
+        ("SIFT1M", resolve_input_log_path(input_dir, args.sift1m_log)),
+        ("SIFT1B", resolve_input_log_path(input_dir, args.sift1b_log)),
+        ("LAION", resolve_input_log_path(input_dir, args.laion_log)),
+        ("H&M", resolve_input_log_path(input_dir, args.hnm_log)),
+    ]
 
-    hnm_log = Path(args.hnm_log)
-    if not hnm_log.is_absolute():
-        hnm_log = input_dir / hnm_log
-
-    laion_log = resolve_laion_log(input_dir, args.laion_log)
-
-    logs = {
-        "SIFT": sift_log,
-        "HNM": hnm_log,
-        "LAION": laion_log,
-    }
-
-    for name, path in logs.items():
+    for name, path in logs_in_order:
         if not path.exists():
             raise FileNotFoundError(f"{name} log not found: {path}")
 
-    parsed = {name: parse_metrics(path) for name, path in logs.items()}
+    parsed = {name: parse_metrics(path) for name, path in logs_in_order}
 
-    bench_names = list(parsed.keys())
+    bench_names = [name for name, _ in logs_in_order]
     naive_lz4 = [parsed[b]["n_naive_lz4"] for b in bench_names]
     naive_deflate = [parsed[b]["n_naive_deflate"] for b in bench_names]
     common_lz4 = [parsed[b]["n_common_lz4"] for b in bench_names]
