@@ -27,6 +27,14 @@ struct VecFileInfo {
     int dim = 0;
 };
 
+struct IndexFileInfo {
+    size_t cur_element_count = 0;
+    size_t data_size_bytes = 0;
+    size_t size_data_per_element = 0;
+    size_t offset_data = 0;
+    size_t label_offset = 0;
+};
+
 template <typename T>
 struct DenseVectors {
     int num = 0;
@@ -97,6 +105,78 @@ inline std::string json_value_to_string(const json& v) {
         return std::to_string(v.get<double>());
     }
     return v.dump();
+}
+
+template <typename T>
+inline void read_binary_pod(std::ifstream& in, T* out, const std::string& name) {
+    if (!in.read(reinterpret_cast<char*>(out), sizeof(T))) {
+        throw std::runtime_error("Failed to read index header field: " + name);
+    }
+}
+
+inline IndexFileInfo inspect_hnsw_index_file(const std::string& graph_path) {
+    std::ifstream in(graph_path, std::ios::binary);
+    if (!in.is_open()) {
+        throw std::runtime_error("Failed to open graph index: " + graph_path);
+    }
+
+    size_t offset_level0 = 0;
+    size_t max_elements = 0;
+    size_t cur_element_count = 0;
+    size_t size_data_per_element = 0;
+    size_t label_offset = 0;
+    size_t offset_data = 0;
+    int maxlevel = 0;
+    unsigned int enterpoint_node = 0;
+    size_t maxM = 0;
+    size_t maxM0 = 0;
+    size_t M = 0;
+    double mult = 0.0;
+    size_t ef_construction = 0;
+
+    read_binary_pod(in, &offset_level0, "offsetLevel0");
+    read_binary_pod(in, &max_elements, "max_elements");
+    read_binary_pod(in, &cur_element_count, "cur_element_count");
+    read_binary_pod(in, &size_data_per_element, "size_data_per_element");
+    read_binary_pod(in, &label_offset, "label_offset");
+    read_binary_pod(in, &offset_data, "offsetData");
+    read_binary_pod(in, &maxlevel, "maxlevel");
+    read_binary_pod(in, &enterpoint_node, "enterpoint_node");
+    read_binary_pod(in, &maxM, "maxM");
+    read_binary_pod(in, &maxM0, "maxM0");
+    read_binary_pod(in, &M, "M");
+    read_binary_pod(in, &mult, "mult");
+    read_binary_pod(in, &ef_construction, "ef_construction");
+
+    (void)offset_level0;
+    (void)max_elements;
+    (void)maxlevel;
+    (void)enterpoint_node;
+    (void)maxM;
+    (void)maxM0;
+    (void)M;
+    (void)mult;
+    (void)ef_construction;
+
+    if (label_offset < offset_data) {
+        throw std::runtime_error("Corrupted graph index header: label_offset < offset_data");
+    }
+
+    const size_t data_size_bytes = label_offset - offset_data;
+    if (data_size_bytes == 0) {
+        throw std::runtime_error("Corrupted graph index header: data_size_bytes is zero");
+    }
+    if (size_data_per_element == 0) {
+        throw std::runtime_error("Corrupted graph index header: size_data_per_element is zero");
+    }
+
+    IndexFileInfo out;
+    out.cur_element_count = cur_element_count;
+    out.data_size_bytes = data_size_bytes;
+    out.size_data_per_element = size_data_per_element;
+    out.offset_data = offset_data;
+    out.label_offset = label_offset;
+    return out;
 }
 
 inline VecFileInfo inspect_fvecs(const std::string& path) {
