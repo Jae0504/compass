@@ -1,0 +1,65 @@
+Section 3 Decompression vs Traversal Profiling
+log_path: /home/jykang5/compass/profile/section3_decompresison_traversal/profile.log
+
+[Run Config]
+queries_used: 100
+num_elements: 100000
+query_dim: 512
+graph_dim: 512
+k: 10
+ef_search_effective: 64
+block_size: 4096
+
+[Totals - Decompression]
+(1) naive_lz4_ns: 334095051 (334.095051 ms)
+(1) naive_deflate_ns: 2662846994 (2662.846994 ms)
+(2) common_lz4_ns: 115212649 (115.212649 ms)
+(2) common_deflate_ns: 1273471189 (1273.471189 ms)
+
+[Totals - Traversal Pipeline]
+(3) graph_traversal_ns: 94341498 (94.341498 ms)
+    upper_traversal_ns: 507629 (0.507629 ms)
+    level0_traversal_ns: 93833869 (93.833869 ms)
+(4) distance_calculation_ns: 348745731 (348.745731 ms)
+    upper_distance_ns: 21351674 (21.351674 ms)
+    level0_distance_ns: 327394057 (327.394057 ms)
+(5) candidate_update_ns: 5591115 (5.591115 ms)
+baseline_sum_ns=(3)+(4)+(5): 448678344 (448.678344 ms)
+
+[Node Access Counts]
+expanded_nodes_upper: 460
+expanded_nodes_level0: 6639
+
+[Portion of Decompression vs Baseline Sum]
+naive_lz4 / baseline_sum: 74.462041%
+naive_deflate / baseline_sum: 593.486855%
+common_lz4 / baseline_sum: 25.678228%
+common_deflate / baseline_sum: 283.827202%
+
+[Traversal/Distance/Candidate Percentage of Baseline Sum]
+(3) graph_traversal_pct: 21.026533%
+(4) distance_calculation_pct: 77.727338%
+(5) candidate_update_pct: 1.246130%
+
+[Per-Node Access Averages (Level-0)]
+node_access_denominator: 6639
+(1) naive_lz4_ns_per_node: 50323
+(1) naive_deflate_ns_per_node: 401091
+(2) common_lz4_ns_per_node: 17353
+(2) common_deflate_ns_per_node: 191816
+(3) graph_traversal_ns_per_node: 14133
+(4) distance_calculation_ns_per_node: 49313
+(5) candidate_update_ns_per_node: 842
+
+[Per-Query Averages]
+avg_naive_lz4_ns: 3340950
+avg_naive_deflate_ns: 26628469
+avg_common_lz4_ns: 1152126
+avg_common_deflate_ns: 12734711
+avg_upper_traversal_ns: 5076
+avg_level0_traversal_ns: 938338
+avg_upper_distance_ns: 213516
+avg_level0_distance_ns: 3273940
+avg_candidate_update_ns: 55911
+avg_expanded_nodes_upper: 4
+avg_expanded_nodes_level0: 66

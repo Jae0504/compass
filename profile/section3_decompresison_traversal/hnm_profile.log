@@ -1,0 +1,69 @@
+Section 3 Decompression vs Traversal Profiling
+log_path: /home/jykang5/compass/profile/section3_decompresison_traversal/profile.log
+
+[Run Config]
+queries_used: 100
+num_elements: 105100
+query_dim: 2048
+graph_dim: 2048
+k: 10
+ef_search_effective: 64
+block_size: 4096
+
+[Totals - Decompression]
+(1) naive_lz4_ns: 213729241 (213.729241 ms)
+(1) naive_deflate_ns: 1932717703 (1932.717703 ms)
+(2) common_lz4_ns: 114493530 (114.493530 ms)
+(2) common_deflate_ns: 954142773 (954.142773 ms)
+
+[Totals - Traversal Pipeline]
+(3) graph_traversal_ns: 64809008 (64.809008 ms)
+    upper_traversal_ns: 477053 (0.477053 ms)
+    level0_traversal_ns: 64331955 (64.331955 ms)
+(4) distance_calculation_ns: 439469267 (439.469267 ms)
+    upper_distance_ns: 35311886 (35.311886 ms)
+    level0_distance_ns: 404157381 (404.157381 ms)
+(5) candidate_update_ns: 12352458 (12.352458 ms)
+baseline_sum_ns=(3)+(4)+(5): 516630733 (516.630733 ms)
+
+[Node Access Counts]
+expanded_nodes_upper: 515
+expanded_nodes_level0: 6648
+
+[Portion of Decompression vs Baseline Sum]
+naive_lz4 / baseline_sum: 41.369827%
+naive_deflate / baseline_sum: 374.100412%
+common_lz4 / baseline_sum: 22.161579%
+common_deflate / baseline_sum: 184.685639%
+
+[Traversal/Distance/Candidate Percentage of Baseline Sum]
+(3) graph_traversal_pct: 12.544551%
+(4) distance_calculation_pct: 85.064484%
+(5) candidate_update_pct: 2.390965%
+
+[Per-Node Access Averages (Level-0)]
+node_access_denominator: 6648
+(1) naive_lz4_ns_per_node: 32149 
+(1) naive_deflate_ns_per_node: 290721
+(2) common_lz4_ns_per_node: 17222
+(2) common_deflate_ns_per_node: 143523
+(3) graph_traversal_ns_per_node: 9676
+(4) distance_calculation_ns_per_node: 60793
+(5) candidate_update_ns_per_node: 1858
+
+[Per-Query Averages]
+avg_naive_lz4_ns: 2137292
+avg_naive_deflate_ns: 19327177
+avg_common_lz4_ns: 1144935
+avg_common_deflate_ns: 9541427
+avg_upper_traversal_ns: 4770
+avg_level0_traversal_ns: 643319
+avg_upper_distance_ns: 353118
+avg_level0_distance_ns: 4041573
+avg_candidate_update_ns: 123524
+avg_expanded_nodes_upper: 5
+avg_expanded_nodes_level0: 66
+
+(1) vs (2) vs (3) + (4) + (5)
+(1): LZ4, Deflate
+(2): LZ4, Deflate
