@@ -2,3 +2,6 @@
 	path = ACORN
 	url = https://github.com/guestrin-lab/ACORN.git
 	branch = main
+[submodule "qpl"]
+	path = qpl
+	url = https://github.com/intel/qpl.git
