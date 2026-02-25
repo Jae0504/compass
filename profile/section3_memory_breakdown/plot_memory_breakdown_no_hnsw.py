@@ -96,7 +96,7 @@ def render_combined_plot(data: dict, output_path: Path, billion_rows: float) -> 
             ax.text(x, label_y, str(size_text[i, j]), ha="center", va="bottom", fontsize=10, fontweight="bold")
 
     ax.set_ylabel(
-        "Size of extra data \n required for filtering",
+        "Normalized extra data size \n for filtering",
         fontsize=10,
         fontweight="bold",
         fontfamily="Arial",
