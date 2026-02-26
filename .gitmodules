@@ -5,6 +5,3 @@
 [submodule "qpl"]
 	path = qpl
 	url = https://github.com/intel/qpl.git
-[submodule "milvus-lite"]
-	path = milvus-lite
-	url = https://github.com/milvus-io/milvus-lite.git
