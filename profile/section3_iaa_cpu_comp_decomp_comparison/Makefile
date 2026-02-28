@@ -1,8 +1,9 @@
 CXX ?= g++
 
-QPL_INC ?= /home/jykang5/src/qpl/include
-QPL_LIB ?= /home/jykang5/src/qpl/build/lib
-LOCAL_NLOHMANN_INC ?= /home/jykang5/compass/end_to_end/vectordb
+REPO_ROOT ?= $(abspath $(CURDIR)/../..)
+QPL_INC ?= $(REPO_ROOT)/qpl/include
+QPL_LIB ?= $(REPO_ROOT)/qpl/build/sources
+LOCAL_NLOHMANN_INC ?= $(REPO_ROOT)/end_to_end/vectordb
 
 CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -I$(LOCAL_NLOHMANN_INC) -I/usr/include -I$(QPL_INC)
 LDFLAGS ?=

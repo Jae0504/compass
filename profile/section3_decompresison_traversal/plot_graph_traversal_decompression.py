@@ -76,7 +76,7 @@ def _try_plot_matplotlib(
         return False
 
     plt.rcParams["font.family"] = "Arial"
-    plt.rcParams["font.size"] = 10
+    plt.rcParams["font.size"] = 12
     plt.rcParams["font.weight"] = "bold"
     plt.rcParams["axes.labelweight"] = "bold"
     plt.rcParams["axes.titleweight"] = "bold"
@@ -92,7 +92,8 @@ def _try_plot_matplotlib(
         "candidate": "#BFBFBF",
     }
 
-    fig, ax = plt.subplots(figsize=(16.0 / 2.54, 5.0 / 2.54))
+    # Fixed output size: 16cm x 4.5cm.
+    fig, ax = plt.subplots(figsize=(16.0 / 2.54, 4.5 / 2.54))
     # Keep stacked bar first in each benchmark group.
     stack_x = [v - 1 * w for v in x]
     ax.bar(stack_x, dist, width=w, label="Dist. Calc.", color=colors["distance"])
@@ -129,10 +130,10 @@ def _try_plot_matplotlib(
     )
     ax.set_xticks(x)
     ax.set_xticklabels(bench_names)
-    ax.set_xlabel("Benchmark", labelpad=-1, fontsize=10, fontweight="bold", fontfamily="Arial")
+    ax.set_xlabel("Benchmark", labelpad=-1, fontsize=12, fontweight="bold", fontfamily="Arial")
     ax.set_ylabel(
-        "Latency taken per-node (ms)",
-        fontsize=10,
+        "Latency (ms)",
+        fontsize=12,
         fontweight="bold",
         fontfamily="Arial",
     )
@@ -160,17 +161,20 @@ def _try_plot_matplotlib(
     ax.legend(
         ordered_handles,
         ordered_labels,
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.995),
+        loc="upper center",
+        bbox_to_anchor=(0.47, 1.22),
         ncol=5,
-        fontsize=10,
-        prop={"family": "Arial", "size": 10, "weight": "bold"},
+        fontsize=12,
+        prop={"family": "Arial", "size": 12, "weight": "bold"},
         frameon=False,
         handlelength=1.2,
-        columnspacing=0.9,
+        handletextpad=0.35,
+        columnspacing=0.8,
+        borderaxespad=0.0,
     )
 
-    fig.subplots_adjust(left=0.095, right=0.995, bottom=0.17, top=0.87)
+    # Keep plotting-area height close to previous config while shrinking figure height.
+    fig.subplots_adjust(left=0.095, right=0.995, bottom=0.19, top=0.868)
     ax.tick_params(axis="x", pad=1)
     fig.savefig(out_path, dpi=200)
     return True
@@ -189,7 +193,7 @@ def _plot_svg(
     height = 760
     margin_left = 100
     margin_right = 40
-    margin_top = 120
+    margin_top = 136
     margin_bottom = 160
     plot_w = width - margin_left - margin_right
     plot_h = height - margin_top - margin_bottom
@@ -236,7 +240,7 @@ def _plot_svg(
             'stroke="#dddddd" stroke-width="1"/>'
         )
         parts.append(
-            '<text x="{x}" y="{y}" font-size="10" font-family="Arial" font-weight="bold" '
+            '<text x="{x}" y="{y}" font-size="12" font-family="Arial" font-weight="bold" '
             'text-anchor="end" dominant-baseline="middle">{t}</text>'.format(
                 x=margin_left - 8,
                 y=f"{y:.2f}",
@@ -293,7 +297,7 @@ def _plot_svg(
             )
 
         parts.append(
-            '<text x="{x}" y="{y}" font-size="10" font-family="Arial" font-weight="bold" text-anchor="middle">'
+            '<text x="{x}" y="{y}" font-size="12" font-family="Arial" font-weight="bold" text-anchor="middle">'
             "{t}</text>".format(
                 x=f"{cx:.2f}",
                 y=f"{(y0 + 28):.2f}",
@@ -303,15 +307,15 @@ def _plot_svg(
 
     # Axis labels.
     parts.append(
-        '<text x="{x}" y="{y}" font-size="10" font-family="Arial" font-weight="bold" text-anchor="middle">'
+        '<text x="{x}" y="{y}" font-size="12" font-family="Arial" font-weight="bold" text-anchor="middle">'
         "Benchmark</text>".format(x=margin_left + plot_w / 2, y=height - 70)
     )
     parts.append(
-        '<text x="{x}" y="{y}" font-size="10" font-family="Arial" font-weight="bold" text-anchor="middle" '
+        '<text x="{x}" y="{y}" font-size="12" font-family="Arial" font-weight="bold" text-anchor="middle" '
         'transform="rotate(-90 {x} {y})">{t}</text>'.format(
             x=30,
             y=margin_top + plot_h / 2,
-            t=_svg_escape("Latency taken per-node (ms)"),
+            t=_svg_escape("Latency (ms)"),
         )
     )
 
@@ -323,10 +327,11 @@ def _plot_svg(
         ("(D) LZ4", colors["common_lz4"]),
         ("(D) Deflate", colors["common_deflate"]),
     ]
-    legend_cols = 5
-    cell_w = 245
-    lx = margin_left
-    ly = 28
+    legend_cols = len(legend_items)
+    cell_w = 220
+    legend_block_w = legend_cols * cell_w
+    lx = margin_left + max(0.0, (plot_w - legend_block_w) / 2.0) - 20
+    ly = 40
     for i, (label, color) in enumerate(legend_items):
         row = i // legend_cols
         col = i % legend_cols
@@ -336,7 +341,7 @@ def _plot_svg(
             f'<rect x="{xx}" y="{yy - 11}" width="15" height="15" fill="{color}" stroke="#222222" stroke-width="0.5"/>'
         )
         parts.append(
-            '<text x="{x}" y="{y}" font-size="10" font-family="Arial" font-weight="bold" dominant-baseline="middle">{t}</text>'.format(
+            '<text x="{x}" y="{y}" font-size="12" font-family="Arial" font-weight="bold" dominant-baseline="middle">{t}</text>'.format(
                 x=xx + 22,
                 y=yy - 3,
                 t=_svg_escape(label),
