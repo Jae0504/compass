@@ -468,23 +468,102 @@ ChunkedCompressed compress_deflate(const RawBlocks& raw_blocks,
     out.chunks.resize(raw_blocks.size());
     out.original_chunk_sizes.resize(raw_blocks.size(), 0);
 
+    if (raw_blocks.empty()) {
+        cycles = 0;
+        return out;
+    }
+
+    const qpl_path_t execution_path = qpl_path_software;
+    uint32_t job_size = 0;
+    qpl_status status = qpl_get_job_size(execution_path, &job_size);
+    if (status != QPL_STS_OK) {
+        throw std::runtime_error("Deflate(QPL-SW) qpl_get_job_size failed with status " +
+                                 std::to_string(status));
+    }
+    std::vector<uint8_t> job_buffer(job_size, 0);
+    qpl_job* job = reinterpret_cast<qpl_job*>(job_buffer.data());
+    status = qpl_init_job(execution_path, job);
+    if (status != QPL_STS_OK) {
+        throw std::runtime_error("Deflate(QPL-SW) qpl_init_job failed with status " +
+                                 std::to_string(status));
+    }
+    auto fini_job = [&]() { (void)qpl_fini_job(job); };
+
+    struct HuffmanTableGuard {
+        qpl_huffman_table_t table = nullptr;
+        ~HuffmanTableGuard() {
+            if (table != nullptr) {
+                (void)qpl_huffman_table_destroy(table);
+            }
+        }
+    } huffman_guard;
+
+    allocator_t default_allocator_c = {malloc, free};
+    status = qpl_deflate_huffman_table_create(
+        compression_table_type, execution_path, default_allocator_c, &huffman_guard.table);
+    if (status != QPL_STS_OK) {
+        fini_job();
+        throw std::runtime_error(
+            "Deflate(QPL-SW) Huffman table creation failed with status " +
+            std::to_string(status));
+    }
+
     const std::uint64_t t0 = __rdtsc();
     for (std::size_t i = 0; i < raw_blocks.size(); ++i) {
         const auto& raw_block = raw_blocks[i];
-        const std::size_t chunk_size = raw_block.size();
-        uLongf dst_cap = compressBound(static_cast<uLong>(chunk_size));
-        out.chunks[i].resize(static_cast<std::size_t>(dst_cap));
-        int ret = compress2(out.chunks[i].data(), &dst_cap, raw_block.data(),
-                            static_cast<uLong>(chunk_size), 1);
-        if (ret != Z_OK) {
-            throw std::runtime_error("Deflate compression failed.");
+        const uint32_t chunk_size = static_cast<uint32_t>(raw_block.size());
+        out.original_chunk_sizes[i] = chunk_size;
+
+        qpl_histogram deflate_histogram {};
+        status = qpl_gather_deflate_statistics(
+            const_cast<uint8_t*>(raw_block.data()), chunk_size, &deflate_histogram,
+            qpl_default_level, execution_path);
+        if (status != QPL_STS_OK) {
+            fini_job();
+            throw std::runtime_error(
+                "Deflate(QPL-SW) gather statistics failed at chunk " +
+                std::to_string(i) + " with status " + std::to_string(status));
         }
+
+        status = qpl_huffman_table_init_with_histogram(
+            huffman_guard.table, &deflate_histogram);
+        if (status != QPL_STS_OK) {
+            fini_job();
+            throw std::runtime_error(
+                "Deflate(QPL-SW) Huffman init failed at chunk " +
+                std::to_string(i) + " with status " + std::to_string(status));
+        }
+
+        const uint32_t dst_cap =
+            qpl_get_safe_deflate_compression_buffer_size(chunk_size);
         out.chunks[i].resize(static_cast<std::size_t>(dst_cap));
-        out.compressed_bytes += out.chunks[i].size();
-        out.original_chunk_sizes[i] = static_cast<std::uint32_t>(chunk_size);
+
+        job->op = qpl_op_compress;
+        job->level = qpl_default_level;
+        job->next_in_ptr = const_cast<uint8_t*>(raw_block.data());
+        job->available_in = chunk_size;
+        job->next_out_ptr = out.chunks[i].data();
+        job->available_out = dst_cap;
+        job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_OMIT_VERIFY;
+        job->huffman_table = huffman_guard.table;
+        job->dictionary = nullptr;
+
+        status = qpl_execute_job(job);
+        if (status != QPL_STS_OK) {
+            fini_job();
+            throw std::runtime_error(
+                "Deflate(QPL-SW) compression failed at chunk " +
+                std::to_string(i) + " with status " + std::to_string(status));
+        }
+
+        const std::size_t produced = static_cast<std::size_t>(job->total_out);
+        out.chunks[i].resize(produced);
+        out.compressed_bytes += produced;
     }
     const std::uint64_t t1 = __rdtsc();
+
     cycles = t1 - t0;
+    fini_job();
     return out;
 }
 
@@ -495,25 +574,62 @@ bool decompress_deflate(const ChunkedCompressed& compressed,
     const std::size_t total_size = total_original_bytes(compressed);
     output.assign(total_size, 0);
 
+    if (compressed.chunks.empty()) {
+        latency_ns = 0;
+        return true;
+    }
+
+    const qpl_path_t execution_path = qpl_path_software;
+    uint32_t job_size = 0;
+    qpl_status status = qpl_get_job_size(execution_path, &job_size);
+    if (status != QPL_STS_OK) {
+        std::ostringstream oss;
+        oss << "Deflate(QPL-SW) qpl_get_job_size failed with status " << status;
+        error = oss.str();
+        return false;
+    }
+    std::vector<uint8_t> job_buffer(job_size, 0);
+    qpl_job* job = reinterpret_cast<qpl_job*>(job_buffer.data());
+    status = qpl_init_job(execution_path, job);
+    if (status != QPL_STS_OK) {
+        std::ostringstream oss;
+        oss << "Deflate(QPL-SW) qpl_init_job failed with status " << status;
+        error = oss.str();
+        return false;
+    }
+    auto fini_job = [&]() { (void)qpl_fini_job(job); };
+
     const auto t0 = std::chrono::high_resolution_clock::now();
     std::size_t offset = 0;
     for (std::size_t i = 0; i < compressed.chunks.size(); ++i) {
         const auto& chunk = compressed.chunks[i];
-        uLongf out_size = compressed.original_chunk_sizes[i];
-        int ret = uncompress(output.data() + offset, &out_size, chunk.data(),
-                             static_cast<uLong>(chunk.size()));
-        if (ret != Z_OK ||
-            out_size != compressed.original_chunk_sizes[i]) {
+        const uint32_t expected = compressed.original_chunk_sizes[i];
+
+        job->op = qpl_op_decompress;
+        job->next_in_ptr = const_cast<uint8_t*>(chunk.data());
+        job->available_in = static_cast<uint32_t>(chunk.size());
+        job->next_out_ptr = output.data() + offset;
+        job->available_out = expected;
+        job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
+        job->dictionary = nullptr;
+        job->huffman_table = nullptr;
+
+        status = qpl_execute_job(job);
+        if (status != QPL_STS_OK ||
+            static_cast<uint32_t>(job->total_out) != expected) {
             std::ostringstream oss;
-            oss << "Deflate decompression failed at chunk " << i;
+            oss << "Deflate(QPL-SW) decompression failed at chunk " << i
+                << " with status " << status;
             error = oss.str();
+            fini_job();
             return false;
         }
-        offset += static_cast<std::size_t>(out_size);
+        offset += static_cast<std::size_t>(expected);
     }
     const auto t1 = std::chrono::high_resolution_clock::now();
     latency_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    fini_job();
     return true;
 }
 
