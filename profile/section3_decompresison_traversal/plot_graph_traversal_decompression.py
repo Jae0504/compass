@@ -72,6 +72,7 @@ def _try_plot_matplotlib(
 ) -> bool:
     try:
         import matplotlib.pyplot as plt
+        from matplotlib.ticker import AutoMinorLocator, FuncFormatter
     except ModuleNotFoundError:
         return False
 
@@ -89,63 +90,82 @@ def _try_plot_matplotlib(
         "common_deflate": "#1E8FFF",
         "distance": "#111111",
         "traversal": "#6D6D6D",
-        "candidate": "#BFBFBF",
+        "candidate": "#FF0000",
     }
 
-    # Fixed output size: 16cm x 4.5cm.
-    fig, ax = plt.subplots(figsize=(16.0 / 2.54, 4.5 / 2.54))
-    # Keep stacked bar first in each benchmark group.
-    stack_x = [v - 1 * w for v in x]
-    ax.bar(stack_x, dist, width=w, label="Dist. Calc.", color=colors["distance"])
-    ax.bar(
-        stack_x,
-        trav,
-        width=w,
-        bottom=dist,
-        label="Graph Trav.",
-        color=colors["traversal"],
-    )
-    ax.bar(
-        stack_x,
-        cand,
-        width=w,
-        bottom=[dist[i] + trav[i] for i in range(len(dist))],
-        label="Cand. Update",
-        color=colors["candidate"],
-    )
+    stack_totals = [dist[i] + trav[i] + cand[i] for i in range(len(dist))]
+    max_stack = max(stack_totals)
+    max_top = max(max_stack, max(common_lz4), max(common_deflate))
 
-    ax.bar(
-        [v + 0 * w for v in x],
-        common_lz4,
-        width=w,
-        label="(D) LZ4",
-        color=colors["common_lz4"],
-    )
-    ax.bar(
-        [v + 1 * w for v in x],
-        common_deflate,
-        width=w,
-        label="(D) Deflate",
-        color=colors["common_deflate"],
-    )
-    ax.set_xticks(x)
-    ax.set_xticklabels(bench_names)
-    ax.set_xlabel("Benchmark", labelpad=-1, fontsize=12, fontweight="bold", fontfamily="Arial")
-    ax.set_ylabel(
-        "Latency (ms)",
-        fontsize=12,
-        fontweight="bold",
-        fontfamily="Arial",
-    )
-    max_top = max(
-        max([dist[i] + trav[i] + cand[i] for i in range(len(dist))]),
-        max(common_lz4),
-        max(common_deflate),
-    )
-    ax.set_ylim(0.0, max_top * 1.1)
-    for label in ax.get_xticklabels() + ax.get_yticklabels():
-        label.set_fontweight("bold")
-    ax.grid(axis="y", linestyle=":", alpha=0.35)
+    # Lower half: linear scale for stacked bars.
+    lower_max = max(max_stack * 1.05, 0.1)
+    # Upper half: log scale to keep large (D) Deflate visible without hiding stack details.
+    upper_min = max(lower_max, 1e-6)
+    upper_max = max(max_top * 1.10, upper_min * 1.05, 0.4)
+
+    # Fixed output size: 16cm x 4.5cm.
+    fig = plt.figure(figsize=(16.0 / 2.54, 4.5 / 2.54))
+    gs = fig.add_gridspec(2, 1, height_ratios=[1, 1], hspace=0.0)
+    ax_top = fig.add_subplot(gs[0])
+    ax_bottom = fig.add_subplot(gs[1], sharex=ax_top)
+
+    stack_x = [v - 1 * w for v in x]
+    lz4_x = [v + 0 * w for v in x]
+    deflate_x = [v + 1 * w for v in x]
+
+    def draw_bars(ax, baseline: float, with_legend: bool) -> None:
+        dist_label = "Dist. Calc." if with_legend else "_nolegend_"
+        trav_label = "Graph Trav." if with_legend else "_nolegend_"
+        cand_label = "Cand. Update" if with_legend else "_nolegend_"
+        lz4_label = "(D) LZ4" if with_legend else "_nolegend_"
+        deflate_label = "(D) Deflate" if with_legend else "_nolegend_"
+
+        base = [baseline] * len(dist)
+        dist_bottom = base
+        trav_bottom = [baseline + dist[i] for i in range(len(dist))]
+        cand_bottom = [baseline + dist[i] + trav[i] for i in range(len(dist))]
+
+        ax.bar(stack_x, dist, width=w, bottom=dist_bottom, label=dist_label, color=colors["distance"])
+        ax.bar(stack_x, trav, width=w, bottom=trav_bottom, label=trav_label, color=colors["traversal"])
+        ax.bar(stack_x, cand, width=w, bottom=cand_bottom, label=cand_label, color=colors["candidate"])
+        ax.bar(lz4_x, common_lz4, width=w, bottom=base, label=lz4_label, color=colors["common_lz4"])
+        ax.bar(deflate_x, common_deflate, width=w, bottom=base, label=deflate_label, color=colors["common_deflate"])
+
+    # Bottom axis is exact linear bars from zero.
+    draw_bars(ax_bottom, baseline=0.0, with_legend=True)
+    # Top axis uses a tiny positive baseline so bars are valid on log scale.
+    draw_bars(ax_top, baseline=max(upper_min * 1e-3, 1e-6), with_legend=False)
+
+    ax_bottom.set_ylim(0.0, lower_max)
+    ax_top.set_yscale("log")
+    ax_top.set_ylim(upper_min, upper_max)
+
+    # Fixed y-ticks requested by user.
+    ax_bottom.set_yticks([0.0, 0.1])
+    ax_top.set_yticks([0.2, 0.3, 0.4])
+    ax_bottom.yaxis.set_minor_locator(AutoMinorLocator(5))
+    ax_top.set_yticks([0.25, 0.35], minor=True)
+    fmt = FuncFormatter(lambda val, _: f"{val:.1f}")
+    ax_top.yaxis.set_major_formatter(fmt)
+    ax_bottom.yaxis.set_major_formatter(fmt)
+    ax_top.tick_params(axis="y", which="minor", left=False, right=False, labelleft=False)
+    ax_bottom.tick_params(axis="y", which="minor", left=False, right=False, labelleft=False)
+
+    ax_bottom.set_xticks(x)
+    ax_bottom.set_xticklabels(bench_names)
+    ax_top.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+    ax_bottom.set_xlabel("Benchmark", labelpad=-1, fontsize=12, fontweight="bold", fontfamily="Arial")
+    fig.text(0.02, 0.50, "Latency (ms)", rotation=90, va="center", ha="center", fontsize=12, fontweight="bold", fontfamily="Arial")
+
+    for axis in (ax_top, ax_bottom):
+        for label in axis.get_xticklabels() + axis.get_yticklabels():
+            label.set_fontweight("bold")
+        axis.grid(axis="y", which="major", linestyle=":", alpha=0.35, linewidth=1.0)
+        axis.grid(axis="y", which="minor", linestyle=":", alpha=0.22, linewidth=0.8)
+
+    # Visual break marker between linear and log parts.
+    ax_top.spines["bottom"].set_visible(False)
+    ax_bottom.spines["top"].set_visible(False)
 
     legend_order = [
         "Graph Trav.",
@@ -154,15 +174,15 @@ def _try_plot_matplotlib(
         "(D) LZ4",
         "(D) Deflate",
     ]
-    handles, labels = ax.get_legend_handles_labels()
+    handles, labels = ax_bottom.get_legend_handles_labels()
     label_to_handle = {label: handle for handle, label in zip(handles, labels)}
     ordered_labels = [label for label in legend_order if label in label_to_handle]
     ordered_handles = [label_to_handle[label] for label in ordered_labels]
-    ax.legend(
+    fig.legend(
         ordered_handles,
         ordered_labels,
         loc="upper center",
-        bbox_to_anchor=(0.47, 1.22),
+        bbox_to_anchor=(0.5, 1.01),
         ncol=5,
         fontsize=12,
         prop={"family": "Arial", "size": 12, "weight": "bold"},
@@ -173,9 +193,8 @@ def _try_plot_matplotlib(
         borderaxespad=0.0,
     )
 
-    # Keep plotting-area height close to previous config while shrinking figure height.
     fig.subplots_adjust(left=0.095, right=0.995, bottom=0.19, top=0.868)
-    ax.tick_params(axis="x", pad=1)
+    ax_bottom.tick_params(axis="x", pad=1)
     fig.savefig(out_path, dpi=200)
     return True
 
@@ -200,7 +219,7 @@ def _plot_svg(
 
     all_values = common_lz4 + common_deflate
     all_values += [dist[i] + trav[i] + cand[i] for i in range(len(dist))]
-    ymax = max(1.0, max(all_values)) * 1.1
+    ymax = max(0.4, max(1.0, max(all_values)) * 1.1)
 
     def y_to_px(v: float) -> float:
         return margin_top + plot_h * (1.0 - (v / ymax))
@@ -220,7 +239,7 @@ def _plot_svg(
         "common_deflate": "#1E8FFF",
         "distance": "#111111",
         "traversal": "#6D6D6D",
-        "candidate": "#BFBFBF",
+        "candidate": "#FF0000",
     }
 
     parts = []
@@ -231,9 +250,10 @@ def _plot_svg(
     parts.append('<rect x="0" y="0" width="100%" height="100%" fill="white"/>')
 
     # Grid + y-axis ticks.
-    n_ticks = 6
-    for i in range(n_ticks + 1):
-        v = ymax * i / n_ticks
+    fixed_ticks = [0.0, 0.1, 0.2, 0.3, 0.4]
+    for v in fixed_ticks:
+        if v > ymax + 1e-12:
+            continue
         y = y_to_px(v)
         parts.append(
             f'<line x1="{margin_left}" y1="{y:.2f}" x2="{margin_left + plot_w}" y2="{y:.2f}" '
@@ -244,7 +264,7 @@ def _plot_svg(
             'text-anchor="end" dominant-baseline="middle">{t}</text>'.format(
                 x=margin_left - 8,
                 y=f"{y:.2f}",
-                t=f"{v:.3f}",
+                t=f"{v:.1f}",
             )
         )
 
