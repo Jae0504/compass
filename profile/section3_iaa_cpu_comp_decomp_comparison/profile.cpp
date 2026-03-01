@@ -57,6 +57,7 @@ struct ChunkedCompressed {
     std::vector<std::vector<uint8_t>> chunks;
     std::vector<std::uint32_t> original_chunk_sizes;
     std::vector<uint8_t> dictionary_raw;
+    bool iaa_dynamic = false;
     std::size_t compressed_bytes = 0;
 };
 
@@ -713,8 +714,10 @@ private:
 };
 
 ChunkedCompressed compress_iaa(const RawBlocks& raw_blocks,
-                               std::uint64_t& cycles) {
+                               std::uint64_t& cycles,
+                               bool dynamic_mode = false) {
     ChunkedCompressed out;
+    out.iaa_dynamic = dynamic_mode;
     const std::size_t chunk_count = raw_blocks.size();
     out.chunks.resize(chunk_count);
     out.original_chunk_sizes.resize(chunk_count, 0);
@@ -757,39 +760,44 @@ ChunkedCompressed compress_iaa(const RawBlocks& raw_blocks,
         qpl_dictionary* dictionary = nullptr;
     } dictionary_guard;
 
-    allocator_t default_allocator_c = {malloc, free};
-    qpl_status status = qpl_deflate_huffman_table_create(
-        compression_table_type, execution_path, default_allocator_c, &huffman_guard.table);
-    if (status != QPL_STS_OK) {
-        throw std::runtime_error(
-            "IAA static Huffman table creation failed with status " +
-            std::to_string(status));
-    }
-
-    out.dictionary_raw = collect_dictionary_raw(raw_blocks, kDictionaryRawSize);
-    if (!out.dictionary_raw.empty()) {
-        const sw_compression_level sw_compr_level = SW_NONE;
-        const hw_compression_level hw_compr_level = HW_LEVEL_1;
-        const std::size_t dictionary_buffer_size = qpl_get_dictionary_size(
-            sw_compr_level, hw_compr_level, out.dictionary_raw.size());
-        if (dictionary_buffer_size == 0) {
-            throw std::runtime_error("IAA dictionary buffer size is zero.");
-        }
-
-        dictionary_guard.buffer = std::make_unique<uint8_t[]>(dictionary_buffer_size);
-        dictionary_guard.dictionary =
-            reinterpret_cast<qpl_dictionary*>(dictionary_guard.buffer.get());
-        status = qpl_build_dictionary(dictionary_guard.dictionary,
-                                      sw_compr_level,
-                                      hw_compr_level,
-                                      out.dictionary_raw.data(),
-                                      out.dictionary_raw.size());
+    qpl_status status = QPL_STS_OK;
+    if (!dynamic_mode) {
+        allocator_t default_allocator_c = {malloc, free};
+        status = qpl_deflate_huffman_table_create(
+            compression_table_type, execution_path, default_allocator_c, &huffman_guard.table);
         if (status != QPL_STS_OK) {
-            throw std::runtime_error("IAA dictionary build failed with status " +
-                                     std::to_string(status));
+            throw std::runtime_error(
+                "IAA static Huffman table creation failed with status " +
+                std::to_string(status));
         }
+
+        out.dictionary_raw = collect_dictionary_raw(raw_blocks, kDictionaryRawSize);
+        if (!out.dictionary_raw.empty()) {
+            const sw_compression_level sw_compr_level = SW_NONE;
+            const hw_compression_level hw_compr_level = HW_LEVEL_1;
+            const std::size_t dictionary_buffer_size = qpl_get_dictionary_size(
+                sw_compr_level, hw_compr_level, out.dictionary_raw.size());
+            if (dictionary_buffer_size == 0) {
+                throw std::runtime_error("IAA dictionary buffer size is zero.");
+            }
+
+            dictionary_guard.buffer = std::make_unique<uint8_t[]>(dictionary_buffer_size);
+            dictionary_guard.dictionary =
+                reinterpret_cast<qpl_dictionary*>(dictionary_guard.buffer.get());
+            status = qpl_build_dictionary(dictionary_guard.dictionary,
+                                          sw_compr_level,
+                                          hw_compr_level,
+                                          out.dictionary_raw.data(),
+                                          out.dictionary_raw.size());
+            if (status != QPL_STS_OK) {
+                throw std::runtime_error("IAA dictionary build failed with status " +
+                                         std::to_string(status));
+            }
+        }
+    } else {
+        out.dictionary_raw.clear();
     }
-    bool use_dictionary = (dictionary_guard.dictionary != nullptr);
+    bool use_dictionary = (!dynamic_mode && dictionary_guard.dictionary != nullptr);
 
     auto submit_compress_job = [&](std::size_t chunk_index) -> void {
         const std::size_t slot = chunk_index % pool.size();
@@ -798,22 +806,24 @@ ChunkedCompressed compress_iaa(const RawBlocks& raw_blocks,
         const auto& raw_block = raw_blocks[chunk_index];
         const uint32_t raw_size = out.original_chunk_sizes[chunk_index];
 
-        qpl_histogram deflate_histogram {};
-        status = qpl_gather_deflate_statistics(
-            const_cast<uint8_t*>(raw_block.data()), raw_size, &deflate_histogram,
-            qpl_default_level, execution_path);
-        if (status != QPL_STS_OK) {
-            throw std::runtime_error(
-                "IAA gather deflate statistics failed at chunk " +
-                std::to_string(chunk_index) + " with status " + std::to_string(status));
-        }
+        if (!dynamic_mode) {
+            qpl_histogram deflate_histogram {};
+            status = qpl_gather_deflate_statistics(
+                const_cast<uint8_t*>(raw_block.data()), raw_size, &deflate_histogram,
+                qpl_default_level, execution_path);
+            if (status != QPL_STS_OK) {
+                throw std::runtime_error(
+                    "IAA gather deflate statistics failed at chunk " +
+                    std::to_string(chunk_index) + " with status " + std::to_string(status));
+            }
 
-        status = qpl_huffman_table_init_with_histogram(
-            huffman_guard.table, &deflate_histogram);
-        if (status != QPL_STS_OK) {
-            throw std::runtime_error(
-                "IAA Huffman table init failed at chunk " +
-                std::to_string(chunk_index) + " with status " + std::to_string(status));
+            status = qpl_huffman_table_init_with_histogram(
+                huffman_guard.table, &deflate_histogram);
+            if (status != QPL_STS_OK) {
+                throw std::runtime_error(
+                    "IAA Huffman table init failed at chunk " +
+                    std::to_string(chunk_index) + " with status " + std::to_string(status));
+            }
         }
 
         // Excluded from cycle accounting by request. Keep output buffer fixed at 2MB,
@@ -826,15 +836,19 @@ ChunkedCompressed compress_iaa(const RawBlocks& raw_blocks,
         job->available_in = raw_size;
         job->next_out_ptr = slot_buffers[slot].data();
         job->available_out = static_cast<uint32_t>(kIaaOutBufferSize);
-        job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_OMIT_VERIFY;
+        job->flags = dynamic_mode
+            ? (QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_OMIT_VERIFY |
+               QPL_FLAG_DYNAMIC_HUFFMAN)
+            : (QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_OMIT_VERIFY);
         job->dictionary = use_dictionary ? dictionary_guard.dictionary : nullptr;
-        job->huffman_table = huffman_guard.table;
+        job->huffman_table = dynamic_mode ? nullptr : huffman_guard.table;
 
         const std::uint64_t t0 = __rdtsc();
         status = qpl_submit_job(job);
         const std::uint64_t t1 = __rdtsc();
         cycles += (t1 - t0);
-        if (status == QPL_STS_NOT_SUPPORTED_MODE_ERR && use_dictionary) {
+        if (!dynamic_mode &&
+            status == QPL_STS_NOT_SUPPORTED_MODE_ERR && use_dictionary) {
             // Some Intel IAA devices do not support dictionary mode on hardware.
             use_dictionary = false;
             out.dictionary_raw.clear();
@@ -925,6 +939,7 @@ bool decompress_iaa(const ChunkedCompressed& compressed,
 
     const std::size_t queue_size = std::min<std::size_t>(kQueueSize, compressed.chunks.size());
     IaaJobPool pool(queue_size);
+    const bool dynamic_mode = compressed.iaa_dynamic;
 
     struct HuffmanTableGuard {
         qpl_huffman_table_t table = nullptr;
@@ -935,16 +950,19 @@ bool decompress_iaa(const ChunkedCompressed& compressed,
         }
     } huffman_guard;
 
-    allocator_t default_allocator_c = {malloc, free};
-    qpl_status status = qpl_deflate_huffman_table_create(
-        decompression_table_type, qpl_path_hardware, default_allocator_c,
-        &huffman_guard.table);
-    if (status != QPL_STS_OK) {
-        std::ostringstream oss;
-        oss << "IAA decompression Huffman table creation failed with status "
-            << status;
-        error = oss.str();
-        return false;
+    qpl_status status = QPL_STS_OK;
+    if (!dynamic_mode) {
+        allocator_t default_allocator_c = {malloc, free};
+        status = qpl_deflate_huffman_table_create(
+            decompression_table_type, qpl_path_hardware, default_allocator_c,
+            &huffman_guard.table);
+        if (status != QPL_STS_OK) {
+            std::ostringstream oss;
+            oss << "IAA decompression Huffman table creation failed with status "
+                << status;
+            error = oss.str();
+            return false;
+        }
     }
 
     struct DictionaryGuard {
@@ -952,7 +970,7 @@ bool decompress_iaa(const ChunkedCompressed& compressed,
         qpl_dictionary* dictionary = nullptr;
     } dictionary_guard;
 
-    if (!compressed.dictionary_raw.empty()) {
+    if (!dynamic_mode && !compressed.dictionary_raw.empty()) {
         const sw_compression_level sw_compr_level = SW_NONE;
         const hw_compression_level hw_compr_level = HW_LEVEL_1;
         const std::size_t dictionary_buffer_size = qpl_get_dictionary_size(
@@ -997,8 +1015,8 @@ bool decompress_iaa(const ChunkedCompressed& compressed,
         job->next_out_ptr = output.data() + output_offsets[chunk_index];
         job->available_out = expected;
         job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST;
-        job->dictionary = dictionary_guard.dictionary;
-        job->huffman_table = huffman_guard.table;
+        job->dictionary = dynamic_mode ? nullptr : dictionary_guard.dictionary;
+        job->huffman_table = dynamic_mode ? nullptr : huffman_guard.table;
 
         qpl_status status = qpl_submit_job(job);
         if (status != QPL_STS_OK) {
@@ -1147,18 +1165,19 @@ BenchmarkResult run_iaa(const std::string& dataset,
                         std::size_t block_size) {
     BenchmarkResult result;
     result.dataset = dataset;
-    result.algorithm = "IAA(HW)";
+    result.algorithm = "IAA(HW-Sta)";
     result.block_size = block_size;
     result.original_bytes = data.size();
 
     try {
         ChunkedCompressed compressed;
-        compressed = compress_iaa(requested_blocks, result.compression_cycles);
-
+        std::uint64_t ignored_compression_cycles = 0;
+        compressed = compress_iaa(requested_blocks, ignored_compression_cycles, false);
+        result.compression_cycles = ignored_compression_cycles;
         result.compressed_bytes = compressed.compressed_bytes;
-        result.compression_ratio =
-            static_cast<double>(result.compressed_bytes) /
-            static_cast<double>(result.original_bytes);
+        result.compression_ratio = static_cast<double>(result.compressed_bytes) / static_cast<double>(result.original_bytes);
+
+        compressed = compress_iaa(requested_blocks, ignored_compression_cycles, true);
 
         std::vector<uint8_t> decompressed;
         std::string err;
@@ -1226,7 +1245,7 @@ void print_dataset_header(const std::string& dataset,
 }
 
 void print_result(const BenchmarkResult& r) {
-    std::cout << std::left << std::setw(10) << r.algorithm
+    std::cout << std::left << std::setw(12) << r.algorithm
               << std::setw(8) << block_label(r.block_size)
               << std::right << std::setw(12) << r.original_bytes
               << std::setw(14) << r.compressed_bytes
@@ -1279,7 +1298,7 @@ int main(int argc, char** argv) {
 
             print_dataset_header(dataset, data.rows, data.columns,
                                  data.bytes.size());
-            std::cout << std::left << std::setw(10) << "Algorithm"
+            std::cout << std::left << std::setw(12) << "Algorithm"
                       << std::setw(8) << "Block"
                       << std::right << std::setw(12) << "Original"
                       << std::setw(14) << "Compressed"
@@ -1304,6 +1323,7 @@ int main(int argc, char** argv) {
                 print_result(run_lz4(dataset, data.bytes, raw_blocks, block));
                 print_result(run_deflate(dataset, data.bytes, raw_blocks, block));
                 print_result(run_iaa(dataset, data.bytes, raw_blocks, block));
+                std::cout << "===============================================================\n";
             }
         }
     } catch (const std::exception& e) {
