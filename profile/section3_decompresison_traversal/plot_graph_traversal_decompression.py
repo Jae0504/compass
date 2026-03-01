@@ -90,7 +90,7 @@ def _try_plot_matplotlib(
         "common_deflate": "#1E8FFF",
         "distance": "#111111",
         "traversal": "#6D6D6D",
-        "candidate": "#FF0000",
+        "candidate": "#BFBFBF",
     }
 
     stack_totals = [dist[i] + trav[i] + cand[i] for i in range(len(dist))]
@@ -239,7 +239,7 @@ def _plot_svg(
         "common_deflate": "#1E8FFF",
         "distance": "#111111",
         "traversal": "#6D6D6D",
-        "candidate": "#FF0000",
+        "candidate": "#BFBFBF",
     }
 
     parts = []
