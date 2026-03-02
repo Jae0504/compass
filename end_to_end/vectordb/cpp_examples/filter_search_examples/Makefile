@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS ?= -O3 -std=c++17 -Wall -Wextra -pthread
+CXXFLAGS ?= -Ofast -std=c++17 -march=native -fopenmp -ftree-vectorize -DNDEBUG -Wall -Wextra -pthread
 
 ROOT_DIR ?= $(abspath ../../../..)
 

@@ -290,8 +290,10 @@ struct SequentialEqRuntime {
 };
 
 struct SequentialEqQueryCache {
-    std::unordered_map<size_t, std::vector<uint8_t>> tb_blocks;
-    std::unordered_map<size_t, std::vector<uint8_t>> fid_blocks;
+    std::vector<std::vector<uint8_t>> tb_blocks;
+    std::vector<uint8_t> tb_ready;
+    std::vector<std::vector<uint8_t>> fid_blocks;
+    std::vector<uint8_t> fid_ready;
 };
 
 std::unique_ptr<filter_expr::Node> parse_filter_ast(const std::string& expression) {
@@ -672,6 +674,52 @@ SequentialEqRuntime build_sequential_eq_runtime(
     return runtime;
 }
 
+void ensure_lz4_block_ready(
+    const compass_lz4_filter::detail::Lz4BlockStorage& storage,
+    size_t block_id,
+    bool is_fid,
+    std::vector<std::vector<uint8_t>>* blocks,
+    std::vector<uint8_t>* ready,
+    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
+    if (blocks == nullptr || ready == nullptr) {
+        throw std::runtime_error("LZ4 block cache pointers must not be null");
+    }
+    if (block_id >= storage.block_count() || block_id >= blocks->size() || block_id >= ready->size()) {
+        throw std::runtime_error("LZ4 block id out of range");
+    }
+    if ((*ready)[block_id] != 0) {
+        return;
+    }
+
+    const size_t raw_len = static_cast<size_t>(storage.raw_block_sizes[block_id]);
+    std::vector<uint8_t>& out = (*blocks)[block_id];
+    out.resize(raw_len);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const int ret = LZ4_decompress_safe(
+        storage.compressed_blocks[block_id].data(),
+        reinterpret_cast<char*>(out.data()),
+        static_cast<int>(storage.compressed_blocks[block_id].size()),
+        static_cast<int>(raw_len));
+    const auto t1 = std::chrono::steady_clock::now();
+    if (ret != static_cast<int>(raw_len)) {
+        throw std::runtime_error("LZ4 decompression failed at block " + std::to_string(block_id));
+    }
+
+    (*ready)[block_id] = 1;
+    if (metrics != nullptr) {
+        metrics->lz4_decompress_time_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        if (is_fid) {
+            ++metrics->fid_blocks_decompressed;
+            metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
+        } else {
+            ++metrics->tb_blocks_decompressed;
+            metrics->tb_bytes_decompressed += static_cast<uint64_t>(raw_len);
+        }
+    }
+}
+
 void prefetch_tb_blocks(
     const SequentialEqRuntime& runtime,
     SequentialEqQueryCache* cache,
@@ -680,11 +728,12 @@ void prefetch_tb_blocks(
         throw std::runtime_error("TB prefetch received null cache");
     }
     for (size_t block_id = 0; block_id < runtime.tb_storage.block_count(); ++block_id) {
-        (void)compass_lz4_filter::detail::get_or_decompress_block(
+        ensure_lz4_block_ready(
             runtime.tb_storage,
             block_id,
             false,
             &cache->tb_blocks,
+            &cache->tb_ready,
             metrics);
     }
 }
@@ -700,11 +749,12 @@ void prefetch_fid_block(
     if (block_id >= runtime.fid_storage.block_count()) {
         return;
     }
-    (void)compass_lz4_filter::detail::get_or_decompress_block(
+    ensure_lz4_block_ready(
         runtime.fid_storage,
         block_id,
         true,
         &cache->fid_blocks,
+        &cache->fid_ready,
         metrics);
 }
 
@@ -720,15 +770,18 @@ bool tb_match_node(
     const size_t byte_offset = node_id / 8;
     const size_t block_id = byte_offset / runtime.tb_storage.block_size;
     const size_t in_block = byte_offset % runtime.tb_storage.block_size;
-    auto it = cache->tb_blocks.find(block_id);
-    if (it == cache->tb_blocks.end() || in_block >= it->second.size()) {
+    if (block_id >= cache->tb_blocks.size() || cache->tb_ready[block_id] == 0) {
+        return false;
+    }
+    const std::vector<uint8_t>& block = cache->tb_blocks[block_id];
+    if (in_block >= block.size()) {
         return false;
     }
 
     if (metrics != nullptr) {
         ++metrics->tb_cache_hits;
     }
-    const uint8_t byte = it->second[in_block];
+    const uint8_t byte = block[in_block];
     return ((byte >> (node_id % 8)) & 1u) != 0;
 }
 
@@ -743,15 +796,18 @@ bool fid_match_node(
 
     const size_t block_id = node_id / runtime.fid_storage.block_size;
     const size_t in_block = node_id % runtime.fid_storage.block_size;
-    auto it = cache->fid_blocks.find(block_id);
-    if (it == cache->fid_blocks.end() || in_block >= it->second.size()) {
+    if (block_id >= cache->fid_blocks.size() || cache->fid_ready[block_id] == 0) {
+        return false;
+    }
+    const std::vector<uint8_t>& block = cache->fid_blocks[block_id];
+    if (in_block >= block.size()) {
         return false;
     }
 
     if (metrics != nullptr) {
         ++metrics->fid_cache_hits;
     }
-    const uint8_t bucket = it->second[in_block];
+    const uint8_t bucket = block[in_block];
     return runtime.allowed_buckets.test(static_cast<size_t>(bucket));
 }
 
@@ -950,7 +1006,10 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
     }
 
     SequentialEqQueryCache cache;
-    cache.tb_blocks.reserve(runtime.tb_storage.block_count());
+    cache.tb_blocks.resize(runtime.tb_storage.block_count());
+    cache.tb_ready.assign(runtime.tb_storage.block_count(), 0);
+    cache.fid_blocks.resize(runtime.fid_storage.block_count());
+    cache.fid_ready.assign(runtime.fid_storage.block_count(), 0);
     prefetch_tb_blocks(runtime, &cache, &call_stats->decomp);
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
@@ -995,15 +1054,26 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             neighbor_ids.push_back(candidate_id);
         }
 
+        struct FrontierCandidate {
+            hnswlib::tableint candidate_id = 0;
+            DistT dist{};
+            uint64_t tb_eval_time_ns = 0;
+            bool deleted = false;
+        };
+
+        std::vector<FrontierCandidate> frontier_candidates;
+        frontier_candidates.reserve(neighbor_ids.size());
+
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
-            const auto t0 = std::chrono::steady_clock::now();
+            const auto tb_t0 = std::chrono::steady_clock::now();
             const bool tb_match = tb_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
+            const auto tb_t1 = std::chrono::steady_clock::now();
+            const uint64_t tb_eval_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(tb_t1 - tb_t0).count());
             if (!tb_match) {
-                const auto t1 = std::chrono::steady_clock::now();
                 ++call_stats->filter_eval_calls;
-                call_stats->filter_eval_time_ns += static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                call_stats->filter_eval_time_ns += tb_eval_ns;
                 continue;
             }
 
@@ -1012,30 +1082,52 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 index.getDataByInternalId(candidate_id),
                 index.dist_func_param_);
 
-            if (runtime.fid_storage.block_size != 0) {
-                const size_t fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
-                prefetch_fid_block(runtime, fid_block_id, &cache, &call_stats->decomp);
+            const bool prelim_consider = (top_candidates.size() < ef || lower_bound > dist);
+            if (!prelim_consider) {
+                ++call_stats->filter_eval_calls;
+                call_stats->filter_eval_time_ns += tb_eval_ns;
+                continue;
             }
-            const bool fid_match = fid_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
-            const auto t1 = std::chrono::steady_clock::now();
+
+            frontier_candidates.push_back(
+                FrontierCandidate{candidate_id, dist, tb_eval_ns, index.isMarkedDeleted(candidate_id)});
+        }
+
+        for (const FrontierCandidate& entry : frontier_candidates) {
+            const bool consider = (top_candidates.size() < ef || lower_bound > entry.dist);
+            if (!consider) {
+                ++call_stats->filter_eval_calls;
+                call_stats->filter_eval_time_ns += entry.tb_eval_time_ns;
+                continue;
+            }
+
+            candidate_set.emplace(-entry.dist, entry.candidate_id);
+
+            uint64_t filter_eval_ns = entry.tb_eval_time_ns;
+            bool fid_match = true;
+            if (runtime.fid_storage.block_size != 0) {
+                const size_t fid_block_id = static_cast<size_t>(entry.candidate_id) / runtime.fid_storage.block_size;
+                const auto fid_t0 = std::chrono::steady_clock::now();
+                prefetch_fid_block(runtime, fid_block_id, &cache, &call_stats->decomp);
+                fid_match = fid_match_node(runtime, &cache, static_cast<size_t>(entry.candidate_id), &call_stats->decomp);
+                const auto fid_t1 = std::chrono::steady_clock::now();
+                filter_eval_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(fid_t1 - fid_t0).count());
+            }
+
             ++call_stats->filter_eval_calls;
-            call_stats->filter_eval_time_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            call_stats->filter_eval_time_ns += filter_eval_ns;
 
-            if (top_candidates.size() < ef || lower_bound > dist) {
-                candidate_set.emplace(-dist, candidate_id);
+            const bool result_allowed = !entry.deleted && fid_match;
+            if (result_allowed) {
+                top_candidates.emplace(entry.dist, entry.candidate_id);
+            }
 
-                const bool result_allowed = !index.isMarkedDeleted(candidate_id) && fid_match;
-                if (!index.isMarkedDeleted(candidate_id) && result_allowed) {
-                    top_candidates.emplace(dist, candidate_id);
-                }
-
-                while (top_candidates.size() > ef) {
-                    top_candidates.pop();
-                }
-                if (!top_candidates.empty()) {
-                    lower_bound = top_candidates.top().first;
-                }
+            while (top_candidates.size() > ef) {
+                top_candidates.pop();
+            }
+            if (!top_candidates.empty()) {
+                lower_bound = top_candidates.top().first;
             }
         }
     }
