@@ -34,7 +34,6 @@ using filter_search_io::VecFileInfo;
 namespace {
 constexpr size_t kLz4FidBlockSizeBytes = 8192 * 8;
 constexpr size_t kLz4TbBlockSizeBytes = 8192 * 256;
-constexpr uint64_t kFidTbMismatchLogLimit = 10;
 
 struct Args {
     std::string dataset_type;
@@ -675,16 +674,12 @@ SequentialEqRuntime build_sequential_eq_runtime(
 
 void prefetch_tb_blocks(
     const SequentialEqRuntime& runtime,
-    const std::unordered_set<size_t>& block_ids,
     SequentialEqQueryCache* cache,
     compass_lz4_filter::QueryDecompressionMetrics* metrics) {
     if (cache == nullptr) {
         throw std::runtime_error("TB prefetch received null cache");
     }
-    for (size_t block_id : block_ids) {
-        if (block_id >= runtime.tb_storage.block_count()) {
-            continue;
-        }
+    for (size_t block_id = 0; block_id < runtime.tb_storage.block_count(); ++block_id) {
         (void)compass_lz4_filter::detail::get_or_decompress_block(
             runtime.tb_storage,
             block_id,
@@ -694,25 +689,23 @@ void prefetch_tb_blocks(
     }
 }
 
-void prefetch_fid_blocks(
+void prefetch_fid_block(
     const SequentialEqRuntime& runtime,
-    const std::unordered_set<size_t>& block_ids,
+    size_t block_id,
     SequentialEqQueryCache* cache,
     compass_lz4_filter::QueryDecompressionMetrics* metrics) {
     if (cache == nullptr) {
         throw std::runtime_error("FID prefetch received null cache");
     }
-    for (size_t block_id : block_ids) {
-        if (block_id >= runtime.fid_storage.block_count()) {
-            continue;
-        }
-        (void)compass_lz4_filter::detail::get_or_decompress_block(
-            runtime.fid_storage,
-            block_id,
-            true,
-            &cache->fid_blocks,
-            metrics);
+    if (block_id >= runtime.fid_storage.block_count()) {
+        return;
     }
+    (void)compass_lz4_filter::detail::get_or_decompress_block(
+        runtime.fid_storage,
+        block_id,
+        true,
+        &cache->fid_blocks,
+        metrics);
 }
 
 bool tb_match_node(
@@ -910,8 +903,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
     size_t k,
     size_t ef,
     const SequentialEqRuntime& runtime,
-    SearchCallStats* call_stats,
-    size_t qid) {
+    SearchCallStats* call_stats) {
     std::vector<std::pair<DistT, hnswlib::labeltype>> result;
     if (index.cur_element_count == 0 || runtime.empty_result) {
         return result;
@@ -959,6 +951,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
 
     SequentialEqQueryCache cache;
     cache.tb_blocks.reserve(runtime.tb_storage.block_count());
+    prefetch_tb_blocks(runtime, &cache, &call_stats->decomp);
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
@@ -973,7 +966,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
 
     visited[curr_obj] = tag;
     DistT lower_bound = std::numeric_limits<DistT>::max();
-    uint64_t mismatch_logs_emitted = 0;
 
     while (!candidate_set.empty()) {
         const Pair<DistT> current = candidate_set.top();
@@ -990,10 +982,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
 
         std::vector<hnswlib::tableint> neighbor_ids;
         neighbor_ids.reserve(size);
-        std::unordered_set<size_t> fid_blocks_to_prefetch;
-        std::unordered_set<size_t> tb_blocks_to_prefetch;
-        fid_blocks_to_prefetch.reserve(size);
-        tb_blocks_to_prefetch.reserve(size);
 
         for (size_t j = 1; j <= size; ++j) {
             const hnswlib::tableint candidate_id = static_cast<hnswlib::tableint>(*(data + j));
@@ -1005,49 +993,17 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             }
             visited[candidate_id] = tag;
             neighbor_ids.push_back(candidate_id);
-
-            if (runtime.fid_storage.block_size != 0) {
-                const size_t fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
-                if (cache.fid_blocks.find(fid_block_id) == cache.fid_blocks.end()) {
-                    fid_blocks_to_prefetch.insert(fid_block_id);
-                }
-            }
-            if (runtime.tb_storage.block_size != 0) {
-                const size_t byte_offset = static_cast<size_t>(candidate_id) / 8;
-                const size_t tb_block_id = byte_offset / runtime.tb_storage.block_size;
-                if (cache.tb_blocks.find(tb_block_id) == cache.tb_blocks.end()) {
-                    tb_blocks_to_prefetch.insert(tb_block_id);
-                }
-            }
         }
-
-        prefetch_tb_blocks(runtime, tb_blocks_to_prefetch, &cache, &call_stats->decomp);
-        prefetch_fid_blocks(runtime, fid_blocks_to_prefetch, &cache, &call_stats->decomp);
 
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
             const auto t0 = std::chrono::steady_clock::now();
             const bool tb_match = tb_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
-            const bool fid_match = fid_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
-            const bool traversal_allowed = tb_match;
-            const auto t1 = std::chrono::steady_clock::now();
-            ++call_stats->filter_eval_calls;
-            call_stats->filter_eval_time_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-
-            if (fid_match && !tb_match) {
-                ++call_stats->fid_tb_mismatch_count;
-                if (mismatch_logs_emitted < kFidTbMismatchLogLimit) {
-                    std::cerr << "FID/TB mismatch: query_id=" << qid
-                              << ", candidate_id=" << candidate_id
-                              << " (FID matched, TB missed)\n";
-                    ++mismatch_logs_emitted;
-                } else {
-                    ++call_stats->fid_tb_mismatch_log_capped;
-                }
-            }
-
-            if (!traversal_allowed) {
+            if (!tb_match) {
+                const auto t1 = std::chrono::steady_clock::now();
+                ++call_stats->filter_eval_calls;
+                call_stats->filter_eval_time_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
                 continue;
             }
 
@@ -1055,6 +1011,16 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 query_data,
                 index.getDataByInternalId(candidate_id),
                 index.dist_func_param_);
+
+            if (runtime.fid_storage.block_size != 0) {
+                const size_t fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
+                prefetch_fid_block(runtime, fid_block_id, &cache, &call_stats->decomp);
+            }
+            const bool fid_match = fid_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
+            const auto t1 = std::chrono::steady_clock::now();
+            ++call_stats->filter_eval_calls;
+            call_stats->filter_eval_time_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
 
             if (top_candidates.size() < ef || lower_bound > dist) {
                 candidate_set.emplace(-dist, candidate_id);
@@ -1212,8 +1178,7 @@ RunStats run_search_typed(
                 static_cast<size_t>(args.k),
                 resolved_ef,
                 *sequential_runtime,
-                &call_stats,
-                qid);
+                &call_stats);
         } else {
             compass_lz4_filter::QueryBlockCache query_cache(engine.attribute_count());
             result = search_with_compass_filter<DistT, QueryT>(

@@ -31,7 +31,6 @@ using filter_search_io::MetadataTable;
 using filter_search_io::VecFileInfo;
 
 namespace {
-constexpr uint64_t kFidTbMismatchLogLimit = 10;
 
 struct Args {
     std::string dataset_type;
@@ -602,16 +601,12 @@ private:
 void submit_tb_prefetch_jobs(
     AsyncJobRing* ring,
     const AsyncEqRuntime& runtime,
-    const std::unordered_set<size_t>& block_ids,
     AsyncEqQueryCache* cache,
     compass_iaa_filter::QueryDecompressionMetrics* metrics) {
     if (ring == nullptr || cache == nullptr) {
         throw std::runtime_error("TB prefetch received null pointer");
     }
-    for (size_t block_id : block_ids) {
-        if (block_id >= runtime.tb_storage.block_count()) {
-            continue;
-        }
+    for (size_t block_id = 0; block_id < runtime.tb_storage.block_count(); ++block_id) {
         if (cache->tb_blocks.find(block_id) != cache->tb_blocks.end()) {
             continue;
         }
@@ -648,58 +643,55 @@ void submit_tb_prefetch_jobs(
     }
 }
 
-void submit_fid_scan_jobs(
+void submit_fid_scan_job(
     AsyncJobRing* ring,
     const AsyncEqRuntime& runtime,
-    const std::unordered_set<size_t>& block_ids,
+    size_t block_id,
     AsyncEqQueryCache* cache,
     compass_iaa_filter::QueryDecompressionMetrics* metrics) {
     if (ring == nullptr || cache == nullptr) {
         throw std::runtime_error("FID async scan received null pointer");
     }
-
-    for (size_t block_id : block_ids) {
-        if (block_id >= runtime.fid_storage.block_count()) {
-            continue;
-        }
-        if (cache->fid_blocks.find(block_id) != cache->fid_blocks.end()) {
-            continue;
-        }
-
-        const uint32_t raw_len = runtime.fid_storage.raw_block_sizes[block_id];
-        if (raw_len == 0) {
-            cache->fid_blocks.emplace(block_id, FidScanBlock{});
-            continue;
-        }
-
-        ring->submit(
-            static_cast<size_t>(raw_len),
-            [&](qpl_job* job, std::vector<uint8_t>& out) {
-                job->op = qpl_op_scan_eq;
-                job->next_in_ptr = const_cast<uint8_t*>(runtime.fid_storage.compressed_blocks[block_id].data());
-                job->available_in = static_cast<uint32_t>(runtime.fid_storage.compressed_blocks[block_id].size());
-                job->next_out_ptr = out.data();
-                job->available_out = raw_len;
-                job->src1_bit_width = 8;
-                job->out_bit_width = qpl_ow_nom;
-                job->param_low = runtime.target_bucket;
-                job->num_input_elements = raw_len;
-                job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_DECOMPRESS_ENABLE;
-            },
-            [cache, metrics, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out, uint64_t elapsed_ns) {
-                out.resize(static_cast<size_t>(job->total_out));
-                FidScanBlock block;
-                block.matches = out;
-                block.input_elements = raw_len;
-                block.byte_per_element = (job->total_out >= raw_len);
-                cache->fid_blocks[block_id] = std::move(block);
-                if (metrics != nullptr) {
-                    metrics->iaa_decompress_time_ns += elapsed_ns;
-                    ++metrics->fid_blocks_decompressed;
-                    metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
-                }
-            });
+    if (block_id >= runtime.fid_storage.block_count()) {
+        return;
     }
+    if (cache->fid_blocks.find(block_id) != cache->fid_blocks.end()) {
+        return;
+    }
+
+    const uint32_t raw_len = runtime.fid_storage.raw_block_sizes[block_id];
+    if (raw_len == 0) {
+        cache->fid_blocks.emplace(block_id, FidScanBlock{});
+        return;
+    }
+
+    ring->submit(
+        static_cast<size_t>(raw_len),
+        [&](qpl_job* job, std::vector<uint8_t>& out) {
+            job->op = qpl_op_scan_eq;
+            job->next_in_ptr = const_cast<uint8_t*>(runtime.fid_storage.compressed_blocks[block_id].data());
+            job->available_in = static_cast<uint32_t>(runtime.fid_storage.compressed_blocks[block_id].size());
+            job->next_out_ptr = out.data();
+            job->available_out = raw_len;
+            job->src1_bit_width = 8;
+            job->out_bit_width = qpl_ow_nom;
+            job->param_low = runtime.target_bucket;
+            job->num_input_elements = raw_len;
+            job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_DECOMPRESS_ENABLE;
+        },
+        [cache, metrics, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out, uint64_t elapsed_ns) {
+            out.resize(static_cast<size_t>(job->total_out));
+            FidScanBlock block;
+            block.matches = out;
+            block.input_elements = raw_len;
+            block.byte_per_element = (job->total_out >= raw_len);
+            cache->fid_blocks[block_id] = std::move(block);
+            if (metrics != nullptr) {
+                metrics->iaa_decompress_time_ns += elapsed_ns;
+                ++metrics->fid_blocks_decompressed;
+                metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
+            }
+        });
 }
 
 bool tb_match_node(
@@ -905,8 +897,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
     size_t ef,
     const AsyncEqRuntime& runtime,
     AsyncJobRing* ring,
-    SearchCallStats* call_stats,
-    size_t qid) {
+    SearchCallStats* call_stats) {
     std::vector<std::pair<DistT, hnswlib::labeltype>> result;
     if (index.cur_element_count == 0 || runtime.empty_result) {
         return result;
@@ -934,6 +925,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
 
     AsyncEqQueryCache cache;
     cache.tb_blocks.reserve(runtime.tb_storage.block_count());
+    submit_tb_prefetch_jobs(ring, runtime, &cache, &call_stats->decomp);
 
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
@@ -973,7 +965,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
 
     visited[curr_obj] = tag;
     DistT lower_bound = std::numeric_limits<DistT>::max();
-    uint64_t mismatch_logs_emitted = 0;
 
     while (!candidate_set.empty()) {
         const Pair<DistT> current = candidate_set.top();
@@ -989,10 +980,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
 
         std::vector<hnswlib::tableint> neighbor_ids;
         neighbor_ids.reserve(size);
-        std::unordered_set<size_t> fid_blocks_to_submit;
-        std::unordered_set<size_t> tb_blocks_to_submit;
-        fid_blocks_to_submit.reserve(size);
-        tb_blocks_to_submit.reserve(size);
 
         for (size_t j = 1; j <= size; ++j) {
             const hnswlib::tableint candidate_id = static_cast<hnswlib::tableint>(*(data + j));
@@ -1004,58 +991,37 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             }
             visited[candidate_id] = tag;
             neighbor_ids.push_back(candidate_id);
-
-            if (runtime.fid_storage.block_size != 0) {
-                const size_t fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
-                if (cache.fid_blocks.find(fid_block_id) == cache.fid_blocks.end()) {
-                    fid_blocks_to_submit.insert(fid_block_id);
-                }
-            }
-            if (runtime.tb_storage.block_size != 0) {
-                const size_t byte_offset = static_cast<size_t>(candidate_id) / 8;
-                const size_t tb_block_id = byte_offset / runtime.tb_storage.block_size;
-                if (cache.tb_blocks.find(tb_block_id) == cache.tb_blocks.end()) {
-                    tb_blocks_to_submit.insert(tb_block_id);
-                }
-            }
         }
-
-        submit_tb_prefetch_jobs(ring, runtime, tb_blocks_to_submit, &cache, &call_stats->decomp);
-        submit_fid_scan_jobs(ring, runtime, fid_blocks_to_submit, &cache, &call_stats->decomp);
-        ring->flush();
 
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
 
             const auto t0 = std::chrono::steady_clock::now();
             const bool tb_match = tb_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
-            const bool fid_match = fid_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
-            const bool traversal_allowed = tb_match;
-            const auto t1 = std::chrono::steady_clock::now();
-            ++call_stats->filter_eval_calls;
-            call_stats->filter_eval_time_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-
-            if (fid_match && !tb_match) {
-                ++call_stats->fid_tb_mismatch_count;
-                if (mismatch_logs_emitted < kFidTbMismatchLogLimit) {
-                    std::cerr << "FID/TB mismatch: query_id=" << qid
-                              << ", candidate_id=" << candidate_id
-                              << " (FID matched, TB missed)\n";
-                    ++mismatch_logs_emitted;
-                } else {
-                    ++call_stats->fid_tb_mismatch_log_capped;
-                }
+            if (!tb_match) {
+                const auto t1 = std::chrono::steady_clock::now();
+                ++call_stats->filter_eval_calls;
+                call_stats->filter_eval_time_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+                continue;
             }
 
-            if (!traversal_allowed) {
-                continue;
+            if (runtime.fid_storage.block_size != 0) {
+                const size_t fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
+                submit_fid_scan_job(ring, runtime, fid_block_id, &cache, &call_stats->decomp);
             }
 
             const DistT dist = index.fstdistfunc_(
                 query_data,
                 index.getDataByInternalId(candidate_id),
                 index.dist_func_param_);
+
+            ring->flush();
+            const bool fid_match = fid_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
+            const auto t1 = std::chrono::steady_clock::now();
+            ++call_stats->filter_eval_calls;
+            call_stats->filter_eval_time_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
 
             if (top_candidates.size() < ef || lower_bound > dist) {
                 candidate_set.emplace(-dist, candidate_id);
@@ -1220,8 +1186,7 @@ RunStats run_search_typed(
                 resolved_ef,
                 *async_runtime,
                 shared_ring.get(),
-                &call_stats,
-                qid);
+                &call_stats);
         } else {
             compass_iaa_filter::QueryBlockCache query_cache(engine.attribute_count());
             result = search_with_compass_filter<DistT, QueryT>(
