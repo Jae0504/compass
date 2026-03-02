@@ -33,10 +33,12 @@ struct Args {
     std::string graph_path;
     std::string query_path;
     std::string filter_expression;
+    std::string search_mode = "in_search_filter";
 
     int k = 0;
     int ef = -1;
     int num_queries = -1;
+    int postfilter_max_candidates = 5000;
 
     std::string payload_jsonl;
     std::string metadata_csv;
@@ -55,6 +57,8 @@ void usage(const char* argv0) {
         << " --query <path(.fvecs|.bvecs)>"
         << " --k <int>"
         << " --filter \"<expression>\""
+        << " [--search-mode <in_search_filter|post_filter_iterative>]"
+        << " [--postfilter-max-candidates <int>]"
         << " [--ef <int>]"
         << " [--payload-jsonl <path>]"
         << " [--metadata-csv <path>]"
@@ -100,6 +104,10 @@ Args parse_args(int argc, char** argv) {
             args.ef = std::stoi(require_value(cur));
         } else if (cur == "--filter") {
             args.filter_expression = require_value(cur);
+        } else if (cur == "--search-mode") {
+            args.search_mode = require_value(cur);
+        } else if (cur == "--postfilter-max-candidates") {
+            args.postfilter_max_candidates = std::stoi(require_value(cur));
         } else if (cur == "--payload-jsonl") {
             args.payload_jsonl = require_value(cur);
         } else if (cur == "--metadata-csv") {
@@ -136,6 +144,14 @@ Args parse_args(int argc, char** argv) {
     if (args.num_queries == 0) {
         throw std::runtime_error("--num-queries/--max-queries must be > 0 when provided");
     }
+    if (args.search_mode != "in_search_filter" &&
+        args.search_mode != "post_filter_iterative") {
+        throw std::runtime_error(
+            "--search-mode must be one of: in_search_filter, post_filter_iterative");
+    }
+    if (args.postfilter_max_candidates <= 0) {
+        throw std::runtime_error("--postfilter-max-candidates must be > 0");
+    }
 
     const bool query_fvec = filter_search_io::ends_with(args.query_path, ".fvecs");
     const bool query_bvec = filter_search_io::ends_with(args.query_path, ".bvecs");
@@ -152,6 +168,11 @@ Args parse_args(int argc, char** argv) {
 
     if (args.ef <= 0) {
         args.ef = std::max(100, args.k);
+    }
+    if (args.search_mode == "post_filter_iterative" &&
+        args.postfilter_max_candidates < args.k) {
+        throw std::runtime_error(
+            "--postfilter-max-candidates must be >= --k for post_filter_iterative mode");
     }
     if (args.id_column.empty()) {
         args.id_column = "id";
@@ -346,12 +367,56 @@ RunStats run_search_typed(
     uint64_t prev_filter_time_ns = filter_functor.eval_time_ns();
     for (size_t qid = 0; qid < query_count; ++qid) {
         const QueryT* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
-        const auto search_start = std::chrono::steady_clock::now();
-        std::vector<std::pair<DistT, hnswlib::labeltype>> result =
-            index.searchKnnCloserFirst(static_cast<const void*>(qptr), static_cast<size_t>(args.k), &filter_functor);
-        const auto search_end = std::chrono::steady_clock::now();
-        const uint64_t query_search_ns = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(search_end - search_start).count());
+        std::vector<std::pair<DistT, hnswlib::labeltype>> result;
+        uint64_t query_search_ns = 0;
+        if (args.search_mode == "in_search_filter") {
+            const auto search_start = std::chrono::steady_clock::now();
+            result = index.searchKnnCloserFirst(
+                static_cast<const void*>(qptr), static_cast<size_t>(args.k), &filter_functor);
+            const auto search_end = std::chrono::steady_clock::now();
+            query_search_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(search_end - search_start).count());
+        } else {
+            const size_t total_limit = total_elements;
+            const size_t max_candidates = std::min(
+                total_limit, static_cast<size_t>(args.postfilter_max_candidates));
+            size_t candidate_k = std::min(
+                max_candidates, std::max<size_t>(1, static_cast<size_t>(args.k)));
+
+            while (true) {
+                const auto iter_search_start = std::chrono::steady_clock::now();
+                const std::vector<std::pair<DistT, hnswlib::labeltype>> raw =
+                    index.searchKnnCloserFirst(
+                        static_cast<const void*>(qptr), candidate_k, nullptr);
+                const auto iter_search_end = std::chrono::steady_clock::now();
+                query_search_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        iter_search_end - iter_search_start)
+                        .count());
+
+                result.clear();
+                result.reserve(std::min(raw.size(), static_cast<size_t>(args.k)));
+                for (const auto& item : raw) {
+                    if (filter_functor(item.second)) {
+                        result.push_back(item);
+                        if (result.size() >= static_cast<size_t>(args.k)) {
+                            break;
+                        }
+                    }
+                }
+
+                if (result.size() >= static_cast<size_t>(args.k) ||
+                    candidate_k >= max_candidates || candidate_k >= total_limit) {
+                    break;
+                }
+
+                size_t next_candidate = candidate_k * 2;
+                if (next_candidate <= candidate_k) {
+                    next_candidate = total_limit;
+                }
+                candidate_k = std::min(max_candidates, next_candidate);
+            }
+        }
         const uint64_t cur_filter_time_ns = filter_functor.eval_time_ns();
         const uint64_t query_filter_ns = cur_filter_time_ns - prev_filter_time_ns;
         prev_filter_time_ns = cur_filter_time_ns;
@@ -482,6 +547,11 @@ std::string build_summary(
         (stats.query_count > 0)
             ? (static_cast<double>(stats.search_time_total_ns) / 1e6 / static_cast<double>(stats.query_count))
             : 0.0;
+    const double qps =
+        (stats.search_loop_time_ns > 0)
+            ? (static_cast<double>(stats.query_count) * 1e9 /
+               static_cast<double>(stats.search_loop_time_ns))
+            : 0.0;
 
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(3);
@@ -496,6 +566,8 @@ std::string build_summary(
     oss << "queries_requested: "
         << (args.num_queries > 0 ? std::to_string(args.num_queries) : std::string("all")) << "\n";
     oss << "k: " << args.k << ", ef: " << args.ef << "\n";
+    oss << "search_mode: " << args.search_mode << "\n";
+    oss << "postfilter_max_candidates: " << args.postfilter_max_candidates << "\n";
     oss << "filter: " << expr.source() << "\n";
     oss << "metadata_total_labels: " << metadata.total_labels << "\n";
     oss << "metadata_populated_labels: " << metadata.populated_rows << "\n";
@@ -510,6 +582,7 @@ std::string build_summary(
     oss << "queries_with_enns_lt_k: " << stats.queries_with_enns_lt_k << "\n";
     oss << "search_loop_time_ms: " << loop_ms << "\n";
     oss << "avg_query_time_ms: " << avg_query_ms << "\n";
+    oss << "qps: " << qps << "\n";
     oss << "filter_eval_calls: " << stats.filter_eval_calls << "\n";
     oss << "filter_eval_time_ms: " << filter_ms << "\n";
     oss << "avg_filter_eval_ns: " << avg_filter_ns << "\n";
