@@ -32,6 +32,8 @@ Advanced overrides:
   --query <path>
   --manifest-1pct <path>
   --manifest-10pct <path>
+  --acorn-index-1pct <path>
+  --acorn-index-10pct <path>
   --payload-jsonl <path>
 
 Output files:
@@ -93,6 +95,8 @@ GRAPH_PATH=""
 QUERY_PATH=""
 MANIFEST_1PCT=""
 MANIFEST_10PCT=""
+ACORN_INDEX_1PCT=""
+ACORN_INDEX_10PCT=""
 PAYLOAD_JSONL=""
 
 while [[ $# -gt 0 ]]; do
@@ -157,6 +161,14 @@ while [[ $# -gt 0 ]]; do
       MANIFEST_10PCT="$2"
       shift 2
       ;;
+    --acorn-index-1pct)
+      ACORN_INDEX_1PCT="$2"
+      shift 2
+      ;;
+    --acorn-index-10pct)
+      ACORN_INDEX_10PCT="$2"
+      shift 2
+      ;;
     --payload-jsonl)
       PAYLOAD_JSONL="$2"
       shift 2
@@ -193,6 +205,7 @@ fi
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
 LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4.run"
 IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa_async.run"
+ACORN_RUN="$SCRIPT_DIR/acorn_search.run"
 PLOT_PY="$SCRIPT_DIR/plot_qps_recall.py"
 
 HNSW_DATASET_TYPE=""
@@ -209,6 +222,8 @@ set_dataset_defaults() {
       : "${QUERY_PATH:=/storage/jykang5/compass_base_query/sift1m_query.fvecs}"
       : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/sift1m/manifest.json}"
       : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/sift1m/manifest.json}"
+      : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/sift1m/sift1m_acorn_m32_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/sift1m/sift1m_acorn_m32_nf10.index}"
       ;;
     sift1b)
       HNSW_DATASET_TYPE="sift"
@@ -218,6 +233,8 @@ set_dataset_defaults() {
       : "${QUERY_PATH:=/storage/jykang5/compass_base_query/sift1b_query.fvecs}"
       : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/sift1b/manifest.json}"
       : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/sift1b/manifest.json}"
+      : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/sift1b/sift1b_acorn_m32_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/sift1b/sift1b_acorn_m32_nf10.index}"
       ;;
     laion)
       HNSW_DATASET_TYPE="laion"
@@ -227,6 +244,8 @@ set_dataset_defaults() {
       : "${QUERY_PATH:=/storage/jykang5/compass_base_query/laion_query.fvecs}"
       : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/laion/manifest.json}"
       : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/laion/manifest.json}"
+      : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/laion/laion_acorn_m32_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/laion/laion_acorn_m32_nf10.index}"
       : "${PAYLOAD_JSONL:=/fast-lab-share/benchmarks/VectorDB/FILTER/LAION/payloads.jsonl}"
       ;;
     hnm)
@@ -237,6 +256,8 @@ set_dataset_defaults() {
       : "${QUERY_PATH:=/storage/jykang5/compass_base_query/hnm_query.fvecs}"
       : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/hnm/manifest.json}"
       : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/hnm/manifest.json}"
+      : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/hnm/hnm_acorn_m32_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/hnm/hnm_acorn_m32_nf10.index}"
       : "${PAYLOAD_JSONL:=/fast-lab-share/benchmarks/VectorDB/FILTER/HnM/payloads.jsonl}"
       ;;
     *)
@@ -257,10 +278,13 @@ fi
 ensure_executable_file "$HNSW_RUN" "hnswlib_filter_search.run is missing or not executable"
 ensure_executable_file "$LZ4_RUN" "compass_search_w_lz4.run is missing or not executable"
 ensure_executable_file "$IAA_RUN" "compass_search_w_iaa_async.run is missing or not executable"
+ensure_executable_file "$ACORN_RUN" "acorn_search.run is missing or not executable"
 ensure_readable_file "$GRAPH_PATH" "graph file not found"
 ensure_readable_file "$QUERY_PATH" "query file not found"
 ensure_readable_file "$MANIFEST_1PCT" "1% manifest file not found"
 ensure_readable_file "$MANIFEST_10PCT" "10% manifest file not found"
+ensure_readable_file "$ACORN_INDEX_1PCT" "ACORN 1% index file not found"
+ensure_readable_file "$ACORN_INDEX_10PCT" "ACORN 10% index file not found"
 if [[ "$HNSW_DATASET_TYPE" != "sift" ]]; then
   ensure_readable_file "$PAYLOAD_JSONL" "payload JSONL is required for non-sift hnsw baseline"
 fi
@@ -382,7 +406,8 @@ run_single() {
   local ef="$3"
   local manifest_path="$4"
   local metadata_csv="$5"
-  local out_csv="$6"
+  local acorn_index_path="$6"
+  local out_csv="$7"
 
   local summary_dir="$OUT_DIR/summaries/${selectivity_pct}pct/${method}"
   mkdir -p "$summary_dir"
@@ -460,6 +485,24 @@ run_single() {
         --summary-out "$summary_path"
       )
       ;;
+    acorn)
+      cmd=(
+        "$ACORN_RUN"
+        --dataset-type "$DATASET"
+        --graph "$acorn_index_path"
+        --query "$QUERY_PATH"
+        --k "$K"
+        --ef "$ef"
+        --filter "$FILTER_EXPR"
+        --num-queries "$NUM_QUERIES"
+        --summary-out "$summary_path"
+      )
+      if [[ "$HNSW_DATASET_TYPE" == "sift" ]]; then
+        cmd+=(--metadata-csv "$metadata_csv" --id-column id)
+      else
+        cmd+=(--payload-jsonl "$PAYLOAD_JSONL")
+      fi
+      ;;
     *)
       echo "Error: unknown method '$method'" >&2
       exit 1
@@ -514,18 +557,20 @@ run_selectivity() {
   local selectivity_pct="$1"
   local manifest_path="$2"
   local metadata_csv="$3"
-  local out_csv="$4"
+  local acorn_index_path="$4"
+  local out_csv="$5"
 
   local methods=(
     "post_filter_hnsw"
     "in_search_filter_hnsw"
+    "acorn"
     "compass_lz4"
     "compass_iaa"
   )
 
   for ef in "${EF_VALUES[@]}"; do
     for method in "${methods[@]}"; do
-      run_single "$method" "$selectivity_pct" "$ef" "$manifest_path" "$metadata_csv" "$out_csv"
+      run_single "$method" "$selectivity_pct" "$ef" "$manifest_path" "$metadata_csv" "$acorn_index_path" "$out_csv"
     done
   done
 }
@@ -537,14 +582,17 @@ echo "  query: $QUERY_PATH"
 echo "  manifests:"
 echo "    1%  -> $MANIFEST_1PCT"
 echo "    10% -> $MANIFEST_10PCT"
+echo "  acorn indexes:"
+echo "    1%  -> $ACORN_INDEX_1PCT"
+echo "    10% -> $ACORN_INDEX_10PCT"
 echo "  k: $K"
 echo "  ef list: ${EF_VALUES[*]}"
 echo "  num-queries: $NUM_QUERIES"
 echo "  filter: $FILTER_EXPR"
 echo "  out-dir: $OUT_DIR"
 
-run_selectivity "1" "$MANIFEST_1PCT" "$META_1PCT" "$RESULTS_1PCT"
-run_selectivity "10" "$MANIFEST_10PCT" "$META_10PCT" "$RESULTS_10PCT"
+run_selectivity "1" "$MANIFEST_1PCT" "$META_1PCT" "$ACORN_INDEX_1PCT" "$RESULTS_1PCT"
+run_selectivity "10" "$MANIFEST_10PCT" "$META_10PCT" "$ACORN_INDEX_10PCT" "$RESULTS_10PCT"
 
 cat "$RESULTS_1PCT" > "$RESULTS_MERGED"
 tail -n +2 "$RESULTS_10PCT" >> "$RESULTS_MERGED"

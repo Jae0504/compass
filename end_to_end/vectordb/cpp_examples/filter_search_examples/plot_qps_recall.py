@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 METHOD_LABELS = {
     "post_filter_hnsw": "Post-filter HNSW",
     "in_search_filter_hnsw": "HNSW filter",
+    "acorn": "ACORN",
     "compass_lz4": "COMPASS-LZ4",
     "compass_iaa": "COMPASS-IAA",
 }
@@ -17,6 +18,7 @@ METHOD_LABELS = {
 METHOD_ORDER = [
     "post_filter_hnsw",
     "in_search_filter_hnsw",
+    "acorn",
     "compass_lz4",
     "compass_iaa",
 ]
@@ -24,6 +26,7 @@ METHOD_ORDER = [
 METHOD_COLORS = {
     "post_filter_hnsw": "#8c564b",
     "in_search_filter_hnsw": "#9467bd",
+    "acorn": "#2ca02c",
     "compass_lz4": "#ff7f0e",
     "compass_iaa": "#1f77b4",
 }
@@ -31,6 +34,7 @@ METHOD_COLORS = {
 METHOD_MARKERS = {
     "post_filter_hnsw": "D",
     "in_search_filter_hnsw": "s",
+    "acorn": "P",
     "compass_lz4": "o",
     "compass_iaa": "^",
 }
