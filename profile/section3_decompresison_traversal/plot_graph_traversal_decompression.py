@@ -86,11 +86,16 @@ def _try_plot_matplotlib(
     w = 0.18
 
     colors = {
+        # "common_lz4": "#FF0000",
+        # "common_deflate": "#1E8FFF",
+        # "distance": "#111111",
+        # "traversal": "#6D6D6D",
+        # "candidate": "#BFBFBF",
         "common_lz4": "#FF0000",
         "common_deflate": "#1E8FFF",
-        "distance": "#111111",
-        "traversal": "#6D6D6D",
-        "candidate": "#BFBFBF",
+        "distance": "#0D3512",
+        "traversal": "#13501B",
+        "candidate": "#47D45A",
     }
 
     stack_totals = [dist[i] + trav[i] + cand[i] for i in range(len(dist))]
@@ -235,11 +240,16 @@ def _plot_svg(
     ]
 
     colors = {
+        # "common_lz4": "#FF0000",
+        # "common_deflate": "#1E8FFF",
+        # "distance": "#111111",
+        # "traversal": "#6D6D6D",
+        # "candidate": "#BFBFBF",
         "common_lz4": "#FF0000",
         "common_deflate": "#1E8FFF",
-        "distance": "#111111",
-        "traversal": "#6D6D6D",
-        "candidate": "#BFBFBF",
+        "distance": "#0D3512",
+        "traversal": "#13501B",
+        "candidate": "#47D45A",
     }
 
     parts = []
