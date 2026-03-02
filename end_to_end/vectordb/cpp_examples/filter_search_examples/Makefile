@@ -1,5 +1,6 @@
 CXX ?= g++
 CXXFLAGS ?= -Ofast -std=c++17 -march=native -fopenmp -ftree-vectorize -DNDEBUG -Wall -Wextra -pthread
+CXXFLAGS_LZ4 ?= -O3 -std=c++17 -Wall -Wextra -pthread
 
 ROOT_DIR ?= $(abspath ../../../..)
 
@@ -44,7 +45,7 @@ hnswlib_filter_search.run: hnswlib_filter_search.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@
 
 compass_search_w_lz4.run: compass_search_w_lz4.cpp
-	$(CXX) $(CXXFLAGS) $(INCLUDES_LZ4) $< -o $@ $(LIBS_LZ4)
+	$(CXX) $(CXXFLAGS_LZ4) $(INCLUDES_LZ4) $< -o $@ $(LIBS_LZ4)
 
 compass_search_w_iaa.run: compass_search_w_iaa.cpp
 	$(QPL_CHECK)
