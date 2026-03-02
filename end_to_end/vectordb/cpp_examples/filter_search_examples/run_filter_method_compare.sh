@@ -20,7 +20,7 @@ Core defaults:
   --dataset                     sift1m
   --k                           10
   --ef-list                     32,64,96,128,160,200,256,320,400
-  --num-queries                 1000
+  --num-queries                 100
   --out-dir                     <this_dir>/out/filter_method_compare
   --postfilter-max-candidates   5000
   --build                       enabled
@@ -81,10 +81,10 @@ ensure_executable_file() {
 
 DATASET="sift1m"
 K=10
-EF_LIST="32,64,96,128,160,200,256,320,400"
-NUM_QUERIES=1000
+EF_LIST="32,64,96,128,160,200"
+NUM_QUERIES=100
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
-POSTFILTER_MAX_CANDIDATES=5000
+POSTFILTER_MAX_CANDIDATES=50
 DO_BUILD=1
 DO_PLOT=1
 FILTER_EXPR='synthetic_id_bucket == 255'
@@ -192,7 +192,7 @@ fi
 
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
 LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4.run"
-IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa.run"
+IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa_async.run"
 PLOT_PY="$SCRIPT_DIR/plot_qps_recall.py"
 
 HNSW_DATASET_TYPE=""
@@ -256,7 +256,7 @@ fi
 
 ensure_executable_file "$HNSW_RUN" "hnswlib_filter_search.run is missing or not executable"
 ensure_executable_file "$LZ4_RUN" "compass_search_w_lz4.run is missing or not executable"
-ensure_executable_file "$IAA_RUN" "compass_search_w_iaa.run is missing or not executable"
+ensure_executable_file "$IAA_RUN" "compass_search_w_iaa_async.run is missing or not executable"
 ensure_readable_file "$GRAPH_PATH" "graph file not found"
 ensure_readable_file "$QUERY_PATH" "query file not found"
 ensure_readable_file "$MANIFEST_1PCT" "1% manifest file not found"
@@ -481,7 +481,7 @@ run_single() {
       local loop_ms
       loop_ms="$(extract_summary_value "search_loop_time_ms" "$summary_path" || true)"
       if is_numeric "$queries_executed" && is_numeric "$loop_ms"; then
-        qps="$(awk -v q="$queries_executed" -v ms="$loop_ms" 'BEGIN { if (ms > 0) printf "%.6f", (q * 1000.0) / ms; else print "0" }')"
+        qps="$(awk -v q="$queries_executed" -v ms="$loop_ms" 'BEGIN { if (ms > 0) printf "%.6f", (q * 100.0) / ms; else print "0" }')"
       fi
     fi
 

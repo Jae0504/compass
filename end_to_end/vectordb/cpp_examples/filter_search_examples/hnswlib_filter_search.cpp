@@ -369,6 +369,7 @@ RunStats run_search_typed(
         const QueryT* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
         std::vector<std::pair<DistT, hnswlib::labeltype>> result;
         uint64_t query_search_ns = 0;
+        uint64_t query_postfilter_stage_ns = 0;
         if (args.search_mode == "in_search_filter") {
             const auto search_start = std::chrono::steady_clock::now();
             result = index.searchKnnCloserFirst(
@@ -383,6 +384,7 @@ RunStats run_search_typed(
             size_t candidate_k = std::min(
                 max_candidates, std::max<size_t>(1, static_cast<size_t>(args.k)));
 
+            const auto postfilter_stage_start = std::chrono::steady_clock::now();
             while (true) {
                 const auto iter_search_start = std::chrono::steady_clock::now();
                 const std::vector<std::pair<DistT, hnswlib::labeltype>> raw =
@@ -416,10 +418,19 @@ RunStats run_search_typed(
                 }
                 candidate_k = std::min(max_candidates, next_candidate);
             }
+            const auto postfilter_stage_end = std::chrono::steady_clock::now();
+            query_postfilter_stage_ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    postfilter_stage_end - postfilter_stage_start)
+                    .count());
         }
         const uint64_t cur_filter_time_ns = filter_functor.eval_time_ns();
-        const uint64_t query_filter_ns = cur_filter_time_ns - prev_filter_time_ns;
+        const uint64_t query_filter_eval_ns = cur_filter_time_ns - prev_filter_time_ns;
         prev_filter_time_ns = cur_filter_time_ns;
+        const uint64_t query_filter_ns =
+            (args.search_mode == "post_filter_iterative")
+                ? query_postfilter_stage_ns
+                : query_filter_eval_ns;
 
         std::priority_queue<std::pair<DistT, hnswlib::labeltype>> enns_heap;
         for (const FilteredCandidate& candidate : filtered_candidates) {
@@ -547,6 +558,10 @@ std::string build_summary(
         (stats.query_count > 0)
             ? (static_cast<double>(stats.search_time_total_ns) / 1e6 / static_cast<double>(stats.query_count))
             : 0.0;
+    const std::string filter_time_definition =
+        (args.search_mode == "post_filter_iterative")
+            ? "full_postfilter_stage"
+            : "eval_only";
     const double qps =
         (stats.search_loop_time_ns > 0)
             ? (static_cast<double>(stats.query_count) * 1e9 /
@@ -586,6 +601,7 @@ std::string build_summary(
     oss << "filter_eval_calls: " << stats.filter_eval_calls << "\n";
     oss << "filter_eval_time_ms: " << filter_ms << "\n";
     oss << "avg_filter_eval_ns: " << avg_filter_ns << "\n";
+    oss << "filter_time_definition: " << filter_time_definition << "\n";
     oss << "avg_filter_time_per_query_ms: " << avg_filter_per_query_ms << "\n";
     oss << "avg_search_time_per_query_ms: " << avg_search_per_query_ms << "\n";
     if (stats.queries_with_enns_lt_k > 0) {
