@@ -312,7 +312,8 @@ public:
         const std::string& manifest_path,
         const std::string& filter_expression,
         const std::unordered_set<std::string>& referenced_fields,
-        size_t block_size = kBlockSizeBytes) {
+        size_t fid_block_size = kBlockSizeBytes,
+        size_t tb_block_size = kBlockSizeBytes) {
         if (manifest_path.empty()) {
             throw std::runtime_error("--fidtb-manifest is required");
         }
@@ -322,12 +323,13 @@ public:
         if (referenced_fields.empty()) {
             throw std::runtime_error("Filter expression did not reference any fields");
         }
-        if (block_size == 0) {
-            throw std::runtime_error("Block size must be positive");
+        if (fid_block_size == 0 || tb_block_size == 0) {
+            throw std::runtime_error("FID/TB block sizes must be positive");
         }
 
         CompassLz4FilterEngine engine;
-        engine.block_size_ = block_size;
+        engine.fid_block_size_ = fid_block_size;
+        engine.tb_block_size_ = tb_block_size;
         engine.filter_expression_ = filter_expression;
         engine.manifest_ = load_manifest(manifest_path);
 
@@ -349,7 +351,11 @@ public:
             if (it == attr_by_key.end()) {
                 throw std::runtime_error("Referenced field not found in manifest: " + field);
             }
-            engine.attributes_.push_back(load_attribute(engine.manifest_, it->second, engine.block_size_));
+            engine.attributes_.push_back(load_attribute(
+                engine.manifest_,
+                it->second,
+                engine.fid_block_size_,
+                engine.tb_block_size_));
             engine.key_to_attr_index_[field] = engine.attributes_.size() - 1;
         }
 
@@ -536,7 +542,8 @@ private:
     static AttributeStorage load_attribute(
         const ManifestData& manifest,
         const ManifestAttribute& attr,
-        size_t block_size) {
+        size_t fid_block_size,
+        size_t tb_block_size) {
         AttributeStorage out;
         out.key = attr.key;
         out.encoding = attr.encoding;
@@ -583,8 +590,8 @@ private:
                 ", tb=" + std::to_string(tb_count));
         }
 
-        out.fid_blocks = detail::compress_to_lz4_blocks(fid_raw, block_size);
-        out.tb_blocks = detail::compress_to_lz4_blocks(tb_raw, block_size);
+        out.fid_blocks = detail::compress_to_lz4_blocks(fid_raw, fid_block_size);
+        out.tb_blocks = detail::compress_to_lz4_blocks(tb_raw, tb_block_size);
         return out;
     }
 
@@ -923,7 +930,8 @@ private:
     std::unordered_map<std::string, size_t> key_to_attr_index_;
 
     std::string filter_expression_;
-    size_t block_size_ = kBlockSizeBytes;
+    size_t fid_block_size_ = kBlockSizeBytes;
+    size_t tb_block_size_ = kBlockSizeBytes;
 
     std::unique_ptr<CompiledNode> compiled_root_;
 };

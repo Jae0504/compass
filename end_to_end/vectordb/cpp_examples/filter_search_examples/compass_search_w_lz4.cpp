@@ -4,7 +4,11 @@
 #include "filter_expr.h"
 #include "io_utils.h"
 
+#include <algorithm>
+#include <array>
+#include <bitset>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -28,6 +32,8 @@ using filter_search_io::MetadataTable;
 using filter_search_io::VecFileInfo;
 
 namespace {
+constexpr size_t kLz4FidBlockSizeBytes = 8192 * 8;
+constexpr size_t kLz4TbBlockSizeBytes = 8192 * 256;
 
 struct Args {
     std::string dataset_type;
@@ -227,6 +233,484 @@ using CandidateQueue = std::priority_queue<
     std::vector<Pair<DistT>>,
     typename hnswlib::HierarchicalNSW<DistT>::CompareByFirst>;
 
+struct SequentialEqRuntime {
+    bool enabled = false;
+    bool empty_result = false;
+    std::string field;
+    std::bitset<compass_lz4_filter::kMaxBuckets> allowed_buckets;
+    size_t n_elements = 0;
+    compass_lz4_filter::detail::Lz4BlockStorage fid_storage;
+    compass_lz4_filter::detail::Lz4BlockStorage tb_storage;
+};
+
+struct SequentialEqQueryCache {
+    std::unordered_map<size_t, std::vector<uint8_t>> tb_blocks;
+    std::unordered_map<size_t, std::vector<uint8_t>> fid_blocks;
+};
+
+std::unique_ptr<filter_expr::Node> parse_filter_ast(const std::string& expression) {
+    std::vector<filter_expr::detail::Token> tokens = filter_expr::detail::tokenize(expression);
+    filter_expr::detail::Parser parser(std::move(tokens));
+    return parser.parse();
+}
+
+bool is_single_field_expression(const filter_expr::Node* node, std::string* field_out) {
+    if (node == nullptr) {
+        return false;
+    }
+    if (node->kind == filter_expr::Node::Kind::Logical) {
+        return is_single_field_expression(node->left.get(), field_out) &&
+               is_single_field_expression(node->right.get(), field_out);
+    }
+    if (field_out == nullptr) {
+        return false;
+    }
+    if (field_out->empty()) {
+        *field_out = node->field;
+        return true;
+    }
+    return *field_out == node->field;
+}
+
+int derive_usable_bins(int nfilters, int used_bins) {
+    int usable_bins = used_bins;
+    if (usable_bins <= 0) {
+        usable_bins = std::max(1, nfilters - 1);
+    }
+    usable_bins = std::min(usable_bins, std::max(1, nfilters - 1));
+    return usable_bins;
+}
+
+int bucket_from_numeric(
+    int usable_bins,
+    double min_value,
+    double max_value,
+    double rhs) {
+    if (usable_bins <= 1 || max_value <= min_value) {
+        return 0;
+    }
+    const double scale = static_cast<double>(usable_bins - 1) / (max_value - min_value);
+    int bucket = static_cast<int>(std::floor((rhs - min_value) * scale));
+    if (bucket < 0) {
+        bucket = 0;
+    }
+    if (bucket >= usable_bins) {
+        bucket = usable_bins - 1;
+    }
+    return bucket;
+}
+
+bool parse_numeric_literal(const filter_expr::Literal& lit, double* out) {
+    if (lit.is_number) {
+        if (out != nullptr) {
+            *out = lit.number;
+        }
+        return true;
+    }
+    return filter_expr::detail::try_parse_double(lit.text, out);
+}
+
+double bucket_representative(int usable_bins, double min_value, double max_value, int bucket) {
+    if (usable_bins <= 1 || max_value <= min_value) {
+        return min_value;
+    }
+    const double ratio = static_cast<double>(bucket) / static_cast<double>(usable_bins - 1);
+    return min_value + ratio * (max_value - min_value);
+}
+
+std::bitset<compass_lz4_filter::kMaxBuckets> all_data_buckets(int usable_bins) {
+    std::bitset<compass_lz4_filter::kMaxBuckets> out;
+    const int limit = std::min(usable_bins, static_cast<int>(compass_lz4_filter::kMaxBuckets));
+    for (int b = 0; b < limit; ++b) {
+        out.set(static_cast<size_t>(b));
+    }
+    return out;
+}
+
+std::bitset<compass_lz4_filter::kMaxBuckets> compile_compare_numeric_buckets(
+    const compass_lz4_filter::ManifestAttribute& attr,
+    int usable_bins,
+    filter_expr::CompareOp op,
+    const filter_expr::Literal& lit) {
+    double rhs = 0.0;
+    if (!parse_numeric_literal(lit, &rhs)) {
+        throw std::runtime_error(
+            "Numeric predicate has non-numeric literal for field '" + attr.key + "': " + lit.text);
+    }
+
+    std::bitset<compass_lz4_filter::kMaxBuckets> out;
+    if (op == filter_expr::CompareOp::Eq) {
+        out.set(static_cast<size_t>(bucket_from_numeric(usable_bins, attr.min_value, attr.max_value, rhs)));
+        return out;
+    }
+    if (op == filter_expr::CompareOp::Ne) {
+        out = all_data_buckets(usable_bins);
+        out.reset(static_cast<size_t>(bucket_from_numeric(usable_bins, attr.min_value, attr.max_value, rhs)));
+        return out;
+    }
+
+    const int limit = std::min(usable_bins, static_cast<int>(compass_lz4_filter::kMaxBuckets));
+    for (int b = 0; b < limit; ++b) {
+        const double rep = bucket_representative(usable_bins, attr.min_value, attr.max_value, b);
+        if (filter_expr::detail::compare_numeric(rep, rhs, op)) {
+            out.set(static_cast<size_t>(b));
+        }
+    }
+    return out;
+}
+
+std::bitset<compass_lz4_filter::kMaxBuckets> compile_between_numeric_buckets(
+    const compass_lz4_filter::ManifestAttribute& attr,
+    int usable_bins,
+    const filter_expr::Literal& lo,
+    const filter_expr::Literal& hi) {
+    double lo_v = 0.0;
+    double hi_v = 0.0;
+    if (!parse_numeric_literal(lo, &lo_v) || !parse_numeric_literal(hi, &hi_v)) {
+        throw std::runtime_error("Numeric BETWEEN has non-numeric bounds for field '" + attr.key + "'");
+    }
+    if (lo_v > hi_v) {
+        return std::bitset<compass_lz4_filter::kMaxBuckets>();
+    }
+
+    std::bitset<compass_lz4_filter::kMaxBuckets> out;
+    const int limit = std::min(usable_bins, static_cast<int>(compass_lz4_filter::kMaxBuckets));
+    for (int b = 0; b < limit; ++b) {
+        const double rep = bucket_representative(usable_bins, attr.min_value, attr.max_value, b);
+        if (rep >= lo_v && rep <= hi_v) {
+            out.set(static_cast<size_t>(b));
+        }
+    }
+    return out;
+}
+
+std::bitset<compass_lz4_filter::kMaxBuckets> compile_in_numeric_buckets(
+    const compass_lz4_filter::ManifestAttribute& attr,
+    int usable_bins,
+    const std::vector<filter_expr::Literal>& list) {
+    std::bitset<compass_lz4_filter::kMaxBuckets> out;
+    for (const filter_expr::Literal& lit : list) {
+        double v = 0.0;
+        if (!parse_numeric_literal(lit, &v)) {
+            throw std::runtime_error(
+                "Numeric IN has non-numeric literal for field '" + attr.key + "': " + lit.text);
+        }
+        out.set(static_cast<size_t>(bucket_from_numeric(usable_bins, attr.min_value, attr.max_value, v)));
+    }
+    return out;
+}
+
+std::bitset<compass_lz4_filter::kMaxBuckets> compile_compare_categorical_buckets(
+    const compass_lz4_filter::ManifestAttribute& attr,
+    int usable_bins,
+    filter_expr::CompareOp op,
+    const filter_expr::Literal& lit) {
+    std::bitset<compass_lz4_filter::kMaxBuckets> out;
+    auto bucket_it = attr.category_map.find(lit.text);
+    if (op == filter_expr::CompareOp::Eq) {
+        if (bucket_it != attr.category_map.end() &&
+            bucket_it->second >= 0 &&
+            bucket_it->second < usable_bins) {
+            out.set(static_cast<size_t>(bucket_it->second));
+        }
+        return out;
+    }
+    if (op == filter_expr::CompareOp::Ne) {
+        out = all_data_buckets(usable_bins);
+        if (bucket_it != attr.category_map.end() &&
+            bucket_it->second >= 0 &&
+            bucket_it->second < usable_bins) {
+            out.reset(static_cast<size_t>(bucket_it->second));
+        }
+        return out;
+    }
+
+    for (const auto& kv : attr.category_map) {
+        const std::string& key = kv.first;
+        const int bucket = kv.second;
+        if (bucket < 0 || bucket >= usable_bins || bucket >= static_cast<int>(compass_lz4_filter::kMaxBuckets)) {
+            continue;
+        }
+        if (filter_expr::detail::compare_string(key, lit.text, op)) {
+            out.set(static_cast<size_t>(bucket));
+        }
+    }
+    return out;
+}
+
+std::bitset<compass_lz4_filter::kMaxBuckets> compile_between_categorical_buckets(
+    const compass_lz4_filter::ManifestAttribute& attr,
+    int usable_bins,
+    const filter_expr::Literal& lo,
+    const filter_expr::Literal& hi) {
+    std::bitset<compass_lz4_filter::kMaxBuckets> out;
+    if (lo.text > hi.text) {
+        return out;
+    }
+    for (const auto& kv : attr.category_map) {
+        const std::string& key = kv.first;
+        const int bucket = kv.second;
+        if (bucket < 0 || bucket >= usable_bins || bucket >= static_cast<int>(compass_lz4_filter::kMaxBuckets)) {
+            continue;
+        }
+        if (key >= lo.text && key <= hi.text) {
+            out.set(static_cast<size_t>(bucket));
+        }
+    }
+    return out;
+}
+
+std::bitset<compass_lz4_filter::kMaxBuckets> compile_in_categorical_buckets(
+    const compass_lz4_filter::ManifestAttribute& attr,
+    int usable_bins,
+    const std::vector<filter_expr::Literal>& list) {
+    std::bitset<compass_lz4_filter::kMaxBuckets> out;
+    for (const filter_expr::Literal& lit : list) {
+        auto it = attr.category_map.find(lit.text);
+        if (it == attr.category_map.end()) {
+            continue;
+        }
+        if (it->second < 0 || it->second >= usable_bins || it->second >= static_cast<int>(compass_lz4_filter::kMaxBuckets)) {
+            continue;
+        }
+        out.set(static_cast<size_t>(it->second));
+    }
+    return out;
+}
+
+std::bitset<compass_lz4_filter::kMaxBuckets> compile_leaf_buckets(
+    const compass_lz4_filter::ManifestAttribute& attr,
+    int usable_bins,
+    const filter_expr::Node* node) {
+    if (node == nullptr) {
+        throw std::runtime_error("Internal error: null filter node");
+    }
+    if (node->kind == filter_expr::Node::Kind::Compare) {
+        if (attr.numeric) {
+            return compile_compare_numeric_buckets(attr, usable_bins, node->compare_op, node->literal);
+        }
+        return compile_compare_categorical_buckets(attr, usable_bins, node->compare_op, node->literal);
+    }
+    if (node->kind == filter_expr::Node::Kind::Between) {
+        if (attr.numeric) {
+            return compile_between_numeric_buckets(attr, usable_bins, node->lower, node->upper);
+        }
+        return compile_between_categorical_buckets(attr, usable_bins, node->lower, node->upper);
+    }
+    if (node->kind == filter_expr::Node::Kind::In) {
+        if (attr.numeric) {
+            return compile_in_numeric_buckets(attr, usable_bins, node->list);
+        }
+        return compile_in_categorical_buckets(attr, usable_bins, node->list);
+    }
+    throw std::runtime_error("Unexpected logical node passed to compile_leaf_buckets");
+}
+
+std::bitset<compass_lz4_filter::kMaxBuckets> compile_node_buckets(
+    const compass_lz4_filter::ManifestAttribute& attr,
+    int usable_bins,
+    const filter_expr::Node* node) {
+    if (node == nullptr) {
+        throw std::runtime_error("Parsed filter expression node is null");
+    }
+    if (node->kind == filter_expr::Node::Kind::Logical) {
+        const std::bitset<compass_lz4_filter::kMaxBuckets> lhs =
+            compile_node_buckets(attr, usable_bins, node->left.get());
+        const std::bitset<compass_lz4_filter::kMaxBuckets> rhs =
+            compile_node_buckets(attr, usable_bins, node->right.get());
+        if (node->logical_op == filter_expr::LogicalOp::And) {
+            return lhs & rhs;
+        }
+        return lhs | rhs;
+    }
+    return compile_leaf_buckets(attr, usable_bins, node);
+}
+
+SequentialEqRuntime build_sequential_eq_runtime(
+    const Args& args,
+    const compass_lz4_filter::CompassLz4FilterEngine& engine) {
+    SequentialEqRuntime runtime;
+    std::unique_ptr<filter_expr::Node> root = parse_filter_ast(args.filter_expression);
+    if (root == nullptr) {
+        return runtime;
+    }
+    std::string field;
+    if (!is_single_field_expression(root.get(), &field) || field.empty()) {
+        return runtime;
+    }
+
+    const compass_lz4_filter::ManifestData& manifest = engine.manifest();
+    const int nfilters = manifest.nfilters;
+    if (nfilters <= 0 || nfilters > static_cast<int>(compass_lz4_filter::kMaxBuckets)) {
+        return runtime;
+    }
+
+    auto attr_it = std::find_if(
+        manifest.attributes.begin(),
+        manifest.attributes.end(),
+        [&](const compass_lz4_filter::ManifestAttribute& attr) {
+            return attr.key == field;
+        });
+    if (attr_it == manifest.attributes.end()) {
+        return runtime;
+    }
+
+    const compass_lz4_filter::ManifestAttribute& attr = *attr_it;
+    const int usable_bins = derive_usable_bins(nfilters, attr.used_bins);
+    if (usable_bins <= 0) {
+        return runtime;
+    }
+
+    const std::bitset<compass_lz4_filter::kMaxBuckets> allowed_buckets =
+        compile_node_buckets(attr, usable_bins, root.get());
+    if (allowed_buckets.none()) {
+        runtime.enabled = true;
+        runtime.empty_result = true;
+        runtime.field = field;
+        runtime.allowed_buckets = allowed_buckets;
+        runtime.n_elements = manifest.n_elements;
+        return runtime;
+    }
+
+    size_t fid_count = 0;
+    std::vector<uint8_t> fid_raw = compass_lz4_filter::detail::read_payload_with_size_header(
+        attr.fid_file,
+        &fid_count,
+        sizeof(uint8_t));
+    if (fid_count != manifest.n_elements) {
+        throw std::runtime_error(
+            "FID element count mismatch while building sequential runtime for field '" + attr.key + "'");
+    }
+
+    size_t tb_count = 0;
+    std::vector<uint8_t> tb_raw = compass_lz4_filter::detail::read_payload_with_size_header(
+        attr.tb_file,
+        &tb_count,
+        compass_lz4_filter::kTbBytesPerNode);
+    if (tb_count != manifest.n_elements) {
+        throw std::runtime_error(
+            "TB element count mismatch while building sequential runtime for field '" + attr.key + "'");
+    }
+
+    std::array<uint8_t, compass_lz4_filter::kTbBytesPerNode> tb_mask{};
+    for (size_t bucket = 0; bucket < compass_lz4_filter::kMaxBuckets; ++bucket) {
+        if (allowed_buckets.test(bucket)) {
+            tb_mask[bucket / 8] |= static_cast<uint8_t>(1u << (bucket % 8));
+        }
+    }
+
+    std::vector<uint8_t> tb_bucket_bits((manifest.n_elements + 7) / 8, 0);
+    for (size_t node_id = 0; node_id < manifest.n_elements; ++node_id) {
+        const size_t base = node_id * compass_lz4_filter::kTbBytesPerNode;
+        bool any_bucket_match = false;
+        for (size_t i = 0; i < compass_lz4_filter::kTbBytesPerNode; ++i) {
+            if ((tb_raw[base + i] & tb_mask[i]) != 0) {
+                any_bucket_match = true;
+                break;
+            }
+        }
+        if (any_bucket_match) {
+            tb_bucket_bits[node_id / 8] |= static_cast<uint8_t>(1u << (node_id % 8));
+        }
+    }
+
+    runtime.fid_storage =
+        compass_lz4_filter::detail::compress_to_lz4_blocks(fid_raw, kLz4FidBlockSizeBytes);
+    runtime.tb_storage =
+        compass_lz4_filter::detail::compress_to_lz4_blocks(tb_bucket_bits, kLz4TbBlockSizeBytes);
+    runtime.enabled = true;
+    runtime.empty_result = false;
+    runtime.field = field;
+    runtime.allowed_buckets = allowed_buckets;
+    runtime.n_elements = manifest.n_elements;
+    return runtime;
+}
+
+void prefetch_tb_blocks(
+    const SequentialEqRuntime& runtime,
+    SequentialEqQueryCache* cache,
+    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
+    if (cache == nullptr) {
+        throw std::runtime_error("TB prefetch received null cache");
+    }
+    for (size_t block_id = 0; block_id < runtime.tb_storage.block_count(); ++block_id) {
+        (void)compass_lz4_filter::detail::get_or_decompress_block(
+            runtime.tb_storage,
+            block_id,
+            false,
+            &cache->tb_blocks,
+            metrics);
+    }
+}
+
+void prefetch_fid_blocks(
+    const SequentialEqRuntime& runtime,
+    const std::unordered_set<size_t>& block_ids,
+    SequentialEqQueryCache* cache,
+    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
+    if (cache == nullptr) {
+        throw std::runtime_error("FID prefetch received null cache");
+    }
+    for (size_t block_id : block_ids) {
+        if (block_id >= runtime.fid_storage.block_count()) {
+            continue;
+        }
+        (void)compass_lz4_filter::detail::get_or_decompress_block(
+            runtime.fid_storage,
+            block_id,
+            true,
+            &cache->fid_blocks,
+            metrics);
+    }
+}
+
+bool tb_match_node(
+    const SequentialEqRuntime& runtime,
+    SequentialEqQueryCache* cache,
+    size_t node_id,
+    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
+    if (cache == nullptr || runtime.tb_storage.block_size == 0 || node_id >= runtime.n_elements) {
+        return false;
+    }
+
+    const size_t byte_offset = node_id / 8;
+    const size_t block_id = byte_offset / runtime.tb_storage.block_size;
+    const size_t in_block = byte_offset % runtime.tb_storage.block_size;
+    auto it = cache->tb_blocks.find(block_id);
+    if (it == cache->tb_blocks.end() || in_block >= it->second.size()) {
+        return false;
+    }
+
+    if (metrics != nullptr) {
+        ++metrics->tb_cache_hits;
+    }
+    const uint8_t byte = it->second[in_block];
+    return ((byte >> (node_id % 8)) & 1u) != 0;
+}
+
+bool fid_match_node(
+    const SequentialEqRuntime& runtime,
+    SequentialEqQueryCache* cache,
+    size_t node_id,
+    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
+    if (cache == nullptr || runtime.fid_storage.block_size == 0 || node_id >= runtime.n_elements) {
+        return false;
+    }
+
+    const size_t block_id = node_id / runtime.fid_storage.block_size;
+    const size_t in_block = node_id % runtime.fid_storage.block_size;
+    auto it = cache->fid_blocks.find(block_id);
+    if (it == cache->fid_blocks.end() || in_block >= it->second.size()) {
+        return false;
+    }
+
+    if (metrics != nullptr) {
+        ++metrics->fid_cache_hits;
+    }
+    const uint8_t bucket = it->second[in_block];
+    return runtime.allowed_buckets.test(static_cast<size_t>(bucket));
+}
+
 template <typename DistT, typename QueryT>
 std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     const hnswlib::HierarchicalNSW<DistT>& index,
@@ -369,6 +853,180 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
 }
 
 template <typename DistT, typename QueryT>
+std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filter(
+    const hnswlib::HierarchicalNSW<DistT>& index,
+    const QueryT* query_data,
+    size_t k,
+    size_t ef,
+    const SequentialEqRuntime& runtime,
+    SearchCallStats* call_stats) {
+    std::vector<std::pair<DistT, hnswlib::labeltype>> result;
+    if (index.cur_element_count == 0 || runtime.empty_result) {
+        return result;
+    }
+
+    if (runtime.n_elements != index.cur_element_count) {
+        throw std::runtime_error("Sequential runtime element count does not match index");
+    }
+
+    SearchCallStats local_stats;
+    if (call_stats == nullptr) {
+        call_stats = &local_stats;
+    }
+
+    hnswlib::tableint curr_obj = index.enterpoint_node_;
+    if (static_cast<int>(curr_obj) == -1) {
+        return result;
+    }
+
+    DistT curdist = index.fstdistfunc_(query_data, index.getDataByInternalId(curr_obj), index.dist_func_param_);
+
+    for (int level = index.maxlevel_; level > 0; --level) {
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            unsigned int* data = reinterpret_cast<unsigned int*>(index.get_linklist(curr_obj, level));
+            const int size = index.getListCount(data);
+            auto* datal = reinterpret_cast<hnswlib::tableint*>(data + 1);
+
+            for (int i = 0; i < size; ++i) {
+                const hnswlib::tableint cand = datal[i];
+                if (cand >= index.cur_element_count) {
+                    throw std::runtime_error("Corrupted graph link while traversing upper layers");
+                }
+
+                const DistT d = index.fstdistfunc_(query_data, index.getDataByInternalId(cand), index.dist_func_param_);
+                if (d < curdist) {
+                    curdist = d;
+                    curr_obj = cand;
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    SequentialEqQueryCache cache;
+    cache.tb_blocks.reserve(runtime.tb_storage.block_count());
+    prefetch_tb_blocks(runtime, &cache, &call_stats->decomp);
+
+    hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
+    hnswlib::vl_type* visited = vl->mass;
+    const hnswlib::vl_type tag = vl->curV;
+
+    CandidateQueue<DistT> top_candidates;
+    CandidateQueue<DistT> candidate_set;
+    {
+        const DistT dist = index.fstdistfunc_(query_data, index.getDataByInternalId(curr_obj), index.dist_func_param_);
+        candidate_set.emplace(-dist, curr_obj);
+    }
+
+    visited[curr_obj] = tag;
+    DistT lower_bound = std::numeric_limits<DistT>::max();
+
+    while (!candidate_set.empty()) {
+        const Pair<DistT> current = candidate_set.top();
+        const DistT candidate_dist = -current.first;
+
+        if (candidate_dist > lower_bound && top_candidates.size() >= ef) {
+            break;
+        }
+        candidate_set.pop();
+
+        const hnswlib::tableint current_node_id = current.second;
+        int* data = reinterpret_cast<int*>(index.get_linklist0(current_node_id));
+        const size_t size = index.getListCount(reinterpret_cast<hnswlib::linklistsizeint*>(data));
+
+        std::vector<hnswlib::tableint> neighbor_ids;
+        neighbor_ids.reserve(size);
+        std::unordered_set<size_t> fid_blocks_to_prefetch;
+        fid_blocks_to_prefetch.reserve(size);
+
+        for (size_t j = 1; j <= size; ++j) {
+            const hnswlib::tableint candidate_id = static_cast<hnswlib::tableint>(*(data + j));
+            if (candidate_id >= index.cur_element_count) {
+                throw std::runtime_error("Corrupted graph link while traversing level-0");
+            }
+            if (visited[candidate_id] == tag) {
+                continue;
+            }
+            visited[candidate_id] = tag;
+            neighbor_ids.push_back(candidate_id);
+
+            const size_t block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
+            if (cache.fid_blocks.find(block_id) == cache.fid_blocks.end()) {
+                fid_blocks_to_prefetch.insert(block_id);
+            }
+        }
+
+        prefetch_fid_blocks(runtime, fid_blocks_to_prefetch, &cache, &call_stats->decomp);
+
+        std::vector<DistT> dists(neighbor_ids.size(), DistT());
+        for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
+            dists[idx] = index.fstdistfunc_(
+                query_data,
+                index.getDataByInternalId(neighbor_ids[idx]),
+                index.dist_func_param_);
+        }
+
+        for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
+            const hnswlib::tableint candidate_id = neighbor_ids[idx];
+            const DistT dist = dists[idx];
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool fid_match = fid_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
+            const bool tb_match = tb_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
+            const bool traversal_allowed = fid_match || tb_match;
+            const auto t1 = std::chrono::steady_clock::now();
+            ++call_stats->filter_eval_calls;
+            call_stats->filter_eval_time_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+
+            if (!traversal_allowed) {
+                continue;
+            }
+
+            if (top_candidates.size() < ef || lower_bound > dist) {
+                candidate_set.emplace(-dist, candidate_id);
+
+                bool result_allowed = false;
+                if (!index.isMarkedDeleted(candidate_id)) {
+                    const auto r0 = std::chrono::steady_clock::now();
+                    result_allowed = fid_match;
+                    const auto r1 = std::chrono::steady_clock::now();
+                    ++call_stats->filter_eval_calls;
+                    call_stats->filter_eval_time_ns += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(r1 - r0).count());
+                }
+                if (!index.isMarkedDeleted(candidate_id) && result_allowed) {
+                    top_candidates.emplace(dist, candidate_id);
+                }
+
+                while (top_candidates.size() > ef) {
+                    top_candidates.pop();
+                }
+                if (!top_candidates.empty()) {
+                    lower_bound = top_candidates.top().first;
+                }
+            }
+        }
+    }
+
+    while (top_candidates.size() > k) {
+        top_candidates.pop();
+    }
+
+    size_t sz = top_candidates.size();
+    result.resize(sz);
+    while (!top_candidates.empty()) {
+        const Pair<DistT> item = top_candidates.top();
+        top_candidates.pop();
+        result[--sz] = std::make_pair(item.first, index.getExternalLabel(item.second));
+    }
+
+    index.visited_list_pool_->releaseVisitedList(vl);
+    return result;
+}
+
+template <typename DistT, typename QueryT>
 std::priority_queue<std::pair<DistT, hnswlib::labeltype>> build_enns_heap(
     const hnswlib::HierarchicalNSW<DistT>& index,
     const QueryT* qptr,
@@ -395,7 +1053,8 @@ RunStats run_search_typed(
     int dim,
     const DenseVectors<QueryT>& queries,
     const compass_lz4_filter::CompassLz4FilterEngine& engine,
-    const MetadataTable& metadata) {
+    const MetadataTable& metadata,
+    const SequentialEqRuntime* sequential_runtime) {
     SpaceT space(static_cast<size_t>(dim));
     hnswlib::HierarchicalNSW<DistT> index(&space, args.graph_path);
     index.setEf(static_cast<size_t>(args.ef));
@@ -408,6 +1067,7 @@ RunStats run_search_typed(
     }
 
     RunStats stats;
+    const bool use_sequential_eq = (sequential_runtime != nullptr && sequential_runtime->enabled);
     const size_t total_elements = index.getCurrentElementCount();
 
     std::vector<size_t> result_nodes = engine.collect_result_candidates();
@@ -473,18 +1133,29 @@ RunStats run_search_typed(
     for (size_t qid = 0; qid < query_count; ++qid) {
         const QueryT* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
 
-        compass_lz4_filter::QueryBlockCache query_cache(engine.attribute_count());
         SearchCallStats call_stats;
 
         const auto search_start = std::chrono::steady_clock::now();
-        std::vector<std::pair<DistT, hnswlib::labeltype>> result = search_with_compass_filter<DistT, QueryT>(
-            index,
-            qptr,
-            static_cast<size_t>(args.k),
-            static_cast<size_t>(args.ef),
-            engine,
-            &query_cache,
-            &call_stats);
+        std::vector<std::pair<DistT, hnswlib::labeltype>> result;
+        if (use_sequential_eq) {
+            result = search_with_sequential_eq_filter<DistT, QueryT>(
+                index,
+                qptr,
+                static_cast<size_t>(args.k),
+                static_cast<size_t>(args.ef),
+                *sequential_runtime,
+                &call_stats);
+        } else {
+            compass_lz4_filter::QueryBlockCache query_cache(engine.attribute_count());
+            result = search_with_compass_filter<DistT, QueryT>(
+                index,
+                qptr,
+                static_cast<size_t>(args.k),
+                static_cast<size_t>(args.ef),
+                engine,
+                &query_cache,
+                &call_stats);
+        }
         const auto search_end = std::chrono::steady_clock::now();
 
         const uint64_t query_search_ns = static_cast<uint64_t>(
@@ -735,7 +1406,9 @@ int main(int argc, char** argv) {
                 args.fidtb_manifest,
                 args.filter_expression,
                 fields,
-                compass_lz4_filter::kBlockSizeBytes);
+                kLz4FidBlockSizeBytes,
+                kLz4TbBlockSizeBytes);
+        const SequentialEqRuntime sequential_runtime = build_sequential_eq_runtime(args, engine);
 
         const bool query_is_fvecs = filter_search_io::ends_with(args.query_path, ".fvecs");
         const size_t query_elem_bytes = query_is_fvecs ? sizeof(float) : sizeof(uint8_t);
@@ -769,7 +1442,8 @@ int main(int argc, char** argv) {
                 static_cast<int>(index_dim),
                 queries,
                 engine,
-                metadata);
+                metadata,
+                sequential_runtime.enabled ? &sequential_runtime : nullptr);
         } else {
             DenseVectors<uint8_t> queries = filter_search_io::read_bvecs(args.query_path);
             stats = run_search_typed<int, hnswlib::L2SpaceI, uint8_t>(
@@ -777,7 +1451,8 @@ int main(int argc, char** argv) {
                 static_cast<int>(index_dim),
                 queries,
                 engine,
-                metadata);
+                metadata,
+                sequential_runtime.enabled ? &sequential_runtime : nullptr);
         }
 
         const std::string summary = build_summary(

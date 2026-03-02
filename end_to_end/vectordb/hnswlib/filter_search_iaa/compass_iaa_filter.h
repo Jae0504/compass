@@ -27,8 +27,8 @@ namespace compass_iaa_filter {
 
 using json = nlohmann::json;
 
-constexpr size_t kDefaultFidBlockSizeBytes = 8192;
-constexpr size_t kDefaultTbBlockSizeBytes = 8192;
+constexpr size_t kDefaultFidBlockSizeBytes = 8192*8;
+constexpr size_t kDefaultTbBlockSizeBytes = 8192*128;
 constexpr size_t kMaxBuckets = 256;
 constexpr size_t kTbBytesPerNode = 32;
 

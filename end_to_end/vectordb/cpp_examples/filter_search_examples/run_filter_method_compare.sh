@@ -222,8 +222,8 @@ set_dataset_defaults() {
       : "${QUERY_PATH:=/storage/jykang5/compass_base_query/sift1m_query.fvecs}"
       : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/sift1m/manifest.json}"
       : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/sift1m/manifest.json}"
-      : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/sift1m/sift1m_acorn_m32_nf100.index}"
-      : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/sift1m/sift1m_acorn_m32_nf10.index}"
+      : "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/sift1m_acorn_m32_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/sift1m_acorn_m32_nf10.index}"
       ;;
     sift1b)
       HNSW_DATASET_TYPE="sift"
@@ -244,8 +244,8 @@ set_dataset_defaults() {
       : "${QUERY_PATH:=/storage/jykang5/compass_base_query/laion_query.fvecs}"
       : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/laion/manifest.json}"
       : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/laion/manifest.json}"
-      : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/laion/laion_acorn_m32_nf100.index}"
-      : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/laion/laion_acorn_m32_nf10.index}"
+      : "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/laion_acorn_m32_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/laion_acorn_m32_nf10.index}"
       : "${PAYLOAD_JSONL:=/fast-lab-share/benchmarks/VectorDB/FILTER/LAION/payloads.jsonl}"
       ;;
     hnm)
@@ -256,8 +256,8 @@ set_dataset_defaults() {
       : "${QUERY_PATH:=/storage/jykang5/compass_base_query/hnm_query.fvecs}"
       : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/hnm/manifest.json}"
       : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/hnm/manifest.json}"
-      : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/hnm/hnm_acorn_m32_nf100.index}"
-      : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/hnm/hnm_acorn_m32_nf10.index}"
+      : "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m32_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m32_nf10.index}"
       : "${PAYLOAD_JSONL:=/fast-lab-share/benchmarks/VectorDB/FILTER/HnM/payloads.jsonl}"
       ;;
     *)
@@ -561,9 +561,9 @@ run_selectivity() {
   local out_csv="$5"
 
   local methods=(
-    "post_filter_hnsw"
-    "in_search_filter_hnsw"
-    "acorn"
+    # "post_filter_hnsw"
+    # "in_search_filter_hnsw"
+    # "acorn"
     "compass_lz4"
     "compass_iaa"
   )
