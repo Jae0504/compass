@@ -26,7 +26,7 @@ else
 QPL_CHECK = @true
 endif
 
-all: hnswlib_filter_search.run compass_search_w_lz4.run compass_search_w_iaa.run
+all: hnswlib_filter_search.run compass_search_w_lz4.run compass_search_w_iaa.run compass_search_w_iaa_async.run
 
 hnswlib_filter_search.run: hnswlib_filter_search.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@
@@ -38,7 +38,11 @@ compass_search_w_iaa.run: compass_search_w_iaa.cpp
 	$(QPL_CHECK)
 	$(CXX) $(CXXFLAGS) $(INCLUDES_IAA) $< -o $@ $(LIBS_IAA)
 
+compass_search_w_iaa_async.run: compass_search_w_iaa_async.cpp
+	$(QPL_CHECK)
+	$(CXX) $(CXXFLAGS) $(INCLUDES_IAA) $< -o $@ $(LIBS_IAA)
+
 clean:
-	rm -f hnswlib_filter_search.run compass_search_w_lz4.run compass_search_w_iaa.run
+	rm -f hnswlib_filter_search.run compass_search_w_lz4.run compass_search_w_iaa.run compass_search_w_iaa_async.run
 
 .PHONY: all clean
