@@ -570,6 +570,58 @@ AsyncEqQueryCache make_preallocated_query_cache(const AsyncEqRuntime& runtime) {
     return cache;
 }
 
+void reset_preallocated_query_cache(
+    const AsyncEqRuntime& runtime,
+    AsyncEqQueryCache* cache) {
+    if (cache == nullptr) {
+        throw std::runtime_error("AsyncEqQueryCache reset received null pointer");
+    }
+    if (cache->tb_blocks.size() != runtime.tb_storage.block_count() ||
+        cache->tb_ready.size() != runtime.tb_storage.block_count() ||
+        cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
+        cache->fid_ready.size() != runtime.fid_storage.block_count()) {
+        throw std::runtime_error("AsyncEqQueryCache reset size mismatch");
+    }
+
+    std::fill(cache->tb_ready.begin(), cache->tb_ready.end(), static_cast<uint8_t>(0));
+    std::fill(cache->fid_ready.begin(), cache->fid_ready.end(), static_cast<uint8_t>(0));
+    for (size_t block_id = 0; block_id < cache->fid_blocks.size(); ++block_id) {
+        FidScanBlock& block = cache->fid_blocks[block_id];
+        block.input_elements = runtime.fid_storage.raw_block_sizes[block_id];
+        block.output_bytes = 0;
+        block.byte_per_element = false;
+    }
+}
+
+void prefault_query_cache_buffers(AsyncEqQueryCache* cache) {
+    if (cache == nullptr) {
+        throw std::runtime_error("AsyncEqQueryCache prefault received null pointer");
+    }
+
+    volatile uint8_t sink = 0;
+    constexpr size_t kPageBytes = 4096;
+
+    auto touch_vec = [&](std::vector<uint8_t>& vec) {
+        if (vec.empty()) {
+            return;
+        }
+        for (size_t i = 0; i < vec.size(); i += kPageBytes) {
+            sink ^= vec[i];
+        }
+        sink ^= vec.back();
+    };
+
+    touch_vec(cache->tb_ready);
+    touch_vec(cache->fid_ready);
+    for (std::vector<uint8_t>& block : cache->tb_blocks) {
+        touch_vec(block);
+    }
+    for (FidScanBlock& block : cache->fid_blocks) {
+        touch_vec(block.matches);
+    }
+    (void)sink;
+}
+
 class AsyncJobRing {
 public:
     AsyncJobRing(size_t queue_size = 128, size_t wait_batch = 64, size_t output_buffer_bytes = 1)
@@ -647,6 +699,21 @@ public:
 
     bool has_pending() const {
         return !pending_slots_.empty();
+    }
+
+    void prefault_output_buffers() {
+        volatile uint8_t sink = 0;
+        constexpr size_t kPageBytes = 4096;
+        for (Slot& slot : slots_) {
+            if (slot.output.empty()) {
+                continue;
+            }
+            for (size_t i = 0; i < slot.output.size(); i += kPageBytes) {
+                sink ^= slot.output[i];
+            }
+            sink ^= slot.output.back();
+        }
+        (void)sink;
     }
 
 private:
@@ -1360,13 +1427,35 @@ RunStats run_search_typed(
         stats.per_query_metrics.reserve(query_count);
     }
 
+    AsyncEqQueryCache query_async_cache = make_preallocated_query_cache(*async_runtime);
+    reset_preallocated_query_cache(*async_runtime, &query_async_cache);
+    shared_ring->prefault_output_buffers();
+    prefault_query_cache_buffers(&query_async_cache);
+
+    // Untimed warm-up to prefault/touch async paths before measured queries.
+    if (query_count > 0) {
+        const QueryT* warmup_qptr = queries.values.data();
+        SearchCallStats warmup_stats;
+        reset_preallocated_query_cache(*async_runtime, &query_async_cache);
+        (void)search_with_async_eq_filter<DistT, QueryT>(
+            index,
+            warmup_qptr,
+            static_cast<size_t>(args.k),
+            resolved_ef,
+            *async_runtime,
+            shared_ring.get(),
+            &query_async_cache,
+            &warmup_stats);
+        shared_ring->flush();
+    }
+
     size_t returned_results = 0;
 
     for (size_t qid = 0; qid < query_count; ++qid) {
         const QueryT* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
 
         SearchCallStats call_stats;
-        AsyncEqQueryCache query_async_cache = make_preallocated_query_cache(*async_runtime);
+        reset_preallocated_query_cache(*async_runtime, &query_async_cache);
 
         const auto search_start = std::chrono::steady_clock::now();
         std::vector<std::pair<DistT, hnswlib::labeltype>> result;
