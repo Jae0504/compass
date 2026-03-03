@@ -10,6 +10,8 @@ Usage:
     [--dataset <sift1m|sift1b|laion|hnm>] \
     [--k <int>] \
     [--ef-list <comma-separated>] \
+    [--ef-list-1pct <comma-separated>] \
+    [--ef-list-10pct <comma-separated>] \
     [--num-queries <int>] \
     [--out-dir <path>] \
     [--postfilter-max-candidates <int>] \
@@ -20,9 +22,13 @@ Core defaults:
   --dataset                     sift1m
   --k                           10
   --ef-list                     32,64,96,128,160,200,256,320,400
+  --ef-list-1pct               (dataset=sift1m default) 64,96,128,160,200
+  --ef-list-10pct              (dataset=sift1m default) 200,256,300,400
   --num-queries                 100
   --out-dir                     <this_dir>/out/filter_method_compare
   --postfilter-max-candidates   5000
+  --fid-block-size-bytes        8192*8 (65536)
+  --tb-block-size-bytes         8192*128 (1048576)
   --build                       enabled
   --plot                        enabled
 
@@ -37,6 +43,8 @@ Advanced overrides:
   --acorn-index-1pct <path>
   --acorn-index-10pct <path>
   --payload-jsonl <path>
+  --fid-block-size-bytes <int>
+  --tb-block-size-bytes <int>
 
 Output files:
   <out-dir>/results_1pct.csv
@@ -86,6 +94,9 @@ ensure_executable_file() {
 DATASET="sift1m"
 K=10
 EF_LIST="32,64,96,128,160,200"
+EF_LIST_1PCT=""
+EF_LIST_10PCT=""
+EF_LIST_SET_BY_USER=0
 NUM_QUERIES=100
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 POSTFILTER_MAX_CANDIDATES=50
@@ -103,6 +114,8 @@ MANIFEST_10PCT=""
 ACORN_INDEX_1PCT=""
 ACORN_INDEX_10PCT=""
 PAYLOAD_JSONL=""
+FID_BLOCK_SIZE_BYTES="$((1024*64))"
+TB_BLOCK_SIZE_BYTES="$((1024*256))"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -116,6 +129,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --ef-list)
       EF_LIST="$2"
+      EF_LIST_SET_BY_USER=1
+      shift 2
+      ;;
+    --ef-list-1pct)
+      EF_LIST_1PCT="$2"
+      shift 2
+      ;;
+    --ef-list-10pct)
+      EF_LIST_10PCT="$2"
       shift 2
       ;;
     --num-queries)
@@ -187,6 +209,14 @@ while [[ $# -gt 0 ]]; do
       PAYLOAD_JSONL="$2"
       shift 2
       ;;
+    --fid-block-size-bytes)
+      FID_BLOCK_SIZE_BYTES="$2"
+      shift 2
+      ;;
+    --tb-block-size-bytes)
+      TB_BLOCK_SIZE_BYTES="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -215,6 +245,18 @@ if [[ "$POSTFILTER_MAX_CANDIDATES" -lt "$K" ]]; then
   echo "Error: --postfilter-max-candidates must be >= --k" >&2
   exit 1
 fi
+if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
+  if ! [[ "$FID_BLOCK_SIZE_BYTES" =~ ^[0-9]+$ ]] || [[ "$FID_BLOCK_SIZE_BYTES" -le 0 ]]; then
+    echo "Error: --fid-block-size-bytes must be a positive integer" >&2
+    exit 1
+  fi
+fi
+if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
+  if ! [[ "$TB_BLOCK_SIZE_BYTES" =~ ^[0-9]+$ ]] || [[ "$TB_BLOCK_SIZE_BYTES" -le 0 ]]; then
+    echo "Error: --tb-block-size-bytes must be a positive integer" >&2
+    exit 1
+  fi
+fi
 
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
 LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4.run"
@@ -232,6 +274,10 @@ set_dataset_defaults() {
       HNSW_DATASET_TYPE="sift"
       LZ4_DATASET_TYPE="sift"
       IAA_DATASET_TYPE="sift1m"
+      if [[ "$EF_LIST_SET_BY_USER" -eq 0 && -z "$EF_LIST_1PCT" && -z "$EF_LIST_10PCT" ]]; then
+        EF_LIST_1PCT="64,96,128,160,200"
+        EF_LIST_10PCT="200,256,300,400"
+      fi
       : "${GRAPH_PATH:=/storage/jykang5/compass_graphs/sift_m128_efc200.bin}"
       : "${QUERY_PATH:=/storage/jykang5/compass_base_query/sift1m_query.fvecs}"
       : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/sift1m/manifest.json}"
@@ -303,23 +349,44 @@ if [[ "$HNSW_DATASET_TYPE" != "sift" ]]; then
   ensure_readable_file "$PAYLOAD_JSONL" "payload JSONL is required for non-sift hnsw baseline"
 fi
 
-IFS=',' read -r -a RAW_EFS <<< "$EF_LIST"
-EF_VALUES=()
-for raw_ef in "${RAW_EFS[@]}"; do
-  ef="$(echo "$raw_ef" | tr -d '[:space:]')"
-  if [[ -z "$ef" ]]; then
-    continue
-  fi
-  if ! [[ "$ef" =~ ^[0-9]+$ ]] || [[ "$ef" -le 0 ]]; then
-    echo "Error: invalid ef in --ef-list: $ef" >&2
+parse_ef_list_into_array() {
+  local ef_list="$1"
+  local ef_label="$2"
+  local out_var_name="$3"
+
+  IFS=',' read -r -a RAW_EFS <<< "$ef_list"
+  local -a parsed_values=()
+  local raw_ef=""
+  local ef=""
+  for raw_ef in "${RAW_EFS[@]}"; do
+    ef="$(echo "$raw_ef" | tr -d '[:space:]')"
+    if [[ -z "$ef" ]]; then
+      continue
+    fi
+    if ! [[ "$ef" =~ ^[0-9]+$ ]] || [[ "$ef" -le 0 ]]; then
+      echo "Error: invalid ef in ${ef_label}: $ef" >&2
+      exit 1
+    fi
+    parsed_values+=("$ef")
+  done
+
+  if [[ "${#parsed_values[@]}" -eq 0 ]]; then
+    echo "Error: ${ef_label} produced no valid ef values" >&2
     exit 1
   fi
-  EF_VALUES+=("$ef")
-done
-if [[ "${#EF_VALUES[@]}" -eq 0 ]]; then
-  echo "Error: --ef-list produced no valid ef values" >&2
-  exit 1
-fi
+
+  eval "$out_var_name=()"
+  local v
+  for v in "${parsed_values[@]}"; do
+    eval "$out_var_name+=(\"$v\")"
+  done
+}
+
+EFFECTIVE_EF_LIST_1PCT="${EF_LIST_1PCT:-$EF_LIST}"
+EFFECTIVE_EF_LIST_10PCT="${EF_LIST_10PCT:-$EF_LIST}"
+
+parse_ef_list_into_array "$EFFECTIVE_EF_LIST_1PCT" "--ef-list-1pct" EF_VALUES_1PCT
+parse_ef_list_into_array "$EFFECTIVE_EF_LIST_10PCT" "--ef-list-10pct" EF_VALUES_10PCT
 
 generate_sift_metadata_csv() {
   local manifest_path="$1"
@@ -415,8 +482,8 @@ RESULTS_1PCT="$OUT_DIR/results_1pct.csv"
 RESULTS_10PCT="$OUT_DIR/results_10pct.csv"
 RESULTS_MERGED="$OUT_DIR/results_merged.csv"
 
-printf 'dataset,selectivity_pct,method,ef,k,queries_executed,recall,qps,summary_path,status,error\n' > "$RESULTS_1PCT"
-printf 'dataset,selectivity_pct,method,ef,k,queries_executed,recall,qps,summary_path,status,error\n' > "$RESULTS_10PCT"
+printf 'dataset,selectivity_pct,method,ef,k,queries_executed,recall,qps,fid_comp_ratio,tb_comp_ratio,total_comp_ratio,summary_path,status,error\n' > "$RESULTS_1PCT"
+printf 'dataset,selectivity_pct,method,ef,k,queries_executed,recall,qps,fid_comp_ratio,tb_comp_ratio,total_comp_ratio,summary_path,status,error\n' > "$RESULTS_10PCT"
 
 GENERATED_META_DIR="$OUT_DIR/generated_metadata"
 mkdir -p "$GENERATED_META_DIR"
@@ -518,6 +585,12 @@ run_single() {
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
       )
+      if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES")
+      fi
+      if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
+      fi
       ;;
     compass_iaa)
       cmd=(
@@ -532,6 +605,12 @@ run_single() {
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
       )
+      if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES")
+      fi
+      if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
+      fi
       ;;
     acorn)
       cmd=(
@@ -562,11 +641,17 @@ run_single() {
   local queries_executed=""
   local recall=""
   local qps=""
+  local fid_comp_ratio=""
+  local tb_comp_ratio=""
+  local total_comp_ratio=""
 
   if "${cmd[@]}" > "$log_path" 2>&1; then
     queries_executed="$(extract_summary_value "queries_executed" "$summary_path" || true)"
     recall="$(extract_summary_value "average_recall_at_k" "$summary_path" || true)"
     qps="$(extract_summary_value "qps" "$summary_path" || true)"
+    fid_comp_ratio="$(extract_summary_value "fid_compression_ratio_raw_over_compressed" "$summary_path" || true)"
+    tb_comp_ratio="$(extract_summary_value "tb_compression_ratio_raw_over_compressed" "$summary_path" || true)"
+    total_comp_ratio="$(extract_summary_value "filter_payload_compression_ratio_raw_over_compressed" "$summary_path" || true)"
 
     if [[ -z "$qps" ]] || ! is_numeric "$qps"; then
       local loop_ms
@@ -587,7 +672,7 @@ run_single() {
     error_text="$(sanitize_csv_field "$error_text")"
   fi
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "$DATASET" \
     "$selectivity_pct" \
     "$method" \
@@ -596,6 +681,9 @@ run_single() {
     "$queries_executed" \
     "$recall" \
     "$qps" \
+    "$fid_comp_ratio" \
+    "$tb_comp_ratio" \
+    "$total_comp_ratio" \
     "$summary_path" \
     "$status" \
     "$error_text" >> "$out_csv"
@@ -608,6 +696,8 @@ run_selectivity() {
   local acorn_index_path="$4"
   local out_csv="$5"
   local filter_expr="$6"
+  local ef_values_name="$7"
+  local -n ef_values_ref="$ef_values_name"
 
   local methods=(
     # "post_filter_hnsw"
@@ -617,7 +707,7 @@ run_selectivity() {
     "compass_iaa"
   )
 
-  for ef in "${EF_VALUES[@]}"; do
+  for ef in "${ef_values_ref[@]}"; do
     for method in "${methods[@]}"; do
       run_single "$method" "$selectivity_pct" "$ef" "$manifest_path" "$metadata_csv" "$acorn_index_path" "$out_csv" "$filter_expr"
     done
@@ -635,14 +725,15 @@ echo "  acorn indexes:"
 echo "    1%  -> $ACORN_INDEX_1PCT"
 echo "    10% -> $ACORN_INDEX_10PCT"
 echo "  k: $K"
-echo "  ef list: ${EF_VALUES[*]}"
+echo "  ef list (1%): ${EF_VALUES_1PCT[*]}"
+echo "  ef list (10%): ${EF_VALUES_10PCT[*]}"
 echo "  num-queries: $NUM_QUERIES"
 echo "  filter (1%): $EFFECTIVE_FILTER_EXPR_1PCT"
 echo "  filter (10%): $EFFECTIVE_FILTER_EXPR_10PCT"
 echo "  out-dir: $OUT_DIR"
 
-run_selectivity "1" "$MANIFEST_1PCT" "$META_1PCT" "$ACORN_INDEX_1PCT" "$RESULTS_1PCT" "$EFFECTIVE_FILTER_EXPR_1PCT"
-run_selectivity "10" "$MANIFEST_10PCT" "$META_10PCT" "$ACORN_INDEX_10PCT" "$RESULTS_10PCT" "$EFFECTIVE_FILTER_EXPR_10PCT"
+run_selectivity "1" "$MANIFEST_1PCT" "$META_1PCT" "$ACORN_INDEX_1PCT" "$RESULTS_1PCT" "$EFFECTIVE_FILTER_EXPR_1PCT" EF_VALUES_1PCT
+run_selectivity "10" "$MANIFEST_10PCT" "$META_10PCT" "$ACORN_INDEX_10PCT" "$RESULTS_10PCT" "$EFFECTIVE_FILTER_EXPR_10PCT" EF_VALUES_10PCT
 
 cat "$RESULTS_1PCT" > "$RESULTS_MERGED"
 tail -n +2 "$RESULTS_10PCT" >> "$RESULTS_MERGED"

@@ -314,6 +314,48 @@ struct AsyncEqRuntime {
     compass_iaa_filter::detail::IaaBlockStorage tb_storage;
 };
 
+struct CompressionStats {
+    uint64_t fid_raw_bytes = 0;
+    uint64_t fid_compressed_bytes = 0;
+    uint64_t tb_raw_bytes = 0;
+    uint64_t tb_compressed_bytes = 0;
+};
+
+uint64_t safe_size_t_to_u64(size_t value) {
+    return static_cast<uint64_t>(value);
+}
+
+uint64_t total_compressed_block_bytes(const std::vector<std::vector<uint8_t>>& blocks) {
+    uint64_t total = 0;
+    for (const auto& block : blocks) {
+        total += safe_size_t_to_u64(block.size());
+    }
+    return total;
+}
+
+CompressionStats compute_compression_stats(const AsyncEqRuntime& runtime) {
+    CompressionStats out;
+    out.fid_raw_bytes = safe_size_t_to_u64(runtime.fid_storage.raw_size);
+    out.fid_compressed_bytes = total_compressed_block_bytes(runtime.fid_storage.compressed_blocks);
+    out.tb_raw_bytes = safe_size_t_to_u64(runtime.tb_storage.raw_size);
+    out.tb_compressed_bytes = total_compressed_block_bytes(runtime.tb_storage.compressed_blocks);
+    return out;
+}
+
+double compression_ratio_raw_over_compressed(uint64_t raw_bytes, uint64_t compressed_bytes) {
+    if (raw_bytes == 0 || compressed_bytes == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(raw_bytes) / static_cast<double>(compressed_bytes);
+}
+
+double compression_pct_of_raw(uint64_t raw_bytes, uint64_t compressed_bytes) {
+    if (raw_bytes == 0) {
+        return 0.0;
+    }
+    return (static_cast<double>(compressed_bytes) * 100.0) / static_cast<double>(raw_bytes);
+}
+
 struct FidScanBlock {
     std::vector<uint8_t> matches;
     uint32_t input_elements = 0;
@@ -599,6 +641,14 @@ public:
         wait_oldest(pending_slots_.size());
     }
 
+    void wait_one() {
+        wait_oldest(1);
+    }
+
+    bool has_pending() const {
+        return !pending_slots_.empty();
+    }
+
 private:
     struct Slot {
         std::unique_ptr<uint8_t[]> job_storage;
@@ -757,6 +807,7 @@ void submit_fid_scan_job(
 
 bool tb_match_node(
     const AsyncEqRuntime& runtime,
+    AsyncJobRing* ring,
     AsyncEqQueryCache* cache,
     size_t node_id,
     compass_iaa_filter::QueryDecompressionMetrics* metrics) {
@@ -767,8 +818,15 @@ bool tb_match_node(
     const size_t block_id = byte_offset / runtime.tb_storage.block_size;
     const size_t in_block = byte_offset % runtime.tb_storage.block_size;
 
-    if (block_id >= cache->tb_blocks.size() || cache->tb_ready[block_id] == 0) {
+    if (block_id >= cache->tb_blocks.size()) {
         return false;
+    }
+    while (cache->tb_ready[block_id] == 0) {
+        if (ring == nullptr || !ring->has_pending()) {
+            throw std::runtime_error(
+                "TB block is not ready and no pending async jobs exist");
+        }
+        ring->wait_one();
     }
     const std::vector<uint8_t>& block = cache->tb_blocks[block_id];
     if (in_block >= block.size()) {
@@ -783,6 +841,7 @@ bool tb_match_node(
 
 bool fid_match_node(
     const AsyncEqRuntime& runtime,
+    AsyncJobRing* ring,
     AsyncEqQueryCache* cache,
     size_t node_id,
     compass_iaa_filter::QueryDecompressionMetrics* metrics) {
@@ -792,8 +851,15 @@ bool fid_match_node(
 
     const size_t block_id = node_id / runtime.fid_storage.block_size;
     const size_t in_block = node_id % runtime.fid_storage.block_size;
-    if (block_id >= cache->fid_blocks.size() || cache->fid_ready[block_id] == 0) {
+    if (block_id >= cache->fid_blocks.size()) {
         return false;
+    }
+    while (cache->fid_ready[block_id] == 0) {
+        if (ring == nullptr || !ring->has_pending()) {
+            throw std::runtime_error(
+                "FID block is not ready and no pending async jobs exist");
+        }
+        ring->wait_one();
     }
     if (metrics != nullptr) {
         ++metrics->fid_cache_hits;
@@ -1022,7 +1088,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             }
         }
     }
-    ring->flush();
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
@@ -1081,30 +1146,24 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         frontier_candidates.clear();
         fid_blocks_to_submit.clear();
 
+        // Stage 1: TB check neighbors and group survivors.
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
 
-            const bool tb_match = tb_match_node(runtime, cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
+            const bool tb_match = tb_match_node(
+                runtime,
+                ring,
+                cache,
+                static_cast<size_t>(candidate_id),
+                &call_stats->decomp);
 
             if (!tb_match) {
                 ++call_stats->filter_eval_calls;
                 continue;
             }
 
-            const DistT dist = index.fstdistfunc_(
-                query_data,
-                index.getDataByInternalId(candidate_id),
-                index.dist_func_param_);
-
-            const bool prelim_consider = (top_candidates.size() < ef || lower_bound > dist);
-            if (!prelim_consider) {
-                ++call_stats->filter_eval_calls;
-                continue;
-            }
-
             FrontierCandidate entry;
             entry.candidate_id = candidate_id;
-            entry.dist = dist;
             entry.deleted = index.isMarkedDeleted(candidate_id);
             if (runtime.fid_storage.block_size != 0) {
                 entry.fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
@@ -1116,6 +1175,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             frontier_candidates.push_back(entry);
         }
 
+        // Stage 2: submit grouped FID jobs.
         if (!fid_blocks_to_submit.empty()) {
             std::sort(fid_blocks_to_submit.begin(), fid_blocks_to_submit.end());
             fid_blocks_to_submit.erase(
@@ -1124,9 +1184,17 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             for (size_t fid_block_id : fid_blocks_to_submit) {
                 submit_fid_scan_job(ring, runtime, fid_block_id, cache, &call_stats->decomp);
             }
-            ring->flush();
         }
 
+        // Stage 3: run distance calculation for grouped neighbors.
+        for (FrontierCandidate& entry : frontier_candidates) {
+            entry.dist = index.fstdistfunc_(
+                query_data,
+                index.getDataByInternalId(entry.candidate_id),
+                index.dist_func_param_);
+        }
+
+        // Stage 4: update candidates/results.
         for (const FrontierCandidate& entry : frontier_candidates) {
             const bool consider = (top_candidates.size() < ef || lower_bound > entry.dist);
             if (!consider) {
@@ -1138,7 +1206,12 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
 
             bool fid_match = true;
             if (entry.need_fid) {
-                fid_match = fid_match_node(runtime, cache, static_cast<size_t>(entry.candidate_id), &call_stats->decomp);
+                fid_match = fid_match_node(
+                    runtime,
+                    ring,
+                    cache,
+                    static_cast<size_t>(entry.candidate_id),
+                    &call_stats->decomp);
             }
 
             ++call_stats->filter_eval_calls;
@@ -1432,7 +1505,8 @@ std::string build_summary(
     size_t index_dim,
     const MetadataTable& metadata,
     const filter_expr::Expression& expr,
-    const RunStats& stats) {
+    const RunStats& stats,
+    const CompressionStats& compression_stats) {
     const double loop_ms = static_cast<double>(stats.search_loop_time_ns) / 1e6;
     const double avg_query_ms =
         (stats.query_count > 0) ? (loop_ms / static_cast<double>(stats.query_count)) : 0.0;
@@ -1459,6 +1533,18 @@ std::string build_summary(
         (stats.search_loop_time_ns > 0)
             ? (static_cast<double>(stats.query_count) * 1e9 / static_cast<double>(stats.search_loop_time_ns))
             : 0.0;
+    const uint64_t total_raw_bytes = compression_stats.fid_raw_bytes + compression_stats.tb_raw_bytes;
+    const uint64_t total_compressed_bytes =
+        compression_stats.fid_compressed_bytes + compression_stats.tb_compressed_bytes;
+    const double fid_ratio = compression_ratio_raw_over_compressed(
+        compression_stats.fid_raw_bytes,
+        compression_stats.fid_compressed_bytes);
+    const double tb_ratio = compression_ratio_raw_over_compressed(
+        compression_stats.tb_raw_bytes,
+        compression_stats.tb_compressed_bytes);
+    const double total_ratio =
+        compression_ratio_raw_over_compressed(total_raw_bytes, total_compressed_bytes);
+    const double total_compressed_pct = compression_pct_of_raw(total_raw_bytes, total_compressed_bytes);
 
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(3);
@@ -1477,6 +1563,16 @@ std::string build_summary(
         << (args.num_queries > 0 ? std::to_string(args.num_queries) : std::string("all")) << "\n";
     oss << "k: " << args.k << ", ef: " << stats.resolved_ef
         << ", break_factor: " << stats.effective_break_factor << "\n";
+    oss << "fid_raw_bytes: " << compression_stats.fid_raw_bytes << "\n";
+    oss << "fid_compressed_bytes: " << compression_stats.fid_compressed_bytes << "\n";
+    oss << "tb_raw_bytes: " << compression_stats.tb_raw_bytes << "\n";
+    oss << "tb_compressed_bytes: " << compression_stats.tb_compressed_bytes << "\n";
+    oss << "fid_compression_ratio_raw_over_compressed: " << fid_ratio << "\n";
+    oss << "tb_compression_ratio_raw_over_compressed: " << tb_ratio << "\n";
+    oss << "filter_payload_raw_bytes: " << total_raw_bytes << "\n";
+    oss << "filter_payload_compressed_bytes: " << total_compressed_bytes << "\n";
+    oss << "filter_payload_compression_ratio_raw_over_compressed: " << total_ratio << "\n";
+    oss << "filter_payload_compressed_pct_of_raw: " << total_compressed_pct << "\n";
     oss << "filter: " << expr.source() << "\n";
     oss << "execution_mode: " << stats.execution_mode << "\n";
 
@@ -1590,6 +1686,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error(
                 "Failed to initialize IAA hardware exact-match runtime; software fallback is disabled");
         }
+        const CompressionStats compression_stats = compute_compression_stats(async_runtime);
 
         const bool query_is_fvecs = filter_search_io::ends_with(args.query_path, ".fvecs");
         const size_t query_elem_bytes = query_is_fvecs ? sizeof(float) : sizeof(uint8_t);
@@ -1644,7 +1741,8 @@ int main(int argc, char** argv) {
             index_dim,
             metadata,
             expr,
-            stats);
+            stats,
+            compression_stats);
         std::cout << summary;
         write_summary_if_needed(summary, args.summary_out);
         return 0;

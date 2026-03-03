@@ -4,6 +4,7 @@
 #include "../../cpp_examples/filter_search_examples/filter_expr.h"
 
 #include <lz4.h>
+#include <lz4hc.h>
 
 #include <algorithm>
 #include <array>
@@ -30,6 +31,7 @@ using json = nlohmann::json;
 constexpr size_t kBlockSizeBytes = 8192;
 constexpr size_t kMaxBuckets = 256;
 constexpr size_t kTbBytesPerNode = 32;
+constexpr int kLz4CompressionLevel = 12;
 
 struct QueryDecompressionMetrics {
     uint64_t lz4_decompress_time_ns = 0;
@@ -212,11 +214,12 @@ inline Lz4BlockStorage compress_to_lz4_blocks(
         }
 
         out.compressed_blocks[bid].assign(static_cast<size_t>(bound), 0);
-        const int csize = LZ4_compress_default(
+        const int csize = LZ4_compress_HC(
             reinterpret_cast<const char*>(raw.data() + start),
             out.compressed_blocks[bid].data(),
             raw_len_i,
-            bound);
+            bound,
+            kLz4CompressionLevel);
         if (csize <= 0) {
             throw std::runtime_error("LZ4 compression failed at block " + std::to_string(bid));
         }
@@ -256,21 +259,17 @@ inline const std::vector<uint8_t>& get_or_decompress_block(
     const size_t raw_len = static_cast<size_t>(storage.raw_block_sizes[block_id]);
     std::vector<uint8_t> out(raw_len, 0);
 
-    const auto t0 = std::chrono::steady_clock::now();
     const int ret = LZ4_decompress_safe(
         storage.compressed_blocks[block_id].data(),
         reinterpret_cast<char*>(out.data()),
         static_cast<int>(storage.compressed_blocks[block_id].size()),
         static_cast<int>(raw_len));
-    const auto t1 = std::chrono::steady_clock::now();
 
     if (ret != static_cast<int>(raw_len)) {
         throw std::runtime_error("LZ4 decompression failed at block " + std::to_string(block_id));
     }
 
     if (metrics != nullptr) {
-        metrics->lz4_decompress_time_ns += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
         if (is_fid) {
             ++metrics->fid_blocks_decompressed;
             metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);

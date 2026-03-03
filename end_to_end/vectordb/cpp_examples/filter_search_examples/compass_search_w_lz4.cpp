@@ -32,8 +32,8 @@ using filter_search_io::MetadataTable;
 using filter_search_io::VecFileInfo;
 
 namespace {
-constexpr size_t kLz4FidBlockSizeBytes = 8192 * 8;
-constexpr size_t kLz4TbBlockSizeBytes = 8192 * 128;
+constexpr size_t kDefaultLz4FidBlockSizeBytes = 8192 * 8;
+constexpr size_t kDefaultLz4TbBlockSizeBytes = 8192 * 128;
 
 struct Args {
     std::string dataset_type;
@@ -48,6 +48,8 @@ struct Args {
     bool ef_explicit = false;
     bool break_factor_explicit = false;
     int num_queries = -1;
+    size_t fid_block_size_bytes = kDefaultLz4FidBlockSizeBytes;
+    size_t tb_block_size_bytes = kDefaultLz4TbBlockSizeBytes;
 
     // Backward-compatible optional flags. Not used in the LZ4 FID/TB path.
     std::string payload_jsonl;
@@ -139,6 +141,8 @@ void usage(const char* argv0) {
         << " [--id-column id]"
         << " [--num-queries <int>]"
         << " [--max-queries <int>]"  // Backward-compatible alias.
+        << " [--fid-block-size-bytes <int>]"
+        << " [--tb-block-size-bytes <int>]"
         << " [--topk-out <path>]"
         << " [--per-query-out <path>]"
         << " [--summary-out <path>]\n";
@@ -192,6 +196,10 @@ Args parse_args(int argc, char** argv) {
             args.id_column = require_value(cur);
         } else if (cur == "--num-queries" || cur == "--max-queries") {
             args.num_queries = std::stoi(require_value(cur));
+        } else if (cur == "--fid-block-size-bytes") {
+            args.fid_block_size_bytes = static_cast<size_t>(std::stoull(require_value(cur)));
+        } else if (cur == "--tb-block-size-bytes") {
+            args.tb_block_size_bytes = static_cast<size_t>(std::stoull(require_value(cur)));
         } else if (cur == "--topk-out") {
             args.topk_out = require_value(cur);
         } else if (cur == "--per-query-out") {
@@ -222,6 +230,9 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.num_queries == 0) {
         throw std::runtime_error("--num-queries/--max-queries must be > 0 when provided");
+    }
+    if (args.fid_block_size_bytes == 0 || args.tb_block_size_bytes == 0) {
+        throw std::runtime_error("--fid-block-size-bytes and --tb-block-size-bytes must be > 0");
     }
 
     const bool query_fvec = filter_search_io::ends_with(args.query_path, ".fvecs");
@@ -288,6 +299,49 @@ struct SequentialEqRuntime {
     compass_lz4_filter::detail::Lz4BlockStorage fid_storage;
     compass_lz4_filter::detail::Lz4BlockStorage tb_storage;
 };
+
+struct CompressionStats {
+    uint64_t fid_raw_bytes = 0;
+    uint64_t fid_compressed_bytes = 0;
+    uint64_t tb_raw_bytes = 0;
+    uint64_t tb_compressed_bytes = 0;
+};
+
+uint64_t safe_size_t_to_u64(size_t value) {
+    return static_cast<uint64_t>(value);
+}
+
+template <typename ElemT>
+uint64_t total_compressed_block_bytes(const std::vector<std::vector<ElemT>>& blocks) {
+    uint64_t total = 0;
+    for (const auto& block : blocks) {
+        total += safe_size_t_to_u64(block.size());
+    }
+    return total;
+}
+
+CompressionStats compute_compression_stats(const SequentialEqRuntime& runtime) {
+    CompressionStats out;
+    out.fid_raw_bytes = safe_size_t_to_u64(runtime.fid_storage.raw_size);
+    out.fid_compressed_bytes = total_compressed_block_bytes(runtime.fid_storage.compressed_blocks);
+    out.tb_raw_bytes = safe_size_t_to_u64(runtime.tb_storage.raw_size);
+    out.tb_compressed_bytes = total_compressed_block_bytes(runtime.tb_storage.compressed_blocks);
+    return out;
+}
+
+double compression_ratio_raw_over_compressed(uint64_t raw_bytes, uint64_t compressed_bytes) {
+    if (raw_bytes == 0 || compressed_bytes == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(raw_bytes) / static_cast<double>(compressed_bytes);
+}
+
+double compression_pct_of_raw(uint64_t raw_bytes, uint64_t compressed_bytes) {
+    if (raw_bytes == 0) {
+        return 0.0;
+    }
+    return (static_cast<double>(compressed_bytes) * 100.0) / static_cast<double>(raw_bytes);
+}
 
 struct SequentialEqQueryCache {
     std::vector<std::vector<uint8_t>> tb_blocks;
@@ -666,10 +720,12 @@ SequentialEqRuntime build_sequential_eq_runtime(
         }
     }
 
-    runtime.fid_storage =
-        compass_lz4_filter::detail::compress_to_lz4_blocks(fid_raw, kLz4FidBlockSizeBytes);
-    runtime.tb_storage =
-        compass_lz4_filter::detail::compress_to_lz4_blocks(tb_bucket_bits, kLz4TbBlockSizeBytes);
+    runtime.fid_storage = compass_lz4_filter::detail::compress_to_lz4_blocks(
+        fid_raw,
+        args.fid_block_size_bytes);
+    runtime.tb_storage = compass_lz4_filter::detail::compress_to_lz4_blocks(
+        tb_bucket_bits,
+        args.tb_block_size_bytes);
     runtime.enabled = true;
     runtime.empty_result = false;
     runtime.field = field;
@@ -719,21 +775,17 @@ void decompress_lz4_block_into(
         return;
     }
 
-    const auto t0 = std::chrono::steady_clock::now();
     const int ret = LZ4_decompress_safe(
         storage.compressed_blocks[block_id].data(),
         reinterpret_cast<char*>(output->data()),
         static_cast<int>(storage.compressed_blocks[block_id].size()),
         static_cast<int>(raw_len));
-    const auto t1 = std::chrono::steady_clock::now();
 
     if (ret != static_cast<int>(raw_len)) {
         throw std::runtime_error("LZ4 decompression failed at block " + std::to_string(block_id));
     }
 
     if (metrics != nullptr) {
-        metrics->lz4_decompress_time_ns += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
         if (is_fid) {
             ++metrics->fid_blocks_decompressed;
             metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
@@ -907,17 +959,13 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     DistT lower_bound = std::numeric_limits<DistT>::max();
 
     auto timed_eval = [&](bool traversal_mode, size_t node_id) -> bool {
-        const auto t0 = std::chrono::steady_clock::now();
         bool allowed = false;
         if (traversal_mode) {
             allowed = engine.allow_traversal(node_id, cache, &call_stats->decomp);
         } else {
             allowed = engine.allow_result(node_id, cache, &call_stats->decomp);
         }
-        const auto t1 = std::chrono::steady_clock::now();
         ++call_stats->filter_eval_calls;
-        call_stats->filter_eval_time_ns += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
         return allowed;
     };
 
@@ -1052,6 +1100,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         }
     }
 
+    // Decompress TB blocks after upper-layer traversal, before level-0 expansion.
+    prefetch_tb_blocks(runtime, cache, &call_stats->decomp);
+
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
     const hnswlib::vl_type tag = vl->curV;
@@ -1096,13 +1147,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
 
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
-            const auto t0 = std::chrono::steady_clock::now();
             const bool tb_match = tb_match_node(runtime, cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
-            const auto t1 = std::chrono::steady_clock::now();
             if (!tb_match) {
                 ++call_stats->filter_eval_calls;
-                call_stats->filter_eval_time_ns += static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
                 continue;
             }
 
@@ -1117,8 +1164,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             }
             const bool fid_match = fid_match_node(runtime, cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
             ++call_stats->filter_eval_calls;
-            call_stats->filter_eval_time_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
 
             if (top_candidates.size() < ef || lower_bound > dist) {
                 candidate_set.emplace(-dist, candidate_id);
@@ -1270,7 +1315,6 @@ RunStats run_search_typed(
         if (use_sequential_eq) {
             query_cache = make_preallocated_query_cache(*sequential_runtime);
             query_workspace.neighbor_ids.reserve(index.maxM0_);
-            prefetch_tb_blocks(*sequential_runtime, &query_cache, &call_stats.decomp);
         }
 
         const auto search_start = std::chrono::steady_clock::now();
@@ -1420,7 +1464,8 @@ std::string build_summary(
     size_t index_dim,
     const MetadataTable& metadata,
     const filter_expr::Expression& expr,
-    const RunStats& stats) {
+    const RunStats& stats,
+    const CompressionStats& compression_stats) {
     const double loop_ms = static_cast<double>(stats.search_loop_time_ns) / 1e6;
     const double avg_query_ms =
         (stats.query_count > 0) ? (loop_ms / static_cast<double>(stats.query_count)) : 0.0;
@@ -1447,6 +1492,18 @@ std::string build_summary(
         (stats.search_loop_time_ns > 0)
             ? (static_cast<double>(stats.query_count) * 1e9 / static_cast<double>(stats.search_loop_time_ns))
             : 0.0;
+    const uint64_t total_raw_bytes = compression_stats.fid_raw_bytes + compression_stats.tb_raw_bytes;
+    const uint64_t total_compressed_bytes =
+        compression_stats.fid_compressed_bytes + compression_stats.tb_compressed_bytes;
+    const double fid_ratio = compression_ratio_raw_over_compressed(
+        compression_stats.fid_raw_bytes,
+        compression_stats.fid_compressed_bytes);
+    const double tb_ratio = compression_ratio_raw_over_compressed(
+        compression_stats.tb_raw_bytes,
+        compression_stats.tb_compressed_bytes);
+    const double total_ratio =
+        compression_ratio_raw_over_compressed(total_raw_bytes, total_compressed_bytes);
+    const double total_compressed_pct = compression_pct_of_raw(total_raw_bytes, total_compressed_bytes);
 
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(3);
@@ -1463,6 +1520,18 @@ std::string build_summary(
         << (args.num_queries > 0 ? std::to_string(args.num_queries) : std::string("all")) << "\n";
     oss << "k: " << args.k << ", ef: " << stats.resolved_ef
         << ", break_factor: " << stats.effective_break_factor << "\n";
+    oss << "fid_block_size_bytes: " << args.fid_block_size_bytes << "\n";
+    oss << "tb_block_size_bytes: " << args.tb_block_size_bytes << "\n";
+    oss << "fid_raw_bytes: " << compression_stats.fid_raw_bytes << "\n";
+    oss << "fid_compressed_bytes: " << compression_stats.fid_compressed_bytes << "\n";
+    oss << "tb_raw_bytes: " << compression_stats.tb_raw_bytes << "\n";
+    oss << "tb_compressed_bytes: " << compression_stats.tb_compressed_bytes << "\n";
+    oss << "fid_compression_ratio_raw_over_compressed: " << fid_ratio << "\n";
+    oss << "tb_compression_ratio_raw_over_compressed: " << tb_ratio << "\n";
+    oss << "filter_payload_raw_bytes: " << total_raw_bytes << "\n";
+    oss << "filter_payload_compressed_bytes: " << total_compressed_bytes << "\n";
+    oss << "filter_payload_compression_ratio_raw_over_compressed: " << total_ratio << "\n";
+    oss << "filter_payload_compressed_pct_of_raw: " << total_compressed_pct << "\n";
     oss << "filter: " << expr.source() << "\n";
 
     // Keep legacy metadata_* keys for script compatibility.
@@ -1555,9 +1624,10 @@ int main(int argc, char** argv) {
                 args.fidtb_manifest,
                 args.filter_expression,
                 fields,
-                kLz4FidBlockSizeBytes,
-                kLz4TbBlockSizeBytes);
+                args.fid_block_size_bytes,
+                args.tb_block_size_bytes);
         const SequentialEqRuntime sequential_runtime = build_sequential_eq_runtime(args, engine);
+        const CompressionStats compression_stats = compute_compression_stats(sequential_runtime);
 
         const bool query_is_fvecs = filter_search_io::ends_with(args.query_path, ".fvecs");
         const size_t query_elem_bytes = query_is_fvecs ? sizeof(float) : sizeof(uint8_t);
@@ -1612,7 +1682,8 @@ int main(int argc, char** argv) {
             index_dim,
             metadata,
             expr,
-            stats);
+            stats,
+            compression_stats);
         std::cout << summary;
         write_summary_if_needed(summary, args.summary_out);
         return 0;
