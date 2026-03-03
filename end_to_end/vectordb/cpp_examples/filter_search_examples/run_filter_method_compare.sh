@@ -114,8 +114,21 @@ MANIFEST_10PCT=""
 ACORN_INDEX_1PCT=""
 ACORN_INDEX_10PCT=""
 PAYLOAD_JSONL=""
-FID_BLOCK_SIZE_BYTES="$((1024*64))"
-TB_BLOCK_SIZE_BYTES="$((1024*256))"
+FID_BLOCK_SIZE_BYTES="$((1024*16))"
+TB_BLOCK_SIZE_BYTES="$((1024*64))"
+
+# Build flags used by this script when --build is enabled.
+# Default: disable AVX/AVX512.
+BUILD_CXXFLAGS="-Ofast -std=c++17 -fopenmp -ftree-vectorize -DNDEBUG -Wall -Wextra -pthread -march=x86-64 -mno-avx -mno-avx2 -mno-avx512f"
+BUILD_CXXFLAGS_LZ4="-O3 -std=c++17 -Wall -Wextra -pthread -march=x86-64 -mno-avx -mno-avx2 -mno-avx512f"
+
+# Optional AVX build flags (commented out by default).
+# BUILD_CXXFLAGS="-Ofast -std=c++17 -fopenmp -ftree-vectorize -DNDEBUG -Wall -Wextra -pthread -march=native -mavx2 -mfma"
+# BUILD_CXXFLAGS_LZ4="-O3 -std=c++17 -Wall -Wextra -pthread -march=native -mavx2 -mfma"
+
+# Optional AVX512 build flags (commented out by default).
+# BUILD_CXXFLAGS="-Ofast -std=c++17 -fopenmp -ftree-vectorize -DNDEBUG -Wall -Wextra -pthread -march=native -mavx512f -mavx512bw -mavx512dq -mavx512vl"
+# BUILD_CXXFLAGS_LZ4="-O3 -std=c++17 -Wall -Wextra -pthread -march=native -mavx512f -mavx512bw -mavx512dq -mavx512vl"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -332,7 +345,7 @@ set_dataset_defaults
 mkdir -p "$OUT_DIR"
 
 if [[ "$DO_BUILD" -eq 1 ]]; then
-  make -C "$SCRIPT_DIR"
+  make -C "$SCRIPT_DIR" CXXFLAGS="$BUILD_CXXFLAGS" CXXFLAGS_LZ4="$BUILD_CXXFLAGS_LZ4"
 fi
 
 ensure_executable_file "$HNSW_RUN" "hnswlib_filter_search.run is missing or not executable"

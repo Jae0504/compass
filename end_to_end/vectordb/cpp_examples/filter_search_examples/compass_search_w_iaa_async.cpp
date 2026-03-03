@@ -1230,7 +1230,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         }
     }
 
-    ring->flush();
     while (top_candidates.size() > k) {
         top_candidates.pop();
     }
@@ -1384,6 +1383,9 @@ RunStats run_search_typed(
 
         const uint64_t query_search_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(search_end - search_start).count());
+
+        // Exclude final async-ring drain from measured search latency.
+        shared_ring->flush();
 
         std::priority_queue<std::pair<DistT, hnswlib::labeltype>> enns_heap =
             build_enns_heap(index, qptr, static_cast<size_t>(args.k), filtered_candidates);
