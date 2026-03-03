@@ -33,7 +33,7 @@ using filter_search_io::VecFileInfo;
 
 namespace {
 constexpr size_t kLz4FidBlockSizeBytes = 8192 * 8;
-constexpr size_t kLz4TbBlockSizeBytes = 8192 * 256;
+constexpr size_t kLz4TbBlockSizeBytes = 8192 * 128;
 
 struct Args {
     std::string dataset_type;
