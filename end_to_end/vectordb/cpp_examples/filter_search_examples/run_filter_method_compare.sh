@@ -28,6 +28,8 @@ Core defaults:
 
 Advanced overrides:
   --filter-expr <expr>
+  --filter-expr-1pct <expr>
+  --filter-expr-10pct <expr>
   --graph <path>
   --query <path>
   --manifest-1pct <path>
@@ -90,6 +92,9 @@ POSTFILTER_MAX_CANDIDATES=50
 DO_BUILD=1
 DO_PLOT=1
 FILTER_EXPR='synthetic_id_bucket == 255'
+FILTER_EXPR_SET_BY_USER=0
+FILTER_EXPR_1PCT=""
+FILTER_EXPR_10PCT=""
 
 GRAPH_PATH=""
 QUERY_PATH=""
@@ -143,6 +148,15 @@ while [[ $# -gt 0 ]]; do
       ;;
     --filter-expr)
       FILTER_EXPR="$2"
+      FILTER_EXPR_SET_BY_USER=1
+      shift 2
+      ;;
+    --filter-expr-1pct)
+      FILTER_EXPR_1PCT="$2"
+      shift 2
+      ;;
+    --filter-expr-10pct)
+      FILTER_EXPR_10PCT="$2"
       shift 2
       ;;
     --graph)
@@ -379,6 +393,24 @@ if min_gid < 0 or max_gid > expected_max:
 PY
 }
 
+derive_tail_bucket_filter_expr() {
+  local manifest_path="$1"
+  python3 - "$manifest_path" <<'PY'
+import json
+import sys
+
+manifest_path = sys.argv[1]
+with open(manifest_path, "r", encoding="utf-8") as f:
+    manifest = json.load(f)
+
+nfilters = int(manifest["nfilters"])
+if nfilters <= 0:
+    raise RuntimeError(f"invalid nfilters={nfilters}")
+
+print(f"synthetic_id_bucket == {nfilters - 1}")
+PY
+}
+
 RESULTS_1PCT="$OUT_DIR/results_1pct.csv"
 RESULTS_10PCT="$OUT_DIR/results_10pct.csv"
 RESULTS_MERGED="$OUT_DIR/results_merged.csv"
@@ -400,6 +432,21 @@ if [[ "$HNSW_DATASET_TYPE" == "sift" ]]; then
   validate_sift_metadata_csv "$MANIFEST_10PCT" "$META_10PCT"
 fi
 
+EFFECTIVE_FILTER_EXPR_1PCT="$FILTER_EXPR"
+EFFECTIVE_FILTER_EXPR_10PCT="$FILTER_EXPR"
+
+if [[ -n "$FILTER_EXPR_1PCT" ]]; then
+  EFFECTIVE_FILTER_EXPR_1PCT="$FILTER_EXPR_1PCT"
+elif [[ "$DATASET" == "sift1m" && "$FILTER_EXPR_SET_BY_USER" -eq 0 ]]; then
+  EFFECTIVE_FILTER_EXPR_1PCT="$(derive_tail_bucket_filter_expr "$MANIFEST_1PCT")"
+fi
+
+if [[ -n "$FILTER_EXPR_10PCT" ]]; then
+  EFFECTIVE_FILTER_EXPR_10PCT="$FILTER_EXPR_10PCT"
+elif [[ "$DATASET" == "sift1m" && "$FILTER_EXPR_SET_BY_USER" -eq 0 ]]; then
+  EFFECTIVE_FILTER_EXPR_10PCT="$(derive_tail_bucket_filter_expr "$MANIFEST_10PCT")"
+fi
+
 run_single() {
   local method="$1"
   local selectivity_pct="$2"
@@ -408,6 +455,7 @@ run_single() {
   local metadata_csv="$5"
   local acorn_index_path="$6"
   local out_csv="$7"
+  local filter_expr="$8"
 
   local summary_dir="$OUT_DIR/summaries/${selectivity_pct}pct/${method}"
   mkdir -p "$summary_dir"
@@ -425,7 +473,7 @@ run_single() {
         --query "$QUERY_PATH"
         --k "$K"
         --ef "$ef"
-        --filter "$FILTER_EXPR"
+        --filter "$filter_expr"
         --search-mode post_filter_iterative
         --postfilter-max-candidates "$POSTFILTER_MAX_CANDIDATES"
         --num-queries "$NUM_QUERIES"
@@ -445,7 +493,7 @@ run_single() {
         --query "$QUERY_PATH"
         --k "$K"
         --ef "$ef"
-        --filter "$FILTER_EXPR"
+        --filter "$filter_expr"
         --search-mode in_search_filter
         --postfilter-max-candidates "$POSTFILTER_MAX_CANDIDATES"
         --num-queries "$NUM_QUERIES"
@@ -465,7 +513,7 @@ run_single() {
         --query "$QUERY_PATH"
         --k "$K"
         --ef "$ef"
-        --filter "$FILTER_EXPR"
+        --filter "$filter_expr"
         --fidtb-manifest "$manifest_path"
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
@@ -479,7 +527,7 @@ run_single() {
         --query "$QUERY_PATH"
         --k "$K"
         --ef "$ef"
-        --filter "$FILTER_EXPR"
+        --filter "$filter_expr"
         --fidtb-manifest "$manifest_path"
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
@@ -493,7 +541,7 @@ run_single() {
         --query "$QUERY_PATH"
         --k "$K"
         --ef "$ef"
-        --filter "$FILTER_EXPR"
+        --filter "$filter_expr"
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
       )
@@ -559,18 +607,19 @@ run_selectivity() {
   local metadata_csv="$3"
   local acorn_index_path="$4"
   local out_csv="$5"
+  local filter_expr="$6"
 
   local methods=(
     # "post_filter_hnsw"
     # "in_search_filter_hnsw"
-    # "acorn"
+    "acorn"
     "compass_lz4"
     "compass_iaa"
   )
 
   for ef in "${EF_VALUES[@]}"; do
     for method in "${methods[@]}"; do
-      run_single "$method" "$selectivity_pct" "$ef" "$manifest_path" "$metadata_csv" "$acorn_index_path" "$out_csv"
+      run_single "$method" "$selectivity_pct" "$ef" "$manifest_path" "$metadata_csv" "$acorn_index_path" "$out_csv" "$filter_expr"
     done
   done
 }
@@ -588,11 +637,12 @@ echo "    10% -> $ACORN_INDEX_10PCT"
 echo "  k: $K"
 echo "  ef list: ${EF_VALUES[*]}"
 echo "  num-queries: $NUM_QUERIES"
-echo "  filter: $FILTER_EXPR"
+echo "  filter (1%): $EFFECTIVE_FILTER_EXPR_1PCT"
+echo "  filter (10%): $EFFECTIVE_FILTER_EXPR_10PCT"
 echo "  out-dir: $OUT_DIR"
 
-run_selectivity "1" "$MANIFEST_1PCT" "$META_1PCT" "$ACORN_INDEX_1PCT" "$RESULTS_1PCT"
-run_selectivity "10" "$MANIFEST_10PCT" "$META_10PCT" "$ACORN_INDEX_10PCT" "$RESULTS_10PCT"
+run_selectivity "1" "$MANIFEST_1PCT" "$META_1PCT" "$ACORN_INDEX_1PCT" "$RESULTS_1PCT" "$EFFECTIVE_FILTER_EXPR_1PCT"
+run_selectivity "10" "$MANIFEST_10PCT" "$META_10PCT" "$ACORN_INDEX_10PCT" "$RESULTS_10PCT" "$EFFECTIVE_FILTER_EXPR_10PCT"
 
 cat "$RESULTS_1PCT" > "$RESULTS_MERGED"
 tail -n +2 "$RESULTS_10PCT" >> "$RESULTS_MERGED"
