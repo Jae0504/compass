@@ -290,8 +290,14 @@ struct SequentialEqRuntime {
 };
 
 struct SequentialEqQueryCache {
-    std::unordered_map<size_t, std::vector<uint8_t>> tb_blocks;
-    std::unordered_map<size_t, std::vector<uint8_t>> fid_blocks;
+    std::vector<std::vector<uint8_t>> tb_blocks;
+    std::vector<uint8_t> tb_ready;
+    std::vector<std::vector<uint8_t>> fid_blocks;
+    std::vector<uint8_t> fid_ready;
+};
+
+struct SequentialEqSearchWorkspace {
+    std::vector<hnswlib::tableint> neighbor_ids;
 };
 
 std::unique_ptr<filter_expr::Node> parse_filter_ast(const std::string& expression) {
@@ -672,6 +678,72 @@ SequentialEqRuntime build_sequential_eq_runtime(
     return runtime;
 }
 
+SequentialEqQueryCache make_preallocated_query_cache(const SequentialEqRuntime& runtime) {
+    SequentialEqQueryCache cache;
+
+    const size_t tb_blocks = runtime.tb_storage.block_count();
+    cache.tb_blocks.resize(tb_blocks);
+    cache.tb_ready.assign(tb_blocks, 0);
+    for (size_t block_id = 0; block_id < tb_blocks; ++block_id) {
+        cache.tb_blocks[block_id].assign(runtime.tb_storage.raw_block_sizes[block_id], 0);
+    }
+
+    const size_t fid_blocks = runtime.fid_storage.block_count();
+    cache.fid_blocks.resize(fid_blocks);
+    cache.fid_ready.assign(fid_blocks, 0);
+    for (size_t block_id = 0; block_id < fid_blocks; ++block_id) {
+        cache.fid_blocks[block_id].assign(runtime.fid_storage.raw_block_sizes[block_id], 0);
+    }
+
+    return cache;
+}
+
+void decompress_lz4_block_into(
+    const compass_lz4_filter::detail::Lz4BlockStorage& storage,
+    size_t block_id,
+    bool is_fid,
+    std::vector<uint8_t>* output,
+    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
+    if (output == nullptr) {
+        throw std::runtime_error("LZ4 decompress destination buffer is null");
+    }
+    if (block_id >= storage.block_count()) {
+        throw std::runtime_error("Block id out of range during decompression");
+    }
+
+    const size_t raw_len = static_cast<size_t>(storage.raw_block_sizes[block_id]);
+    if (output->size() < raw_len) {
+        throw std::runtime_error("Preallocated LZ4 output buffer is too small");
+    }
+    if (raw_len == 0) {
+        return;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const int ret = LZ4_decompress_safe(
+        storage.compressed_blocks[block_id].data(),
+        reinterpret_cast<char*>(output->data()),
+        static_cast<int>(storage.compressed_blocks[block_id].size()),
+        static_cast<int>(raw_len));
+    const auto t1 = std::chrono::steady_clock::now();
+
+    if (ret != static_cast<int>(raw_len)) {
+        throw std::runtime_error("LZ4 decompression failed at block " + std::to_string(block_id));
+    }
+
+    if (metrics != nullptr) {
+        metrics->lz4_decompress_time_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+        if (is_fid) {
+            ++metrics->fid_blocks_decompressed;
+            metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
+        } else {
+            ++metrics->tb_blocks_decompressed;
+            metrics->tb_bytes_decompressed += static_cast<uint64_t>(raw_len);
+        }
+    }
+}
+
 void prefetch_tb_blocks(
     const SequentialEqRuntime& runtime,
     SequentialEqQueryCache* cache,
@@ -680,12 +752,19 @@ void prefetch_tb_blocks(
         throw std::runtime_error("TB prefetch received null cache");
     }
     for (size_t block_id = 0; block_id < runtime.tb_storage.block_count(); ++block_id) {
-        (void)compass_lz4_filter::detail::get_or_decompress_block(
+        if (block_id >= cache->tb_ready.size() || block_id >= cache->tb_blocks.size()) {
+            throw std::runtime_error("TB query cache is not preallocated for all blocks");
+        }
+        if (cache->tb_ready[block_id] != 0) {
+            continue;
+        }
+        decompress_lz4_block_into(
             runtime.tb_storage,
             block_id,
             false,
-            &cache->tb_blocks,
+            &cache->tb_blocks[block_id],
             metrics);
+        cache->tb_ready[block_id] = 1;
     }
 }
 
@@ -700,12 +779,19 @@ void prefetch_fid_block(
     if (block_id >= runtime.fid_storage.block_count()) {
         return;
     }
-    (void)compass_lz4_filter::detail::get_or_decompress_block(
+    if (block_id >= cache->fid_ready.size() || block_id >= cache->fid_blocks.size()) {
+        throw std::runtime_error("FID query cache is not preallocated for all blocks");
+    }
+    if (cache->fid_ready[block_id] != 0) {
+        return;
+    }
+    decompress_lz4_block_into(
         runtime.fid_storage,
         block_id,
         true,
-        &cache->fid_blocks,
+        &cache->fid_blocks[block_id],
         metrics);
+    cache->fid_ready[block_id] = 1;
 }
 
 bool tb_match_node(
@@ -720,15 +806,17 @@ bool tb_match_node(
     const size_t byte_offset = node_id / 8;
     const size_t block_id = byte_offset / runtime.tb_storage.block_size;
     const size_t in_block = byte_offset % runtime.tb_storage.block_size;
-    auto it = cache->tb_blocks.find(block_id);
-    if (it == cache->tb_blocks.end() || in_block >= it->second.size()) {
+    if (block_id >= cache->tb_blocks.size() || block_id >= cache->tb_ready.size() || cache->tb_ready[block_id] == 0) {
+        return false;
+    }
+    if (in_block >= cache->tb_blocks[block_id].size()) {
         return false;
     }
 
     if (metrics != nullptr) {
         ++metrics->tb_cache_hits;
     }
-    const uint8_t byte = it->second[in_block];
+    const uint8_t byte = cache->tb_blocks[block_id][in_block];
     return ((byte >> (node_id % 8)) & 1u) != 0;
 }
 
@@ -743,15 +831,17 @@ bool fid_match_node(
 
     const size_t block_id = node_id / runtime.fid_storage.block_size;
     const size_t in_block = node_id % runtime.fid_storage.block_size;
-    auto it = cache->fid_blocks.find(block_id);
-    if (it == cache->fid_blocks.end() || in_block >= it->second.size()) {
+    if (block_id >= cache->fid_blocks.size() || block_id >= cache->fid_ready.size() || cache->fid_ready[block_id] == 0) {
+        return false;
+    }
+    if (in_block >= cache->fid_blocks[block_id].size()) {
         return false;
     }
 
     if (metrics != nullptr) {
         ++metrics->fid_cache_hits;
     }
-    const uint8_t bucket = it->second[in_block];
+    const uint8_t bucket = cache->fid_blocks[block_id][in_block];
     return runtime.allowed_buckets.test(static_cast<size_t>(bucket));
 }
 
@@ -765,6 +855,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     compass_lz4_filter::QueryBlockCache* cache,
     SearchCallStats* call_stats) {
     std::vector<std::pair<DistT, hnswlib::labeltype>> result;
+    result.reserve(k);
     if (index.cur_element_count == 0) {
         return result;
     }
@@ -884,13 +975,12 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
         top_candidates.pop();
     }
 
-    size_t sz = top_candidates.size();
-    result.resize(sz);
     while (!top_candidates.empty()) {
         const Pair<DistT> item = top_candidates.top();
         top_candidates.pop();
-        result[--sz] = std::make_pair(item.first, index.getExternalLabel(item.second));
+        result.emplace_back(item.first, index.getExternalLabel(item.second));
     }
+    std::reverse(result.begin(), result.end());
 
     index.visited_list_pool_->releaseVisitedList(vl);
     return result;
@@ -903,8 +993,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
     size_t k,
     size_t ef,
     const SequentialEqRuntime& runtime,
+    SequentialEqQueryCache* cache,
+    SequentialEqSearchWorkspace* workspace,
     SearchCallStats* call_stats) {
     std::vector<std::pair<DistT, hnswlib::labeltype>> result;
+    result.reserve(k);
     if (index.cur_element_count == 0 || runtime.empty_result) {
         return result;
     }
@@ -916,6 +1009,16 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
     SearchCallStats local_stats;
     if (call_stats == nullptr) {
         call_stats = &local_stats;
+    }
+    if (cache == nullptr || workspace == nullptr) {
+        throw std::runtime_error("SequentialEq search received null cache/workspace");
+    }
+    if (cache->tb_blocks.size() != runtime.tb_storage.block_count() ||
+        cache->tb_ready.size() != runtime.tb_storage.block_count() ||
+        cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
+        cache->fid_ready.size() != runtime.fid_storage.block_count()) {
+        throw std::runtime_error(
+            "SequentialEq query cache must be fully preallocated before search");
     }
 
     hnswlib::tableint curr_obj = index.enterpoint_node_;
@@ -949,10 +1052,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         }
     }
 
-    SequentialEqQueryCache cache;
-    cache.tb_blocks.reserve(runtime.tb_storage.block_count());
-    prefetch_tb_blocks(runtime, &cache, &call_stats->decomp);
-
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
     const hnswlib::vl_type tag = vl->curV;
@@ -980,8 +1079,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         int* data = reinterpret_cast<int*>(index.get_linklist0(current_node_id));
         const size_t size = index.getListCount(reinterpret_cast<hnswlib::linklistsizeint*>(data));
 
-        std::vector<hnswlib::tableint> neighbor_ids;
-        neighbor_ids.reserve(size);
+        std::vector<hnswlib::tableint>& neighbor_ids = workspace->neighbor_ids;
+        neighbor_ids.clear();
 
         for (size_t j = 1; j <= size; ++j) {
             const hnswlib::tableint candidate_id = static_cast<hnswlib::tableint>(*(data + j));
@@ -998,7 +1097,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
             const auto t0 = std::chrono::steady_clock::now();
-            const bool tb_match = tb_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
+            const bool tb_match = tb_match_node(runtime, cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
             const auto t1 = std::chrono::steady_clock::now();
             if (!tb_match) {
                 ++call_stats->filter_eval_calls;
@@ -1014,9 +1113,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
 
             if (runtime.fid_storage.block_size != 0) {
                 const size_t fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
-                prefetch_fid_block(runtime, fid_block_id, &cache, &call_stats->decomp);
+                prefetch_fid_block(runtime, fid_block_id, cache, &call_stats->decomp);
             }
-            const bool fid_match = fid_match_node(runtime, &cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
+            const bool fid_match = fid_match_node(runtime, cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
             ++call_stats->filter_eval_calls;
             call_stats->filter_eval_time_ns += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
@@ -1043,13 +1142,12 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         top_candidates.pop();
     }
 
-    size_t sz = top_candidates.size();
-    result.resize(sz);
     while (!top_candidates.empty()) {
         const Pair<DistT> item = top_candidates.top();
         top_candidates.pop();
-        result[--sz] = std::make_pair(item.first, index.getExternalLabel(item.second));
+        result.emplace_back(item.first, index.getExternalLabel(item.second));
     }
+    std::reverse(result.begin(), result.end());
 
     index.visited_list_pool_->releaseVisitedList(vl);
     return result;
@@ -1167,6 +1265,13 @@ RunStats run_search_typed(
         const QueryT* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
 
         SearchCallStats call_stats;
+        SequentialEqQueryCache query_cache;
+        SequentialEqSearchWorkspace query_workspace;
+        if (use_sequential_eq) {
+            query_cache = make_preallocated_query_cache(*sequential_runtime);
+            query_workspace.neighbor_ids.reserve(index.maxM0_);
+            prefetch_tb_blocks(*sequential_runtime, &query_cache, &call_stats.decomp);
+        }
 
         const auto search_start = std::chrono::steady_clock::now();
         std::vector<std::pair<DistT, hnswlib::labeltype>> result;
@@ -1177,16 +1282,18 @@ RunStats run_search_typed(
                 static_cast<size_t>(args.k),
                 resolved_ef,
                 *sequential_runtime,
+                &query_cache,
+                &query_workspace,
                 &call_stats);
         } else {
-            compass_lz4_filter::QueryBlockCache query_cache(engine.attribute_count());
+            compass_lz4_filter::QueryBlockCache engine_query_cache(engine.attribute_count());
             result = search_with_compass_filter<DistT, QueryT>(
                 index,
                 qptr,
                 static_cast<size_t>(args.k),
                 resolved_ef,
                 engine,
-                &query_cache,
+                &engine_query_cache,
                 &call_stats);
         }
         const auto search_end = std::chrono::steady_clock::now();

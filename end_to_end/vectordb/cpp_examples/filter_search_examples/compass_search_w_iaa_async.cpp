@@ -587,7 +587,6 @@ public:
                 std::to_string(static_cast<int>(submit_status)));
         }
 
-        slot.submit_time = std::chrono::steady_clock::now();
         slot.complete = std::forward<CompleteFn>(complete_fn);
         pending_slots_.push_back(slot_id);
 
@@ -605,8 +604,7 @@ private:
         std::unique_ptr<uint8_t[]> job_storage;
         qpl_job* job = nullptr;
         std::vector<uint8_t> output;
-        std::chrono::steady_clock::time_point submit_time;
-        std::function<void(qpl_job*, std::vector<uint8_t>&, uint64_t)> complete;
+        std::function<void(qpl_job*, std::vector<uint8_t>&)> complete;
     };
 
     void ensure_free_slot() {
@@ -627,17 +625,14 @@ private:
             Slot& slot = slots_[slot_id];
 
             const qpl_status wait_status = qpl_wait_job(slot.job);
-            const auto done_time = std::chrono::steady_clock::now();
             if (wait_status != QPL_STS_OK) {
                 throw std::runtime_error(
                     "AsyncJobRing: qpl_wait_job failed with status " +
                     std::to_string(static_cast<int>(wait_status)));
             }
 
-            const uint64_t elapsed_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(done_time - slot.submit_time).count());
             if (slot.complete) {
-                slot.complete(slot.job, slot.output, elapsed_ns);
+                slot.complete(slot.job, slot.output);
             }
             slot.complete = nullptr;
             free_slots_.push_back(slot_id);
@@ -686,7 +681,7 @@ void submit_tb_prefetch_jobs(
                 job->num_input_elements = raw_len;
                 job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_DECOMPRESS_ENABLE;
             },
-            [cache, metrics, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out, uint64_t elapsed_ns) {
+            [cache, metrics, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out) {
                 const size_t produced = static_cast<size_t>(job->total_out);
                 std::vector<uint8_t>& dst = cache->tb_blocks[block_id];
                 if (produced > dst.size()) {
@@ -695,7 +690,6 @@ void submit_tb_prefetch_jobs(
                 std::copy_n(out.begin(), produced, dst.begin());
                 cache->tb_ready[block_id] = 1;
                 if (metrics != nullptr) {
-                    metrics->iaa_decompress_time_ns += elapsed_ns;
                     ++metrics->tb_blocks_decompressed;
                     metrics->tb_bytes_decompressed += static_cast<uint64_t>(raw_len);
                 }
@@ -743,7 +737,7 @@ void submit_fid_scan_job(
             job->num_input_elements = raw_len;
             job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_DECOMPRESS_ENABLE;
         },
-        [cache, metrics, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out, uint64_t elapsed_ns) {
+        [cache, metrics, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out) {
             const size_t produced = static_cast<size_t>(job->total_out);
             FidScanBlock& block = cache->fid_blocks[block_id];
             if (produced > block.matches.size()) {
@@ -755,7 +749,6 @@ void submit_fid_scan_job(
             block.byte_per_element = (job->total_out >= raw_len);
             cache->fid_ready[block_id] = 1;
             if (metrics != nullptr) {
-                metrics->iaa_decompress_time_ns += elapsed_ns;
                 ++metrics->fid_blocks_decompressed;
                 metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
             }
@@ -1049,7 +1042,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         hnswlib::tableint candidate_id = 0;
         DistT dist{};
         size_t fid_block_id = 0;
-        uint64_t tb_eval_time_ns = 0;
         bool deleted = false;
         bool need_fid = false;
     };
@@ -1092,15 +1084,10 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
 
-            const auto tb_t0 = std::chrono::steady_clock::now();
             const bool tb_match = tb_match_node(runtime, cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
-            const auto tb_t1 = std::chrono::steady_clock::now();
-            const uint64_t tb_eval_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(tb_t1 - tb_t0).count());
 
             if (!tb_match) {
                 ++call_stats->filter_eval_calls;
-                call_stats->filter_eval_time_ns += tb_eval_ns;
                 continue;
             }
 
@@ -1112,14 +1099,12 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             const bool prelim_consider = (top_candidates.size() < ef || lower_bound > dist);
             if (!prelim_consider) {
                 ++call_stats->filter_eval_calls;
-                call_stats->filter_eval_time_ns += tb_eval_ns;
                 continue;
             }
 
             FrontierCandidate entry;
             entry.candidate_id = candidate_id;
             entry.dist = dist;
-            entry.tb_eval_time_ns = tb_eval_ns;
             entry.deleted = index.isMarkedDeleted(candidate_id);
             if (runtime.fid_storage.block_size != 0) {
                 entry.fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
@@ -1146,24 +1131,17 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             const bool consider = (top_candidates.size() < ef || lower_bound > entry.dist);
             if (!consider) {
                 ++call_stats->filter_eval_calls;
-                call_stats->filter_eval_time_ns += entry.tb_eval_time_ns;
                 continue;
             }
 
             candidate_set.emplace(-entry.dist, entry.candidate_id);
 
-            uint64_t filter_eval_ns = entry.tb_eval_time_ns;
             bool fid_match = true;
             if (entry.need_fid) {
-                const auto fid_t0 = std::chrono::steady_clock::now();
                 fid_match = fid_match_node(runtime, cache, static_cast<size_t>(entry.candidate_id), &call_stats->decomp);
-                const auto fid_t1 = std::chrono::steady_clock::now();
-                filter_eval_ns += static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(fid_t1 - fid_t0).count());
             }
 
             ++call_stats->filter_eval_calls;
-            call_stats->filter_eval_time_ns += filter_eval_ns;
 
             const bool result_allowed = !entry.deleted && fid_match;
             if (result_allowed) {
