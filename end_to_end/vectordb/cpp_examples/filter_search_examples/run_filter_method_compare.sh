@@ -15,6 +15,7 @@ Usage:
     [--num-queries <int>] \
     [--out-dir <path>] \
     [--postfilter-max-candidates <int>] \
+    [--postfilter-max-candidates-list <comma-separated>] \
     [--build|--no-build] \
     [--plot|--no-plot]
 
@@ -26,7 +27,8 @@ Core defaults:
   --ef-list-10pct              (dataset=sift1m default) 200,256,300,400
   --num-queries                 100
   --out-dir                     <this_dir>/out/filter_method_compare
-  --postfilter-max-candidates   5000
+  --postfilter-max-candidates   3000 (in_search_filter_hnsw)
+  --postfilter-max-candidates-list 500,1000,1500,2000 (post_filter_hnsw sweep)
   --fid-block-size-bytes        8192*8 (65536)
   --tb-block-size-bytes         8192*128 (1048576)
   --build                       enabled
@@ -97,9 +99,12 @@ EF_LIST="32,64,96,128,160,200"
 EF_LIST_1PCT=""
 EF_LIST_10PCT=""
 EF_LIST_SET_BY_USER=0
-NUM_QUERIES=100
+NUM_QUERIES=20
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
-POSTFILTER_MAX_CANDIDATES=50
+POSTFILTER_MAX_CANDIDATES=3000
+POSTFILTER_MAX_CANDIDATES_SET_BY_USER=0
+POSTFILTER_MAX_CANDIDATES_LIST="500,1000,1500,2000"
+POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=0
 DO_BUILD=1
 DO_PLOT=1
 FILTER_EXPR='synthetic_id_bucket == 255'
@@ -114,8 +119,8 @@ MANIFEST_10PCT=""
 ACORN_INDEX_1PCT=""
 ACORN_INDEX_10PCT=""
 PAYLOAD_JSONL=""
-FID_BLOCK_SIZE_BYTES="$((1024*16))"
-TB_BLOCK_SIZE_BYTES="$((1024*64))"
+FID_BLOCK_SIZE_BYTES="$((1024*128))"
+TB_BLOCK_SIZE_BYTES="$((1024*1024))"
 
 # Build flags used by this script when --build is enabled.
 # Default: disable AVX/AVX512.
@@ -163,6 +168,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --postfilter-max-candidates)
       POSTFILTER_MAX_CANDIDATES="$2"
+      POSTFILTER_MAX_CANDIDATES_SET_BY_USER=1
+      shift 2
+      ;;
+    --postfilter-max-candidates-list)
+      POSTFILTER_MAX_CANDIDATES_LIST="$2"
+      POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=1
       shift 2
       ;;
     --build)
@@ -257,6 +268,11 @@ fi
 if [[ "$POSTFILTER_MAX_CANDIDATES" -lt "$K" ]]; then
   echo "Error: --postfilter-max-candidates must be >= --k" >&2
   exit 1
+fi
+# Backward compatibility: if only --postfilter-max-candidates is set by user,
+# use it as the post_filter_hnsw sweep list too.
+if [[ "$POSTFILTER_MAX_CANDIDATES_SET_BY_USER" -eq 1 && "$POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER" -eq 0 ]]; then
+  POSTFILTER_MAX_CANDIDATES_LIST="$POSTFILTER_MAX_CANDIDATES"
 fi
 if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
   if ! [[ "$FID_BLOCK_SIZE_BYTES" =~ ^[0-9]+$ ]] || [[ "$FID_BLOCK_SIZE_BYTES" -le 0 ]]; then
@@ -395,11 +411,54 @@ parse_ef_list_into_array() {
   done
 }
 
+parse_positive_int_list_into_array() {
+  local raw_list="$1"
+  local list_label="$2"
+  local out_var_name="$3"
+
+  IFS=',' read -r -a RAW_VALUES <<< "$raw_list"
+  local -a parsed_values=()
+  local raw_value=""
+  local value=""
+  for raw_value in "${RAW_VALUES[@]}"; do
+    value="$(echo "$raw_value" | tr -d '[:space:]')"
+    if [[ -z "$value" ]]; then
+      continue
+    fi
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" -le 0 ]]; then
+      echo "Error: invalid value in ${list_label}: $value" >&2
+      exit 1
+    fi
+    parsed_values+=("$value")
+  done
+
+  if [[ "${#parsed_values[@]}" -eq 0 ]]; then
+    echo "Error: ${list_label} produced no valid values" >&2
+    exit 1
+  fi
+
+  eval "$out_var_name=()"
+  local v
+  for v in "${parsed_values[@]}"; do
+    eval "$out_var_name+=(\"$v\")"
+  done
+}
+
 EFFECTIVE_EF_LIST_1PCT="${EF_LIST_1PCT:-$EF_LIST}"
 EFFECTIVE_EF_LIST_10PCT="${EF_LIST_10PCT:-$EF_LIST}"
 
 parse_ef_list_into_array "$EFFECTIVE_EF_LIST_1PCT" "--ef-list-1pct" EF_VALUES_1PCT
 parse_ef_list_into_array "$EFFECTIVE_EF_LIST_10PCT" "--ef-list-10pct" EF_VALUES_10PCT
+parse_positive_int_list_into_array \
+  "$POSTFILTER_MAX_CANDIDATES_LIST" \
+  "--postfilter-max-candidates-list" \
+  POSTFILTER_MAX_VALUES
+for max_candidates in "${POSTFILTER_MAX_VALUES[@]}"; do
+  if [[ "$max_candidates" -lt "$K" ]]; then
+    echo "Error: every --postfilter-max-candidates-list value must be >= --k (found: $max_candidates)" >&2
+    exit 1
+  fi
+done
 
 generate_sift_metadata_csv() {
   local manifest_path="$1"
@@ -495,8 +554,8 @@ RESULTS_1PCT="$OUT_DIR/results_1pct.csv"
 RESULTS_10PCT="$OUT_DIR/results_10pct.csv"
 RESULTS_MERGED="$OUT_DIR/results_merged.csv"
 
-printf 'dataset,selectivity_pct,method,ef,k,queries_executed,recall,qps,fid_comp_ratio,tb_comp_ratio,total_comp_ratio,summary_path,status,error\n' > "$RESULTS_1PCT"
-printf 'dataset,selectivity_pct,method,ef,k,queries_executed,recall,qps,fid_comp_ratio,tb_comp_ratio,total_comp_ratio,summary_path,status,error\n' > "$RESULTS_10PCT"
+printf 'dataset,selectivity_pct,method,ef,postfilter_max_candidates,k,queries_executed,recall,qps,fid_comp_ratio,tb_comp_ratio,total_comp_ratio,summary_path,status,error\n' > "$RESULTS_1PCT"
+printf 'dataset,selectivity_pct,method,ef,postfilter_max_candidates,k,queries_executed,recall,qps,fid_comp_ratio,tb_comp_ratio,total_comp_ratio,summary_path,status,error\n' > "$RESULTS_10PCT"
 
 GENERATED_META_DIR="$OUT_DIR/generated_metadata"
 mkdir -p "$GENERATED_META_DIR"
@@ -536,12 +595,17 @@ run_single() {
   local acorn_index_path="$6"
   local out_csv="$7"
   local filter_expr="$8"
+  local postfilter_max_candidates="$9"
 
   local summary_dir="$OUT_DIR/summaries/${selectivity_pct}pct/${method}"
   mkdir -p "$summary_dir"
 
-  local summary_path="$summary_dir/ef_${ef}.summary.txt"
-  local log_path="$summary_dir/ef_${ef}.log"
+  local summary_stem="ef_${ef}"
+  if [[ "$method" == "post_filter_hnsw" ]]; then
+    summary_stem="ef_${ef}_pfc_${postfilter_max_candidates}"
+  fi
+  local summary_path="$summary_dir/${summary_stem}.summary.txt"
+  local log_path="$summary_dir/${summary_stem}.log"
 
   local -a cmd
   case "$method" in
@@ -555,7 +619,7 @@ run_single() {
         --ef "$ef"
         --filter "$filter_expr"
         --search-mode post_filter_iterative
-        --postfilter-max-candidates "$POSTFILTER_MAX_CANDIDATES"
+        --postfilter-max-candidates "$postfilter_max_candidates"
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
       )
@@ -657,6 +721,10 @@ run_single() {
   local fid_comp_ratio=""
   local tb_comp_ratio=""
   local total_comp_ratio=""
+  local postfilter_value_out=""
+  if [[ "$method" == "post_filter_hnsw" ]]; then
+    postfilter_value_out="$postfilter_max_candidates"
+  fi
 
   if "${cmd[@]}" > "$log_path" 2>&1; then
     queries_executed="$(extract_summary_value "queries_executed" "$summary_path" || true)"
@@ -685,11 +753,12 @@ run_single() {
     error_text="$(sanitize_csv_field "$error_text")"
   fi
 
-  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+  printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
     "$DATASET" \
     "$selectivity_pct" \
     "$method" \
     "$ef" \
+    "$postfilter_value_out" \
     "$K" \
     "$queries_executed" \
     "$recall" \
@@ -714,15 +783,39 @@ run_selectivity() {
 
   local methods=(
     "post_filter_hnsw"
-    "in_search_filter_hnsw"
-    "acorn"
-    "compass_lz4"
-    "compass_iaa"
+    # "in_search_filter_hnsw"
+    # "acorn"
+    # "compass_lz4"
+    # "compass_iaa"
   )
 
   for ef in "${ef_values_ref[@]}"; do
     for method in "${methods[@]}"; do
-      run_single "$method" "$selectivity_pct" "$ef" "$manifest_path" "$metadata_csv" "$acorn_index_path" "$out_csv" "$filter_expr"
+      if [[ "$method" == "post_filter_hnsw" ]]; then
+        for postfilter_max_candidates in "${POSTFILTER_MAX_VALUES[@]}"; do
+          run_single \
+            "$method" \
+            "$selectivity_pct" \
+            "$ef" \
+            "$manifest_path" \
+            "$metadata_csv" \
+            "$acorn_index_path" \
+            "$out_csv" \
+            "$filter_expr" \
+            "$postfilter_max_candidates"
+        done
+      else
+        run_single \
+          "$method" \
+          "$selectivity_pct" \
+          "$ef" \
+          "$manifest_path" \
+          "$metadata_csv" \
+          "$acorn_index_path" \
+          "$out_csv" \
+          "$filter_expr" \
+          "$POSTFILTER_MAX_CANDIDATES"
+      fi
     done
   done
 }
@@ -740,6 +833,8 @@ echo "    10% -> $ACORN_INDEX_10PCT"
 echo "  k: $K"
 echo "  ef list (1%): ${EF_VALUES_1PCT[*]}"
 echo "  ef list (10%): ${EF_VALUES_10PCT[*]}"
+echo "  postfilter max-candidates list: ${POSTFILTER_MAX_VALUES[*]}"
+echo "  in_search_filter_hnsw postfilter-max-candidates: $POSTFILTER_MAX_CANDIDATES"
 echo "  num-queries: $NUM_QUERIES"
 echo "  filter (1%): $EFFECTIVE_FILTER_EXPR_1PCT"
 echo "  filter (10%): $EFFECTIVE_FILTER_EXPR_10PCT"
