@@ -272,10 +272,8 @@ if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
 fi
 
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
-LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4.run"
-LZ4_GROUPING_RUN="$SCRIPT_DIR/compass_search_w_lz4_grouping.run"
-IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa_async.run"
-IAA_GROUPING_RUN="$SCRIPT_DIR/compass_search_w_iaa_async_grouping.run"
+LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4_grouping.run"
+IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa_async_grouping.run"
 ACORN_RUN="$SCRIPT_DIR/acorn_search.run"
 PLOT_PY="$SCRIPT_DIR/plot_qps_recall.py"
 
@@ -290,15 +288,15 @@ set_dataset_defaults() {
       LZ4_DATASET_TYPE="sift"
       IAA_DATASET_TYPE="sift1m"
       if [[ "$EF_LIST_SET_BY_USER" -eq 0 && -z "$EF_LIST_1PCT" && -z "$EF_LIST_10PCT" ]]; then
-        EF_LIST_1PCT="64,96,128,160,200"
-        EF_LIST_10PCT="200,256,300,400"
+        EF_LIST_1PCT="1, 2, 4, 8, 16, 32, 64,96,128,160,200"
+        EF_LIST_10PCT="32, 64, 128, 200,256,300,400, 512,640,800"
       fi
       : "${GRAPH_PATH:=/storage/jykang5/compass_graphs/sift_m128_efc200.bin}"
       : "${QUERY_PATH:=/storage/jykang5/compass_base_query/sift1m_query.fvecs}"
       : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/sift1m/manifest.json}"
       : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/sift1m/manifest.json}"
-      : "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/sift1m_acorn_m32_nf100.index}"
-      : "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/sift1m_acorn_m32_nf10.index}"
+      : "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/sift1m_acorn_m64_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/sift1m_acorn_m64_nf10.index}"
       ;;
     sift1b)
       HNSW_DATASET_TYPE="sift"
@@ -351,10 +349,8 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
 fi
 
 ensure_executable_file "$HNSW_RUN" "hnswlib_filter_search.run is missing or not executable"
-ensure_executable_file "$LZ4_RUN" "compass_search_w_lz4.run is missing or not executable"
-ensure_executable_file "$LZ4_GROUPING_RUN" "compass_search_w_lz4_grouping.run is missing or not executable"
-ensure_executable_file "$IAA_RUN" "compass_search_w_iaa_async.run is missing or not executable"
-ensure_executable_file "$IAA_GROUPING_RUN" "compass_search_w_iaa_async_grouping.run is missing or not executable"
+ensure_executable_file "$LZ4_RUN" "compass_search_w_lz4_grouping.run is missing or not executable"
+ensure_executable_file "$IAA_RUN" "compass_search_w_iaa_async_grouping.run is missing or not executable"
 ensure_executable_file "$ACORN_RUN" "acorn_search.run is missing or not executable"
 ensure_readable_file "$GRAPH_PATH" "graph file not found"
 ensure_readable_file "$QUERY_PATH" "query file not found"
@@ -609,49 +605,9 @@ run_single() {
         cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
       fi
       ;;
-    compass_lz4_grouping)
-      cmd=(
-        "$LZ4_GROUPING_RUN"
-        --dataset-type "$LZ4_DATASET_TYPE"
-        --graph "$GRAPH_PATH"
-        --query "$QUERY_PATH"
-        --k "$K"
-        --ef "$ef"
-        --filter "$filter_expr"
-        --fidtb-manifest "$manifest_path"
-        --num-queries "$NUM_QUERIES"
-        --summary-out "$summary_path"
-      )
-      if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
-        cmd+=(--fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES")
-      fi
-      if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
-        cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
-      fi
-      ;;
     compass_iaa)
       cmd=(
         "$IAA_RUN"
-        --dataset-type "$IAA_DATASET_TYPE"
-        --graph "$GRAPH_PATH"
-        --query "$QUERY_PATH"
-        --k "$K"
-        --ef "$ef"
-        --filter "$filter_expr"
-        --fidtb-manifest "$manifest_path"
-        --num-queries "$NUM_QUERIES"
-        --summary-out "$summary_path"
-      )
-      if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
-        cmd+=(--fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES")
-      fi
-      if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
-        cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
-      fi
-      ;;
-    compass_iaa_grouping)
-      cmd=(
-        "$IAA_GROUPING_RUN"
         --dataset-type "$IAA_DATASET_TYPE"
         --graph "$GRAPH_PATH"
         --query "$QUERY_PATH"
@@ -757,13 +713,11 @@ run_selectivity() {
   local -n ef_values_ref="$ef_values_name"
 
   local methods=(
-    # "post_filter_hnsw"
-    # "in_search_filter_hnsw"
-    # "acorn"
-    # "compass_lz4"
-    "compass_lz4_grouping"
+    "post_filter_hnsw"
+    "in_search_filter_hnsw"
+    "acorn"
+    "compass_lz4"
     "compass_iaa"
-    "compass_iaa_grouping"
   )
 
   for ef in "${ef_values_ref[@]}"; do
