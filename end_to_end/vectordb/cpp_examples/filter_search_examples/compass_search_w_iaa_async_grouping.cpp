@@ -100,6 +100,10 @@ struct RunStats {
     uint64_t tb_bytes_decompressed = 0;
     uint64_t fid_tb_mismatch_count = 0;
     uint64_t fid_tb_mismatch_log_capped = 0;
+    uint64_t deferred_candidates_enqueued = 0;
+    uint64_t deferred_retry_rounds = 0;
+    uint64_t job_poll_calls = 0;
+    uint64_t job_poll_ready = 0;
 
     size_t returned_results = 0;
     size_t selectivity_count = 0;
@@ -122,6 +126,10 @@ struct SearchCallStats {
     compass_iaa_filter::QueryDecompressionMetrics decomp;
     uint64_t fid_tb_mismatch_count = 0;
     uint64_t fid_tb_mismatch_log_capped = 0;
+    uint64_t deferred_candidates_enqueued = 0;
+    uint64_t deferred_retry_rounds = 0;
+    uint64_t job_poll_calls = 0;
+    uint64_t job_poll_ready = 0;
 };
 
 void usage(const char* argv0) {
@@ -368,7 +376,12 @@ struct AsyncEqQueryCache {
     std::vector<uint8_t> tb_ready;
     std::vector<FidScanBlock> fid_blocks;
     std::vector<uint8_t> fid_ready;
+    std::vector<uint8_t> fid_state;
 };
+
+constexpr uint8_t kFidStateNotSubmitted = 0;
+constexpr uint8_t kFidStateInflight = 1;
+constexpr uint8_t kFidStateReady = 2;
 
 bool is_sift_exact_dataset(std::string_view dataset_type) {
     return dataset_type == "sift1m" ||
@@ -438,7 +451,7 @@ void print_fid_value_histogram(
     }
 
     std::cout
-        << "[IAA_ASYNC] FID value histogram"
+        << "[IAA_ASYNC_GROUPING] FID value histogram"
         << " field=" << field
         << " nfilters=" << nfilters
         << " elements=" << fid_raw.size()
@@ -591,6 +604,7 @@ AsyncEqQueryCache make_preallocated_query_cache(const AsyncEqRuntime& runtime) {
     const size_t fid_blocks = runtime.fid_storage.block_count();
     cache.fid_blocks.resize(fid_blocks);
     cache.fid_ready.assign(fid_blocks, 0);
+    cache.fid_state.assign(fid_blocks, kFidStateNotSubmitted);
     for (size_t block_id = 0; block_id < fid_blocks; ++block_id) {
         FidScanBlock& block = cache.fid_blocks[block_id];
         block.matches.assign(runtime.fid_storage.raw_block_sizes[block_id], 0);
@@ -611,12 +625,14 @@ void reset_preallocated_query_cache(
     if (cache->tb_blocks.size() != runtime.tb_storage.block_count() ||
         cache->tb_ready.size() != runtime.tb_storage.block_count() ||
         cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
-        cache->fid_ready.size() != runtime.fid_storage.block_count()) {
+        cache->fid_ready.size() != runtime.fid_storage.block_count() ||
+        cache->fid_state.size() != runtime.fid_storage.block_count()) {
         throw std::runtime_error("AsyncEqQueryCache reset size mismatch");
     }
 
     std::fill(cache->tb_ready.begin(), cache->tb_ready.end(), static_cast<uint8_t>(0));
     std::fill(cache->fid_ready.begin(), cache->fid_ready.end(), static_cast<uint8_t>(0));
+    std::fill(cache->fid_state.begin(), cache->fid_state.end(), kFidStateNotSubmitted);
     for (size_t block_id = 0; block_id < cache->fid_blocks.size(); ++block_id) {
         FidScanBlock& block = cache->fid_blocks[block_id];
         block.input_elements = runtime.fid_storage.raw_block_sizes[block_id];
@@ -645,6 +661,7 @@ void prefault_query_cache_buffers(AsyncEqQueryCache* cache) {
 
     touch_vec(cache->tb_ready);
     touch_vec(cache->fid_ready);
+    touch_vec(cache->fid_state);
     for (std::vector<uint8_t>& block : cache->tb_blocks) {
         touch_vec(block);
     }
@@ -733,6 +750,29 @@ public:
         return !pending_slots_.empty();
     }
 
+    size_t poll_ready_jobs() {
+        size_t completed = 0;
+        const size_t pending_count = pending_slots_.size();
+        for (size_t i = 0; i < pending_count; ++i) {
+            const size_t slot_id = pending_slots_.front();
+            pending_slots_.pop_front();
+            Slot& slot = slots_[slot_id];
+
+            const qpl_status status = qpl_check_job(slot.job);
+            if (status == QPL_STS_OK) {
+                complete_slot(slot_id);
+                ++completed;
+            } else if (status == QPL_STS_BEING_PROCESSED) {
+                pending_slots_.push_back(slot_id);
+            } else {
+                throw std::runtime_error(
+                    "AsyncJobRing: qpl_check_job failed with status " +
+                    std::to_string(static_cast<int>(status)));
+            }
+        }
+        return completed;
+    }
+
     void prefault_output_buffers() {
         volatile uint8_t sink = 0;
         constexpr size_t kPageBytes = 4096;
@@ -779,13 +819,17 @@ private:
                     "AsyncJobRing: qpl_wait_job failed with status " +
                     std::to_string(static_cast<int>(wait_status)));
             }
-
-            if (slot.complete) {
-                slot.complete(slot.job, slot.output);
-            }
-            slot.complete = nullptr;
-            free_slots_.push_back(slot_id);
+            complete_slot(slot_id);
         }
+    }
+
+    void complete_slot(size_t slot_id) {
+        Slot& slot = slots_[slot_id];
+        if (slot.complete) {
+            slot.complete(slot.job, slot.output);
+        }
+        slot.complete = nullptr;
+        free_slots_.push_back(slot_id);
     }
 
     size_t queue_size_ = 128;
@@ -858,7 +902,11 @@ void submit_fid_scan_job(
     if (block_id >= runtime.fid_storage.block_count()) {
         return;
     }
-    if (block_id >= cache->fid_ready.size() || cache->fid_ready[block_id] != 0) {
+    if (block_id >= cache->fid_ready.size() || block_id >= cache->fid_state.size()) {
+        return;
+    }
+    if (cache->fid_state[block_id] == kFidStateInflight ||
+        cache->fid_state[block_id] == kFidStateReady) {
         return;
     }
 
@@ -869,6 +917,7 @@ void submit_fid_scan_job(
         block.output_bytes = 0;
         block.byte_per_element = false;
         cache->fid_ready[block_id] = 1;
+        cache->fid_state[block_id] = kFidStateReady;
         return;
     }
 
@@ -897,11 +946,13 @@ void submit_fid_scan_job(
             block.output_bytes = static_cast<uint32_t>(produced);
             block.byte_per_element = (job->total_out >= raw_len);
             cache->fid_ready[block_id] = 1;
+            cache->fid_state[block_id] = kFidStateReady;
             if (metrics != nullptr) {
                 ++metrics->fid_blocks_decompressed;
                 metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
             }
         });
+    cache->fid_state[block_id] = kFidStateInflight;
 }
 
 bool tb_match_node(
@@ -1158,7 +1209,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
     if (cache->tb_blocks.size() != runtime.tb_storage.block_count() ||
         cache->tb_ready.size() != runtime.tb_storage.block_count() ||
         cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
-        cache->fid_ready.size() != runtime.fid_storage.block_count()) {
+        cache->fid_ready.size() != runtime.fid_storage.block_count() ||
+        cache->fid_state.size() != runtime.fid_storage.block_count()) {
         throw std::runtime_error(
             "AsyncEqQueryCache must be fully preallocated before search");
     }
@@ -1209,17 +1261,138 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         bool deleted = false;
         bool need_fid = false;
     };
+    constexpr size_t kFidSubmitBatchThreshold = 8;
     std::vector<hnswlib::tableint> neighbor_ids;
     neighbor_ids.reserve(index.maxM0_);
     std::vector<FrontierCandidate> frontier_candidates;
     frontier_candidates.reserve(index.maxM0_);
-    std::vector<size_t> fid_blocks_to_submit;
-    fid_blocks_to_submit.reserve(index.maxM0_);
+    std::vector<size_t> pending_fid_blocks_to_submit;
+    pending_fid_blocks_to_submit.reserve(index.maxM0_ * 2);
+    std::vector<uint8_t> pending_fid_block_marks(cache->fid_state.size(), static_cast<uint8_t>(0));
+    std::vector<FrontierCandidate> temp_result_buffer;
+    temp_result_buffer.reserve(index.maxM0_ * 4);
+    std::vector<FrontierCandidate> next_temp_result_buffer;
+    next_temp_result_buffer.reserve(index.maxM0_ * 4);
 
-    while (!candidate_set.empty()) {
+    auto poll_ready_jobs = [&]() {
+        ++call_stats->job_poll_calls;
+        call_stats->job_poll_ready += static_cast<uint64_t>(ring->poll_ready_jobs());
+    };
+
+    auto submit_pending_fid_blocks = [&]() {
+        if (pending_fid_blocks_to_submit.size() < kFidSubmitBatchThreshold) {
+            return;
+        }
+        for (size_t fid_block_id : pending_fid_blocks_to_submit) {
+            if (fid_block_id >= pending_fid_block_marks.size()) {
+                continue;
+            }
+            pending_fid_block_marks[fid_block_id] = static_cast<uint8_t>(0);
+            submit_fid_scan_job(ring, runtime, fid_block_id, cache, &call_stats->decomp);
+        }
+        pending_fid_blocks_to_submit.clear();
+    };
+
+    auto push_result_candidate_if_allowed = [&](const FrontierCandidate& entry) {
+        if (entry.deleted) {
+            return;
+        }
+        top_candidates.emplace(entry.dist, entry.candidate_id);
+        while (top_candidates.size() > ef) {
+            top_candidates.pop();
+        }
+        if (!top_candidates.empty()) {
+            lower_bound = top_candidates.top().first;
+        }
+    };
+
+    auto retry_temp_buffer_once = [&]() {
+        if (temp_result_buffer.empty()) {
+            return;
+        }
+        ++call_stats->deferred_retry_rounds;
+        next_temp_result_buffer.clear();
+        for (const FrontierCandidate& entry : temp_result_buffer) {
+            if (!entry.need_fid) {
+                ++call_stats->filter_eval_calls;
+                push_result_candidate_if_allowed(entry);
+                continue;
+            }
+            if (entry.fid_block_id >= cache->fid_state.size()) {
+                ++call_stats->filter_eval_calls;
+                continue;
+            }
+            if (cache->fid_state[entry.fid_block_id] != kFidStateReady) {
+                next_temp_result_buffer.push_back(entry);
+                continue;
+            }
+            const bool fid_match = fid_match_node(
+                runtime,
+                ring,
+                cache,
+                static_cast<size_t>(entry.candidate_id),
+                &call_stats->decomp);
+            ++call_stats->filter_eval_calls;
+            if (fid_match) {
+                push_result_candidate_if_allowed(entry);
+            }
+        }
+        temp_result_buffer.swap(next_temp_result_buffer);
+    };
+
+    // Base-layer traversal loop with staged non-blocking FID handling.
+    while (true) {
+        // Stage 0: progress async work already in flight.
+        // Poll qpl_check_job completions, then retry buffered result candidates
+        // whose FID may have become ready since the last expansion.
+        poll_ready_jobs();
+        retry_temp_buffer_once();
+
+        if (candidate_set.empty()) {
+            // Stage 6a: frontier is empty.
+            // If buffered candidates still depend on inflight jobs, keep waiting minimally;
+            // otherwise terminate this query's level-0 exploration.
+            if (temp_result_buffer.empty()) {
+                if (!ring->has_pending()) {
+                    break;
+                }
+                ring->wait_one();
+                continue;
+            }
+            if (ring->has_pending()) {
+                ring->wait_one();
+                continue;
+            }
+
+            bool has_inflight = false;
+            for (const FrontierCandidate& buffered_entry : temp_result_buffer) {
+                if (buffered_entry.need_fid &&
+                    buffered_entry.fid_block_id < cache->fid_state.size() &&
+                    cache->fid_state[buffered_entry.fid_block_id] == kFidStateInflight) {
+                    has_inflight = true;
+                    break;
+                }
+            }
+            if (has_inflight) {
+                throw std::runtime_error(
+                    "Temporary result entries remain while FID blocks are inflight but no pending jobs exist");
+            }
+            // Keep non-blocking behavior: do not force-submit or flush residual sub-threshold FID blocks.
+            break;
+        }
+
         const Pair<DistT> current = candidate_set.top();
         const DistT candidate_dist = -current.first;
         if (candidate_dist > lower_bound && top_candidates.size() >= ef) {
+            // Stage 6b: ef/lower_bound early-stop.
+            // Stop only when no pending async work can still make buffered entries eligible.
+            if (temp_result_buffer.empty() && !ring->has_pending()) {
+                break;
+            }
+            if (ring->has_pending()) {
+                ring->wait_one();
+                continue;
+            }
             break;
         }
         candidate_set.pop();
@@ -1228,8 +1401,10 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         int* data = reinterpret_cast<int*>(index.get_linklist0(current_node_id));
         const size_t size = index.getListCount(reinterpret_cast<hnswlib::linklistsizeint*>(data));
 
+        // Stage 1: gather unvisited neighbors and apply TB prefilter.
+        // TB-passed neighbors are grouped into frontier_candidates, and any needed
+        // FID block ids are added to the pending submission set.
         neighbor_ids.clear();
-
         for (size_t j = 1; j <= size; ++j) {
             const hnswlib::tableint candidate_id = static_cast<hnswlib::tableint>(*(data + j));
             if (candidate_id >= index.cur_element_count) {
@@ -1243,19 +1418,14 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         }
 
         frontier_candidates.clear();
-        fid_blocks_to_submit.clear();
-
-        // Stage 1: TB check neighbors and group survivors.
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
-
             const bool tb_match = tb_match_node(
                 runtime,
                 ring,
                 cache,
                 static_cast<size_t>(candidate_id),
                 &call_stats->decomp);
-
             if (!tb_match) {
                 ++call_stats->filter_eval_calls;
                 continue;
@@ -1267,25 +1437,18 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             if (runtime.fid_storage.block_size != 0) {
                 entry.fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
                 entry.need_fid = true;
-                if (entry.fid_block_id < cache->fid_ready.size() && cache->fid_ready[entry.fid_block_id] == 0) {
-                    fid_blocks_to_submit.push_back(entry.fid_block_id);
+                if (entry.fid_block_id < cache->fid_state.size() &&
+                    cache->fid_state[entry.fid_block_id] == kFidStateNotSubmitted &&
+                    entry.fid_block_id < pending_fid_block_marks.size() &&
+                    pending_fid_block_marks[entry.fid_block_id] == 0) {
+                    pending_fid_block_marks[entry.fid_block_id] = static_cast<uint8_t>(1);
+                    pending_fid_blocks_to_submit.push_back(entry.fid_block_id);
                 }
             }
             frontier_candidates.push_back(entry);
         }
 
-        // Stage 2: submit grouped FID jobs.
-        if (!fid_blocks_to_submit.empty()) {
-            std::sort(fid_blocks_to_submit.begin(), fid_blocks_to_submit.end());
-            fid_blocks_to_submit.erase(
-                std::unique(fid_blocks_to_submit.begin(), fid_blocks_to_submit.end()),
-                fid_blocks_to_submit.end());
-            for (size_t fid_block_id : fid_blocks_to_submit) {
-                submit_fid_scan_job(ring, runtime, fid_block_id, cache, &call_stats->decomp);
-            }
-        }
-
-        // Stage 3: run distance calculation for grouped neighbors.
+        // Stage 2: compute distances for all TB-passed neighbors.
         for (FrontierCandidate& entry : frontier_candidates) {
             entry.dist = index.fstdistfunc_(
                 query_data,
@@ -1293,7 +1456,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                 index.dist_func_param_);
         }
 
-        // Stage 4: update candidates/results.
+        // Stage 3: traversal/update split.
+        // 1) Push eligible TB-passed nodes to candidate_set immediately (keeps recall close to baseline).
+        // 2) For final results: if FID is ready, evaluate now; otherwise push to temporary buffer.
         for (const FrontierCandidate& entry : frontier_candidates) {
             const bool consider = (top_candidates.size() < ef || lower_bound > entry.dist);
             if (!consider) {
@@ -1301,34 +1466,47 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                 continue;
             }
 
+            // Keep traversal quality high by expanding TB-passed nodes immediately.
             candidate_set.emplace(-entry.dist, entry.candidate_id);
 
-            bool fid_match = true;
-            if (entry.need_fid) {
-                fid_match = fid_match_node(
+            if (!entry.need_fid) {
+                ++call_stats->filter_eval_calls;
+                push_result_candidate_if_allowed(entry);
+                continue;
+            }
+
+            if (entry.fid_block_id < cache->fid_state.size() &&
+                cache->fid_state[entry.fid_block_id] == kFidStateReady) {
+                const bool fid_match = fid_match_node(
                     runtime,
                     ring,
                     cache,
                     static_cast<size_t>(entry.candidate_id),
                     &call_stats->decomp);
+                ++call_stats->filter_eval_calls;
+                if (fid_match) {
+                    push_result_candidate_if_allowed(entry);
+                }
+                continue;
             }
 
-            ++call_stats->filter_eval_calls;
-
-            const bool result_allowed = !entry.deleted && fid_match;
-            if (result_allowed) {
-                top_candidates.emplace(entry.dist, entry.candidate_id);
-            }
-
-            while (top_candidates.size() > ef) {
-                top_candidates.pop();
-            }
-            if (!top_candidates.empty()) {
-                lower_bound = top_candidates.top().first;
-            }
+            temp_result_buffer.push_back(entry);
+            ++call_stats->deferred_candidates_enqueued;
         }
+
+        // Stage 4: submit newly discovered FID blocks in batches (threshold = 8).
+        // This reduces software-side submit overhead.
+        submit_pending_fid_blocks();
+
+        // Stage 5: non-blocking completion check for the jobs submitted this/previous rounds.
+        poll_ready_jobs();
+
+        // Stage 6c: retry temporary-buffer candidates after this expansion.
+        // Any entry whose FID is now ready and matched is moved to top_candidates.
+        retry_temp_buffer_once();
     }
 
+    // Stage 7: trim to top-k and emit results in ascending distance order.
     while (top_candidates.size() > k) {
         top_candidates.pop();
     }
@@ -1559,6 +1737,10 @@ RunStats run_search_typed(
         stats.tb_bytes_decompressed += call_stats.decomp.tb_bytes_decompressed;
         stats.fid_tb_mismatch_count += call_stats.fid_tb_mismatch_count;
         stats.fid_tb_mismatch_log_capped += call_stats.fid_tb_mismatch_log_capped;
+        stats.deferred_candidates_enqueued += call_stats.deferred_candidates_enqueued;
+        stats.deferred_retry_rounds += call_stats.deferred_retry_rounds;
+        stats.job_poll_calls += call_stats.job_poll_calls;
+        stats.job_poll_ready += call_stats.job_poll_ready;
         stats.search_loop_time_ns += query_search_ns;
 
         returned_results += result.size();
@@ -1735,6 +1917,10 @@ std::string build_summary(
     oss << "tb_bytes_decompressed: " << stats.tb_bytes_decompressed << "\n";
     oss << "fid_tb_mismatch_count: " << stats.fid_tb_mismatch_count << "\n";
     oss << "fid_tb_mismatch_log_capped: " << stats.fid_tb_mismatch_log_capped << "\n";
+    oss << "debug_deferred_candidates_enqueued: " << stats.deferred_candidates_enqueued << "\n";
+    oss << "debug_deferred_retry_rounds: " << stats.deferred_retry_rounds << "\n";
+    oss << "debug_job_poll_calls: " << stats.job_poll_calls << "\n";
+    oss << "debug_job_poll_ready: " << stats.job_poll_ready << "\n";
 
     if (stats.queries_with_enns_lt_k > 0) {
         oss << "warning: filtering condition is too restrictive for k on "
@@ -1778,7 +1964,7 @@ int main(int argc, char** argv) {
         Args args = parse_args(argc, argv);
         if (!is_sift_exact_dataset(args.dataset_type)) {
             throw std::runtime_error(
-                "compass_search_w_iaa_async is optimized for exact-match SIFT datasets only; "
+                "compass_search_w_iaa_async_grouping is optimized for exact-match SIFT datasets only; "
                 "--dataset-type must be sift1m or sift1b");
         }
 

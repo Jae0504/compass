@@ -274,6 +274,7 @@ fi
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
 LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4.run"
 IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa_async.run"
+IAA_GROUPING_RUN="$SCRIPT_DIR/compass_search_w_iaa_async_grouping.run"
 ACORN_RUN="$SCRIPT_DIR/acorn_search.run"
 PLOT_PY="$SCRIPT_DIR/plot_qps_recall.py"
 
@@ -345,12 +346,13 @@ set_dataset_defaults
 mkdir -p "$OUT_DIR"
 
 if [[ "$DO_BUILD" -eq 1 ]]; then
-  make -C "$SCRIPT_DIR" CXXFLAGS="$BUILD_CXXFLAGS" CXXFLAGS_LZ4="$BUILD_CXXFLAGS_LZ4"
+  make -B -C "$SCRIPT_DIR" CXXFLAGS="$BUILD_CXXFLAGS" CXXFLAGS_LZ4="$BUILD_CXXFLAGS_LZ4"
 fi
 
 ensure_executable_file "$HNSW_RUN" "hnswlib_filter_search.run is missing or not executable"
 ensure_executable_file "$LZ4_RUN" "compass_search_w_lz4.run is missing or not executable"
 ensure_executable_file "$IAA_RUN" "compass_search_w_iaa_async.run is missing or not executable"
+ensure_executable_file "$IAA_GROUPING_RUN" "compass_search_w_iaa_async_grouping.run is missing or not executable"
 ensure_executable_file "$ACORN_RUN" "acorn_search.run is missing or not executable"
 ensure_readable_file "$GRAPH_PATH" "graph file not found"
 ensure_readable_file "$QUERY_PATH" "query file not found"
@@ -625,6 +627,26 @@ run_single() {
         cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
       fi
       ;;
+    compass_iaa_grouping)
+      cmd=(
+        "$IAA_GROUPING_RUN"
+        --dataset-type "$IAA_DATASET_TYPE"
+        --graph "$GRAPH_PATH"
+        --query "$QUERY_PATH"
+        --k "$K"
+        --ef "$ef"
+        --filter "$filter_expr"
+        --fidtb-manifest "$manifest_path"
+        --num-queries "$NUM_QUERIES"
+        --summary-out "$summary_path"
+      )
+      if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES")
+      fi
+      if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
+      fi
+      ;;
     acorn)
       cmd=(
         "$ACORN_RUN"
@@ -715,9 +737,10 @@ run_selectivity() {
   local methods=(
     # "post_filter_hnsw"
     # "in_search_filter_hnsw"
-    "acorn"
-    "compass_lz4"
+    # "acorn"
+    # "compass_lz4"
     "compass_iaa"
+    "compass_iaa_grouping"
   )
 
   for ef in "${ef_values_ref[@]}"; do
