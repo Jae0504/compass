@@ -625,6 +625,74 @@ EncodedAttribute encode_attribute(
     return out;
 }
 
+void apply_sift_synthetic_id_bucket_encoding(
+    EncodedAttribute* encoded,
+    size_t row_count,
+    int nfilters_local) {
+    if (encoded == nullptr) {
+        throw std::runtime_error("Null encoded attribute for sift synthetic_id_bucket override");
+    }
+    if (nfilters_local <= 0 || nfilters_local > 256) {
+        throw std::runtime_error("nfilters must be in [1, 256] for sift synthetic_id_bucket override");
+    }
+
+    encoded->fid.assign(row_count, static_cast<uint8_t>(0));
+
+    const size_t base_per_bucket = row_count / static_cast<size_t>(nfilters_local);
+    for (int bucket = 0; bucket < nfilters_local - 1; ++bucket) {
+        const size_t start = static_cast<size_t>(bucket) * base_per_bucket;
+        const size_t end = std::min(row_count, static_cast<size_t>(bucket + 1) * base_per_bucket);
+        for (size_t i = start; i < end; ++i) {
+            encoded->fid[i] = static_cast<uint8_t>(bucket);
+        }
+    }
+
+    const size_t last_start = static_cast<size_t>(nfilters_local - 1) * base_per_bucket;
+    for (size_t i = last_start; i < row_count; ++i) {
+        encoded->fid[i] = static_cast<uint8_t>(nfilters_local - 1);
+    }
+
+    encoded->encoding = "categorical_sorted";
+    encoded->numeric = false;
+    encoded->missing_count = 0;
+    encoded->category_map.clear();
+    for (int bucket = 0; bucket < nfilters_local; ++bucket) {
+        encoded->category_map[std::to_string(bucket)] = bucket;
+    }
+
+    std::vector<uint8_t> seen(static_cast<size_t>(nfilters_local), 0);
+    size_t unique_count = 0;
+    for (uint8_t bucket : encoded->fid) {
+        const size_t idx = static_cast<size_t>(bucket);
+        if (idx < seen.size() && seen[idx] == 0) {
+            seen[idx] = 1;
+            ++unique_count;
+        }
+    }
+    encoded->unique_non_missing = unique_count;
+    encoded->used_bins = static_cast<int>(unique_count);
+    encoded->min_value = 0.0;
+    encoded->max_value = static_cast<double>(std::max(0, nfilters_local - 1));
+}
+
+void clear_unused_tb_bits(std::vector<std::bitset<256>>* tb, int nfilters_local) {
+    if (tb == nullptr) {
+        throw std::runtime_error("Null TB pointer for clearing unused bits");
+    }
+    if (nfilters_local < 0 || nfilters_local > 256) {
+        throw std::runtime_error("nfilters must be in [0, 256] while clearing TB bits");
+    }
+    if (nfilters_local >= 256) {
+        return;
+    }
+
+    for (std::bitset<256>& node_bits : *tb) {
+        for (int bit = nfilters_local; bit < 256; ++bit) {
+            node_bits.reset(static_cast<size_t>(bit));
+        }
+    }
+}
+
 std::vector<std::bitset<256>> build_tb_for_attribute(
     hnswlib::HierarchicalNSW<float>* index,
     const std::vector<uint8_t>& fid_values,
@@ -842,6 +910,12 @@ int main(int argc, char** argv) {
 
         for (const auto& attr : attributes) {
             EncodedAttribute encoded = encode_attribute(attr, args.nfilters, filter_value_map);
+            if (args.dataset_type == "sift" && attr.key == "synthetic_id_bucket") {
+                apply_sift_synthetic_id_bucket_encoding(
+                    &encoded,
+                    static_cast<size_t>(ds.base_num),
+                    args.nfilters);
+            }
 
             std::vector<std::bitset<256>> tb = build_tb_for_attribute(
                 index,
@@ -851,6 +925,7 @@ int main(int argc, char** argv) {
                 args.steiner_factor,
                 args.ep_factor,
                 0.0f);
+            clear_unused_tb_bits(&tb, args.nfilters);
 
             const std::string safe_key = sanitize_key_for_filename(attr.key);
             const std::string fid_name = args.benchmark + "_" + safe_key + "_fid.bin";

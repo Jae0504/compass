@@ -138,17 +138,17 @@ fi
 
 echo "Done. Outputs under: $OUT_DIR/$BENCHMARK"
 
-# /home/jykang5/compass/end_to_end/vectordb/cpp_examples/build_examples/build_FID_TB.run \
-#   --dataset-type sift \
-#   --benchmark sift1m \
-#   --graph /storage/jykang5/compass_graphs/sift_m128_efc200.bin \
-#   --base /storage/jykang5/compass_base_query/sift1m_base.fvecs \
-#   --out-dir /storage/jykang5/fid_tb/n_filter_10 \
-#   --threads 32 \
-#   --nfilters 10 \
-#   --steiner-factor 4 \
-#   --ep-factor 4 \
-#   --isolated-connection-factor 5
+/home/jykang5/compass/end_to_end/vectordb/cpp_examples/build_examples/build_FID_TB.run \
+  --dataset-type sift \
+  --benchmark sift1m \
+  --graph /storage/jykang5/compass_graphs/sift_m128_efc200.bin \
+  --base /storage/jykang5/compass_base_query/sift1m_base.fvecs \
+  --out-dir /storage/jykang5/fid_tb/n_filter_2 \
+  --threads 32 \
+  --nfilters 2 \
+  --steiner-factor 4 \
+  --ep-factor 4 \
+  --isolated-connection-factor 5
 
 
 # /home/jykang5/compass/end_to_end/vectordb/cpp_examples/build_examples/build_FID_TB.run \
