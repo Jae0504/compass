@@ -554,9 +554,9 @@ private:
         out.category_map = attr.category_map;
 
         if (out.usable_bins <= 0) {
-            out.usable_bins = std::max(1, out.nfilters - 1);
+            out.usable_bins = std::max(1, out.nfilters);
         }
-        out.usable_bins = std::min(out.usable_bins, std::max(1, out.nfilters - 1));
+        out.usable_bins = std::min(out.usable_bins, std::max(1, out.nfilters));
 
         if (out.numeric) {
             if (out.encoding != "numeric_minmax_quantized") {

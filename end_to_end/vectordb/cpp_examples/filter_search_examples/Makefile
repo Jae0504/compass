@@ -39,12 +39,15 @@ else \
 	true; \
 fi
 
-all: hnswlib_filter_search.run compass_search_w_lz4.run compass_search_w_iaa.run compass_search_w_iaa_async.run compass_search_w_iaa_async_grouping.run compass_search_w_iaa_async_range_filter.run compass_search_w_iaa_async_multiple_em.run acorn_search.run
+all: hnswlib_filter_search.run compass_search_w_lz4.run compass_search_w_lz4_grouping.run compass_search_w_iaa.run compass_search_w_iaa_async.run compass_search_w_iaa_async_grouping.run compass_search_w_iaa_async_range_filter.run compass_search_w_iaa_async_multiple_em.run acorn_search.run
 
 hnswlib_filter_search.run: hnswlib_filter_search.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $< -o $@
 
 compass_search_w_lz4.run: compass_search_w_lz4.cpp
+	$(CXX) $(CXXFLAGS_LZ4) $(INCLUDES_LZ4) $< -o $@ $(LIBS_LZ4)
+
+compass_search_w_lz4_grouping.run: compass_search_w_lz4_grouping.cpp
 	$(CXX) $(CXXFLAGS_LZ4) $(INCLUDES_LZ4) $< -o $@ $(LIBS_LZ4)
 
 compass_search_w_iaa.run: compass_search_w_iaa.cpp
@@ -72,6 +75,6 @@ acorn_search.run: acorn_search.cpp
 	$(CXX) $(CXXFLAGS) $(INCLUDES_ACORN) $< -o $@ $(LIBS_ACORN)
 
 clean:
-	rm -f hnswlib_filter_search.run compass_search_w_lz4.run compass_search_w_iaa.run compass_search_w_iaa_async.run compass_search_w_iaa_async_grouping.run compass_search_w_iaa_async_range_filter.run compass_search_w_iaa_async_multiple_em.run acorn_search.run
+	rm -f hnswlib_filter_search.run compass_search_w_lz4.run compass_search_w_lz4_grouping.run compass_search_w_iaa.run compass_search_w_iaa_async.run compass_search_w_iaa_async_grouping.run compass_search_w_iaa_async_range_filter.run compass_search_w_iaa_async_multiple_em.run acorn_search.run
 
 .PHONY: all clean

@@ -273,6 +273,7 @@ fi
 
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
 LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4.run"
+LZ4_GROUPING_RUN="$SCRIPT_DIR/compass_search_w_lz4_grouping.run"
 IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa_async.run"
 IAA_GROUPING_RUN="$SCRIPT_DIR/compass_search_w_iaa_async_grouping.run"
 ACORN_RUN="$SCRIPT_DIR/acorn_search.run"
@@ -351,6 +352,7 @@ fi
 
 ensure_executable_file "$HNSW_RUN" "hnswlib_filter_search.run is missing or not executable"
 ensure_executable_file "$LZ4_RUN" "compass_search_w_lz4.run is missing or not executable"
+ensure_executable_file "$LZ4_GROUPING_RUN" "compass_search_w_lz4_grouping.run is missing or not executable"
 ensure_executable_file "$IAA_RUN" "compass_search_w_iaa_async.run is missing or not executable"
 ensure_executable_file "$IAA_GROUPING_RUN" "compass_search_w_iaa_async_grouping.run is missing or not executable"
 ensure_executable_file "$ACORN_RUN" "acorn_search.run is missing or not executable"
@@ -607,6 +609,26 @@ run_single() {
         cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
       fi
       ;;
+    compass_lz4_grouping)
+      cmd=(
+        "$LZ4_GROUPING_RUN"
+        --dataset-type "$LZ4_DATASET_TYPE"
+        --graph "$GRAPH_PATH"
+        --query "$QUERY_PATH"
+        --k "$K"
+        --ef "$ef"
+        --filter "$filter_expr"
+        --fidtb-manifest "$manifest_path"
+        --num-queries "$NUM_QUERIES"
+        --summary-out "$summary_path"
+      )
+      if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES")
+      fi
+      if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
+      fi
+      ;;
     compass_iaa)
       cmd=(
         "$IAA_RUN"
@@ -739,6 +761,7 @@ run_selectivity() {
     # "in_search_filter_hnsw"
     # "acorn"
     # "compass_lz4"
+    "compass_lz4_grouping"
     "compass_iaa"
     "compass_iaa_grouping"
   )
