@@ -1,0 +1,684 @@
+
+=== /home/jykang5/compass/temp/hnm_payloads.jsonl ===
+Total records: 105100
+- colour_group_code: unique_count=50
+    value=31 count=1508
+    value=51 count=5776
+    value=52 count=2055
+    value=73 count=12129
+    value=71 count=3004
+    value=9 count=22565
+    value=12 count=3341
+    value=43 count=2335
+    value=19 count=2761
+    value=13 count=2708
+    value=8 count=2727
+    value=72 count=3304
+    value=7 count=4476
+    value=10 count=9501
+    value=50 count=741
+    value=5 count=1359
+    value=53 count=815
+    value=3 count=696
+    value=6 count=2097
+    value=11 count=2722
+    ... (30 more values)
+- colour_group_name: unique_count=50
+    value='Light Orange' count=1508
+    value='Light Pink' count=5776
+    value='Pink' count=2055
+    value='Dark Blue' count=12129
+    value='Light Blue' count=3004
+    value='Black' count=22565
+    value='Light Beige' count=3341
+    value='Dark Red' count=2335
+    value='Greenish Khaki' count=2761
+    value='Beige' count=2708
+    value='Dark Grey' count=2727
+    value='Blue' count=3304
+    value='Grey' count=4476
+    value='White' count=9501
+    value='Other Pink' count=741
+    value='Gold' count=1359
+    value='Dark Pink' count=815
+    value='Silver' count=696
+    value='Light Grey' count=2097
+    value='Off White' count=2722
+    ... (30 more values)
+- department_name: unique_count=250
+    value='Divided Shoes' count=261
+    value='Projects Dresses' count=553
+    value='Basic 1' count=1333
+    value='Young Boy Jersey Basic' count=461
+    value='Everyday Waredrobe Denim' count=80
+    value='Kids Boy Jersey Basic' count=671
+    value='Men Sport Woven' count=300
+    value='Shopbasket Socks' count=210
+    value='Small Accessories' count=844
+    value='EQ & Special Collections' count=34
+    value='Shirt' count=1153
+    value='Gloves/Hats' count=352
+    value='Projects Jersey & Knitwear' count=387
+    value='Denim trousers' count=397
+    value='Socks' count=214
+    value='UW' count=290
+    value='Baby basics' count=1144
+    value='Men Sport Bottoms' count=200
+    value='Kids Girl Jersey Basic' count=1096
+    value='Denim Trousers' count=503
+    ... (230 more values)
+- department_no: unique_count=299
+    value=3929 count=261
+    value=1343 count=553
+    value=1643 count=1333
+    value=8768 count=461
+    value=1779 count=80
+    value=7668 count=671
+    value=8559 count=300
+    value=3611 count=210
+    value=9986 count=500
+    value=3439 count=25
+    value=5731 count=243
+    value=3519 count=352
+    value=1644 count=387
+    value=5672 count=397
+    value=3610 count=214
+    value=3937 count=290
+    value=6515 count=1144
+    value=8394 count=200
+    value=7920 count=1096
+    value=1772 count=503
+    ... (279 more values)
+- detail_desc: unique_count=43293
+    value='Ankle boots with lacing at the front, a loop at the back, fabric linings, imitation leather insoles and chunky rubber soles. Platform front 2 cm, heel 4.5 cm.' count=2
+    value='Playsuit in woven fabric with decorative lace trims, a wrapover front with a concealed press-stud, narrow adjustable shoulder straps that cross at the back and an elasticated waist. Smocking at the back, side pockets and short legs. Lined at the top.' count=2
+    value='Cropped top in soft, ribbed jersey with a V-neck, straight cut at the back and narrow shoulder straps.' count=12
+    value='V-neck T-shirts in organic cotton jersey.' count=12
+    value='5-pocket, calf-length jeans in washed denim with a high waist and straight legs with raw-edge, frayed hems.' count=4
+    value='Long-sleeved top in organic cotton jersey with a ribbed neckline and a chest pocket.' count=6
+    value='Sports trousers in sweatshirt fabric with elastication and a concealed drawstring at the waist. Zipped side pockets, a mesh section at the crotch and wide ribbing at the hems.' count=7
+    value='Fine-knit socks in soft chenille with elasticated tops.' count=4
+    value='Narrow metal bracelet. Width 0.5 cm.' count=4
+    value='Scarf in a soft cashmere knit. Size 60x180 cm.' count=5
+    value='Top in soft, organic cotton jersey with long raglan sleeves in a contrasting colour.' count=21
+    value='Shirt in premium cotton with a narrow turn-down collar and French front. Long sleeves, narrow cuffs with adjustable buttoning, a yoke at the back and a rounded hem. Slim fit with narrow shoulders and a tapered waist for a fitted silhouette.' count=11
+    value='Hat knitted in soft cashmere with a roll edge.' count=13
+    value='Vest top in crêped jersey with raw, scalloped edges.' count=1
+    value='5-pocket, low-rise jeans in washed stretch denim with slim legs. The jeans are made partly from recycled cotton.' count=5
+    value='Socks in a fine knit containing glittery threads.' count=3
+    value='Knee-socks in a fine-knit cotton blend.' count=2
+    value='Sports jacket in sturdy jersey with a mesh-lined hood, zip down the front and mesh panels at the back, sides and cuffs. Zipped pocket on one sleeve. Unlined. Size of sleeve pocket 12x16 cm.' count=1
+    value='Knee socks in a soft knit with elastication at the top. One pair in a textured knit and one pair in a smooth knit.' count=2
+    value='Joggers in soft sweatshirt fabric made from organic cotton with an elasticated waist and ribbed hems. Soft brushed inside.' count=7
+    ... (43273 more values)
+- garment_group_name: unique_count=21
+    value='Shoes' count=5021
+    value='Dresses Ladies' count=4872
+    value='Jersey Basic' count=8087
+    value='Trousers Denim' count=3096
+    value='Jersey Fancy' count=21415
+    value='Socks and Tights' count=2258
+    value='Accessories' count=11365
+    value='Shirts' count=2116
+    value='Under-, Nightwear' count=7412
+    value='Shorts' count=1555
+    value='Knitwear' count=7480
+    value='Outdoor' count=4501
+    value='Unknown' count=3870
+    value='Blouses' count=5830
+    value='Woven/Jersey/Knitted mix Baby' count=1962
+    value='Swimwear' count=2786
+    value='Trousers' count=6718
+    value='Dresses/Skirts girls' count=1540
+    value='Dressed' count=906
+    value='Special Offers' count=1061
+    ... (1 more values)
+- garment_group_no: unique_count=21
+    value=1020 count=5021
+    value=1013 count=4872
+    value=1002 count=8087
+    value=1016 count=3096
+    value=1005 count=21415
+    value=1021 count=2258
+    value=1019 count=11365
+    value=1011 count=2116
+    value=1017 count=7412
+    value=1025 count=1555
+    value=1003 count=7480
+    value=1007 count=4501
+    value=1001 count=3870
+    value=1010 count=5830
+    value=1006 count=1962
+    value=1018 count=2786
+    value=1009 count=6718
+    value=1014 count=1540
+    value=1008 count=906
+    value=1023 count=1061
+    ... (1 more values)
+- graphical_appearance_name: unique_count=30
+    value='Solid' count=49450
+    value='All over pattern' count=17128
+    value='Denim' count=4835
+    value='Colour blocking' count=1820
+    value='Application/3D' count=1337
+    value='Metallic' count=337
+    value='Melange' count=5918
+    value='Glittering/Metallic' count=954
+    value='Contrast' count=376
+    value='Stripe' count=4980
+    value='Treatment' count=583
+    value='Other structure' count=1501
+    value='Other pattern' count=510
+    value='Front print' count=3210
+    value='Lace' count=1511
+    value='Check' count=2176
+    value='Dot' count=680
+    value='Unknown' count=51
+    value='Neps' count=66
+    value='Embroidery' count=1163
+    ... (10 more values)
+- graphical_appearance_no: unique_count=30
+    value=1010016 count=49450
+    value=1010001 count=17128
+    value=1010023 count=4835
+    value=1010005 count=1820
+    value=1010002 count=1337
+    value=1010011 count=337
+    value=1010010 count=5918
+    value=1010009 count=954
+    value=1010020 count=376
+    value=1010017 count=4980
+    value=1010018 count=583
+    value=1010026 count=1501
+    value=1010013 count=510
+    value=1010008 count=3210
+    value=1010021 count=1511
+    value=1010004 count=2176
+    value=1010006 count=680
+    value=-1 count=51
+    value=1010027 count=66
+    value=1010007 count=1163
+    ... (10 more values)
+- index_code: unique_count=10
+    value='D' count=15084
+    value='I' count=9201
+    value='A' count=25951
+    value='H' count=11994
+    value='S' count=3381
+    value='B' count=6752
+    value='F' count=12504
+    value='C' count=6849
+    value='G' count=8846
+    value='J' count=4538
+- index_group_name: unique_count=5
+    value='Divided' count=15084
+    value='Baby/Children' count=34579
+    value='Ladieswear' count=39552
+    value='Sport' count=3381
+    value='Menswear' count=12504
+- index_group_no: unique_count=5
+    value=2 count=15084
+    value=4 count=34579
+    value=1 count=39552
+    value=26 count=3381
+    value=3 count=12504
+- index_name: unique_count=10
+    value='Divided' count=15084
+    value='Children Sizes 134-170' count=9201
+    value='Ladieswear' count=25951
+    value='Children Sizes 92-140' count=11994
+    value='Sport' count=3381
+    value='Lingeries/Tights' count=6752
+    value='Menswear' count=12504
+    value='Ladies Accessories' count=6849
+    value='Baby Sizes 50-98' count=8846
+    value='Children Accessories, Swimwear' count=4538
+- perceived_colour_master_id: unique_count=20
+    value=3 count=2713
+    value=4 count=9347
+    value=2 count=18414
+    value=5 count=22479
+    value=11 count=5635
+    value=18 count=5858
+    value=20 count=3175
+    value=1 count=1221
+    value=9 count=12618
+    value=12 count=8903
+    value=7 count=1823
+    value=15 count=2146
+    value=19 count=3509
+    value=6 count=1093
+    value=-1 count=685
+    value=8 count=3113
+    value=13 count=2256
+    value=14 count=104
+    value=10 count=5
+    value=16 count=3
+- perceived_colour_master_name: unique_count=20
+    value='Orange' count=2713
+    value='Pink' count=9347
+    value='Blue' count=18414
+    value='Black' count=22479
+    value='Beige' count=5635
+    value='Red' count=5858
+    value='Khaki green' count=3175
+    value='Mole' count=1221
+    value='White' count=12618
+    value='Grey' count=8903
+    value='Turquoise' count=1823
+    value='Metal' count=2146
+    value='Green' count=3509
+    value='Lilac Purple' count=1093
+    value='Unknown' count=685
+    value='Yellow' count=3113
+    value='Brown' count=2256
+    value='undefined' count=104
+    value='Yellowish Green' count=5
+    value='Bluish Green' count=3
+- perceived_colour_value_id: unique_count=8
+    value=1 count=22069
+    value=7 count=5686
+    value=4 count=42530
+    value=2 count=12601
+    value=3 count=15659
+    value=5 count=6423
+    value=-1 count=28
+    value=6 count=104
+- perceived_colour_value_name: unique_count=8
+    value='Dusty Light' count=22069
+    value='Medium' count=5686
+    value='Dark' count=42530
+    value='Medium Dusty' count=12601
+    value='Light' count=15659
+    value='Bright' count=6423
+    value='Unknown' count=28
+    value='Undefined' count=104
+- prod_name: unique_count=45728
+    value='CHRISTINA BOOT' count=1
+    value='Corinne jumpsuit' count=2
+    value='Goldie tank top' count=12
+    value='ELIAS basic V-neck BB 2-p' count=2
+    value='Culotte' count=4
+    value='OSCAR l/s tee SB' count=3
+    value='Montana pants' count=7
+    value='Fun Chenille 2p Lounge sock' count=3
+    value='Bracelet Bangle CO' count=3
+    value='Icona Premium scarf' count=5
+    value='JIMMY raglan tshirt BB' count=14
+    value='TD Roger eller TD Poplin 29 by' count=4
+    value='Icona premium beanie' count=4
+    value='Verona Tank' count=1
+    value='Slim 5pkt Midprice' count=16
+    value='Lurex 2p Sock' count=3
+    value='CHRISTINA BOOT (1)' count=1
+    value='KNEE HIGH SOCK' count=2
+    value='Butch hood' count=1
+    value='Tua 2p kneehigh' count=2
+    ... (45708 more values)
+- product_code: unique_count=47072
+    value=401729 count=2
+    value=406979 count=2
+    value=408875 count=12
+    value=403490 count=3
+    value=400296 count=4
+    value=402065 count=6
+    value=403844 count=7
+    value=408649 count=3
+    value=408884 count=4
+    value=402382 count=5
+    value=405636 count=21
+    value=408104 count=8
+    value=402389 count=4
+    value=409683 count=1
+    value=400342 count=5
+    value=408569 count=3
+    value=400901 count=2
+    value=404383 count=1
+    value=408571 count=2
+    value=404864 count=7
+    ... (47052 more values)
+- product_group_name: unique_count=19
+    value='Shoes' count=5156
+    value='Garment Full body' count=13276
+    value='Garment Upper body' count=42680
+    value='Garment Lower body' count=19770
+    value='Socks & Tights' count=2431
+    value='Accessories' count=11005
+    value='Underwear' count=5462
+    value='Swimwear' count=3125
+    value='Nightwear' count=1898
+    value='Unknown' count=121
+    value='Cosmetic' count=48
+    value='Fun' count=2
+    value='Garment and Shoe care' count=9
+    value='Underwear/nightwear' count=54
+    value='Bags' count=25
+    value='Items' count=17
+    value='Furniture' count=13
+    value='Interior textile' count=3
+    value='Stationery' count=5
+- product_type_name: unique_count=131
+    value='Boots' count=1028
+    value='Dress' count=10348
+    value='Vest top' count=2979
+    value='T-shirt' count=7880
+    value='Trousers' count=11150
+    value='Socks' count=1880
+    value='Bracelet' count=172
+    value='Scarf' count=1013
+    value='Top' count=4152
+    value='Shirt' count=3403
+    value='Hat/beanie' count=1343
+    value='Hoodie' count=2356
+    value='Jacket' count=3940
+    value='Sweater' count=9295
+    value='Sunglasses' count=575
+    value='Shorts' count=3926
+    value='Earring' count=1154
+    value='Cardigan' count=1546
+    value='Other accessories' count=1017
+    value='Bag' count=1273
+    ... (111 more values)
+- product_type_no: unique_count=132
+    value=87 count=1028
+    value=265 count=10348
+    value=253 count=2979
+    value=255 count=7880
+    value=272 count=11150
+    value=302 count=1880
+    value=68 count=172
+    value=80 count=1013
+    value=254 count=4152
+    value=259 count=3403
+    value=75 count=1343
+    value=308 count=2356
+    value=262 count=3940
+    value=252 count=9295
+    value=81 count=575
+    value=274 count=3926
+    value=70 count=1154
+    value=245 count=1546
+    value=78 count=1017
+    value=66 count=1273
+    ... (112 more values)
+- section_name: unique_count=56
+    value='Divided Accessories' count=1692
+    value='Divided Projects' count=2362
+    value='Divided Basics' count=1714
+    value='Boys Underwear & Basics' count=2028
+    value='Ladies Denim' count=1100
+    value='Men H&M Sport' count=871
+    value='Womens Nightwear, Socks & Tigh' count=1560
+    value='Men Accessories' count=1321
+    value='Womens Big accessories' count=1655
+    value='Men Suits & Tailoring' count=1426
+    value='Denim Men' count=520
+    value='Baby Essentials & Complements' count=4916
+    value='Girls Underwear & Basics' count=3483
+    value='Divided Collection' count=7115
+    value='Womens Small accessories' count=3208
+    value='Contemporary Casual' count=1554
+    value='H&M+' count=2333
+    value='Divided Selected' count=987
+    value='Mens Outerwear' count=629
+    value='Men Other 2' count=190
+    ... (36 more values)
+- section_no: unique_count=57
+    value=52 count=1692
+    value=50 count=2362
+    value=51 count=1714
+    value=72 count=2028
+    value=57 count=1100
+    value=22 count=871
+    value=62 count=1560
+    value=25 count=1321
+    value=65 count=1655
+    value=23 count=1426
+    value=56 count=520
+    value=44 count=4916
+    value=79 count=3483
+    value=53 count=7115
+    value=66 count=3208
+    value=21 count=1554
+    value=2 count=2333
+    value=58 count=987
+    value=31 count=629
+    value=30 count=190
+    ... (37 more values)
+
+=== /home/jykang5/compass/temp/laion_payloads.jsonl ===
+Total records: 100000
+- LICENSE: unique_count=75
+    value='?' count=98287
+    value='' count=1442
+    value=0 count=109
+    value='http://creativecommons.org/licenses/by-sa/3.0/' count=55
+    value='180' count=3
+    value='400' count=1
+    value='http://creativecommons.org/licenses/by-nc-nd/4.0/' count=2
+    value='https://creativecommons.org/licenses/by/2.0/' count=4
+    value='http://creativecommons.org/licenses/by-nc-nd/3.0/' count=2
+    value='https://creativecommons.org/licenses/publicdomain/' count=8
+    value='//creativecommons.org/licenses/by-nc-nd/3.0/us/' count=1
+    value='320' count=1
+    value='https://creativecommons.org/licenses/by/4.0/' count=3
+    value='http://creativecommons.org/licenses/by-sa/2.0/' count=2
+    value='300' count=1
+    value='185' count=1
+    value='https://creativecommons.org/licenses/by-sa/2.0/' count=2
+    value='http://creativecommons.org/licenses/by/4.0/' count=2
+    value='https://creativecommons.org/licenses/by/4.0/?ref=chooser-v1' count=1
+    value='https://creativecommons.org/licenses/by-nc-sa/4.0/' count=2
+    ... (55 more values)
+- NSFW: unique_count=10
+    value='UNLIKELY' count=92915
+    value='UNSURE' count=5110
+    value='NSFW' count=1823
+    value=0 count=116
+    value='False' count=26
+    value='True' count=5
+    value='?' count=2
+    value='e1aa71181ee4214c49c00ba312ebc117' count=1
+    value='-' count=1
+    value='d5379b60a6544b14f7737a7764438b45' count=1
+- caption: unique_count=99789
+    value='2 bed Terraced property to rent in Crofts Lane, Ross-on-Wye' count=1
+    value="Teleflora's Simply Sweet in Cleveland TN, Jimmie's Flowers" count=1
+    value='Happy little girl  on the meadow - Stock fotografie' count=1
+    value='Purple Forest...' count=1
+    value='Seamless metal background vector' count=1
+    value='Bettie Page Film Director Interview' count=1
+    value='Love Your God with All Your Mind (MP3): The Role of Reason in the Life of the Soul' count=1
+    value='Officers are trying to reunite the animal with its owners.' count=1
+    value='"""Shh..I am Sleeping"" Living Life Door Hanger"' count=1
+    value='Custom Engraved Beech Fly Box (choice of river)' count=1
+    value='T-shirt Skullactic Wave  - Charcoal' count=1
+    value='Juices & Smoothies Galore 2008' count=1
+    value='Vanity Lights Or Bathroom : Master Bath- Kichler Lighting 4-Light Bayley Olde Bronze Bathroom Vanity Light at Lowes.com ...' count=1
+    value='24 Pcs Reusable Eyebrow Stencil Set DIY Eye Brow D' count=1
+    value='kitchen best color for kitchen cabinets kitchen colour scheme' count=1
+    value='Large White Pearl Set (8-8.5 mm)' count=1
+    value='Bastille - Of the Night - Barn on the Farm 2012' count=1
+    value='Fire Emblem The Sacred Stones  GBA Game Boy Advance SP Nintendo DS EURO VERSION' count=1
+    value="Lauren Alaina joined Macy's Thanksgiving Day Parade wearing a chic leopard-print coat." count=1
+    value='DR Strings Tite-Fit LT7-9 Lite 7-String Nickel Plated Electric Guitar Strings (LT7-9-105248)' count=1
+    ... (99769 more values)
+- error_message: unique_count=1
+    value=0 count=100000
+- exif: unique_count=8573
+    value='{}' count=86353
+    value='{"Image Software": "Google"}' count=383
+    value='{"Image Orientation": "Horizontal (normal)", "Image XResolution": "150", "Image YResolution": "150", "Image ResolutionUnit": "Pixels/Inch", "Image Software": "Adobe Photoshop 7.0", "Image DateTime": "2005:12:30 16:33:11", "Image ExifOffset": "156", "Thumbnail Compression": "JPEG (old-style)", "Thumbnail XResolution": "72", "Thumbnail YResolution": "72", "Thumbnail ResolutionUnit": "Pixels/Inch", "Thumbnail JPEGInterchangeFormat": "294", "Thumbnail JPEGInterchangeFormatLength": "4374", "EXIF ColorSpace": "Uncalibrated", "EXIF ExifImageWidth": "456", "EXIF ExifImageLength": "648"}' count=1
+    value='{"Image Orientation": "Horizontal (normal)", "Image XResolution": "600", "Image YResolution": "600", "Image ResolutionUnit": "Pixels/Inch", "Image Software": "Adobe Photoshop CS3 Windows", "Image DateTime": "2009:08:26 21:08:18", "Image ExifOffset": "164", "Thumbnail Compression": "JPEG (old-style)", "Thumbnail XResolution": "72", "Thumbnail YResolution": "72", "Thumbnail ResolutionUnit": "Pixels/Inch", "Thumbnail JPEGInterchangeFormat": "302", "Thumbnail JPEGInterchangeFormatLength": "7733", "EXIF ColorSpace": "sRGB", "EXIF ExifImageWidth": "490", "EXIF ExifImageLength": "298"}' count=1
+    value='{"Image Software": "Google", "Image ExifOffset": "46", "EXIF ExifVersion": "0220"}' count=33
+    value='{"Image XResolution": "240", "Image YResolution": "240", "Image ResolutionUnit": "Pixels/Inch", "Image YCbCrPositioning": "Centered", "Image Copyright": "(c) Javarman | Dreamstime.com", "Image XPTitle": "[104, 0, 116, 0, 116, 0, 112, 0, 58, 0, 47, 0, 47, 0, 119, 0, 119, 0, 119, 0, ... ]"}' count=1
+    value='{"Image Orientation": "Horizontal (normal)", "Image XResolution": "96", "Image YResolution": "96", "Image ResolutionUnit": "Pixels/Inch", "Image YCbCrPositioning": "Centered", "Image ExifOffset": "102", "EXIF ExifVersion": "0210", "EXIF ComponentsConfiguration": "YCbCr", "EXIF FlashPixVersion": "0100", "EXIF ColorSpace": "Uncalibrated", "EXIF ExifImageWidth": "645", "EXIF ExifImageLength": "430"}' count=6
+    value='{"Image Orientation": "Horizontal (normal)", "Image XResolution": "300", "Image YResolution": "300", "Image ResolutionUnit": "Pixels/Inch", "Image Software": "Adobe Photoshop CS6 (Windows)", "Image DateTime": "2019:01:28 12:41:48", "Image ExifOffset": "164", "Thumbnail Compression": "JPEG (old-style)", "Thumbnail XResolution": "72", "Thumbnail YResolution": "72", "Thumbnail ResolutionUnit": "Pixels/Inch", "Thumbnail JPEGInterchangeFormat": "302", "Thumbnail JPEGInterchangeFormatLength": "9709", "EXIF ColorSpace": "sRGB", "EXIF ExifImageWidth": "817", "EXIF ExifImageLength": "428"}' count=1
+    value='{"Image Copyright": ""}' count=78
+    value='{"Image Software": "Picasa", "Image Artist": "Picasa"}' count=2
+    value='{"Image Tag 0x5110": "1", "Image Tag 0x5111": "0", "Image Tag 0x5112": "0"}' count=311
+    value='{"Image XResolution": "300", "Image YResolution": "300", "Image ResolutionUnit": "Pixels/Inch", "Image YCbCrPositioning": "Centered"}' count=427
+    value='{"Image Software": "Adobe Photoshop CC 2015 (Macintosh)"}' count=1
+    value='{"Image XResolution": "300", "Image YResolution": "300", "Image ResolutionUnit": "Pixels/Inch", "Image YCbCrPositioning": "Centered", "Image Copyright": "(c) Dreamstock | Dreamstime.com", "Image XPTitle": "[104, 0, 116, 0, 116, 0, 112, 0, 58, 0, 47, 0, 47, 0, 119, 0, 119, 0, 119, 0, ... ]"}' count=1
+    value='{"Image Orientation": "Horizontal (normal)", "Image XResolution": "72", "Image YResolution": "72", "Image ResolutionUnit": "Pixels/Inch", "Image Software": "Adobe Photoshop CS6 (Windows)", "Image DateTime": "2015:11:08 15:15:41", "Image ExifOffset": "164", "Thumbnail Compression": "JPEG (old-style)", "Thumbnail XResolution": "72", "Thumbnail YResolution": "72", "Thumbnail ResolutionUnit": "Pixels/Inch", "Thumbnail JPEGInterchangeFormat": "302", "Thumbnail JPEGInterchangeFormatLength": "10194", "EXIF ColorSpace": "Uncalibrated", "EXIF ExifImageWidth": "380", "EXIF ExifImageLength": "400"}' count=1
+    value='{"Image Orientation": "Horizontal (normal)", "Image Software": "Google", "Image YCbCrSubSampling": "[2, 2]", "Image ExifOffset": "70", "EXIF ExifVersion": "0220", "EXIF ExifImageWidth": "1305", "EXIF ExifImageLength": "500"}' count=1
+    value='{"Image Make": "NIKON CORPORATION", "Image Model": "NIKON D300", "Image DateTime": "2011:04:15 16:54:25", "Image ExifOffset": "112", "EXIF ExposureTime": "1/800", "EXIF FNumber": "10", "EXIF ExposureProgram": "Manual", "EXIF ISOSpeedRatings": "400", "EXIF DateTimeOriginal": "2011:04:14 15:17:16", "EXIF DateTimeDigitized": "2011:04:14 15:17:16", "EXIF ExposureBiasValue": "0", "EXIF MaxApertureValue": "3", "EXIF MeteringMode": "CenterWeightedAverage", "EXIF LightSource": "Fine weather", "EXIF Flash": "Flash did not fire", "EXIF FocalLength": "165", "EXIF ColorSpace": "sRGB", "EXIF ExposureMode": "Manual Exposure", "EXIF WhiteBalance": "Manual", "EXIF SceneCaptureType": "Standard"}' count=1
+    value='{"Image ExifOffset": "26"}' count=341
+    value='{"Image ExifOffset": "22"}' count=1587
+    value='{"Image Orientation": "Horizontal (normal)", "Image XResolution": "72", "Image YResolution": "72", "Image ResolutionUnit": "Pixels/Inch", "Image YCbCrPositioning": "Centered", "Image ExifOffset": "102", "EXIF ExifVersion": "0210", "EXIF ComponentsConfiguration": "YCbCr", "EXIF FlashPixVersion": "0100", "EXIF ColorSpace": "Uncalibrated", "EXIF ExifImageWidth": "257", "EXIF ExifImageLength": "196"}' count=1
+    ... (8553 more values)
+- height: unique_count=1
+    value=256 count=100000
+- image_path: unique_count=10000
+    value='000000033' count=15
+    value='000000044' count=16
+    value='000000052' count=15
+    value='000000015' count=16
+    value='000000043' count=15
+    value='000000010' count=16
+    value='000000084' count=16
+    value='000000049' count=16
+    value='000000034' count=16
+    value='000000005' count=16
+    value='000000036' count=16
+    value='000000073' count=15
+    value='000000095' count=16
+    value='000000074' count=16
+    value='000000060' count=16
+    value='000000002' count=16
+    value='000000141' count=16
+    value='000000109' count=16
+    value='000000000' count=16
+    value='000000024' count=16
+    ... (9980 more values)
+- key: unique_count=10000
+    value=33 count=15
+    value=44 count=16
+    value=52 count=15
+    value=15 count=16
+    value=43 count=15
+    value=10 count=16
+    value=84 count=16
+    value=49 count=16
+    value=34 count=16
+    value=5 count=16
+    value=36 count=16
+    value=73 count=15
+    value=95 count=16
+    value=74 count=16
+    value=60 count=16
+    value=2 count=16
+    value=141 count=16
+    value=109 count=16
+    value=0 count=16
+    value=24 count=16
+    ... (9980 more values)
+- original_height: unique_count=1848
+    value=143 count=142
+    value=300 count=4655
+    value=110 count=975
+    value=351 count=70
+    value=250 count=2240
+    value=270 count=727
+    value=132 count=83
+    value=174 count=71
+    value=166 count=134
+    value=320 count=1057
+    value=306 count=49
+    value=736 count=39
+    value=220 count=1188
+    value=194 count=202
+    value=600 count=2104
+    value=360 count=1506
+    value=225 count=1709
+    value=264 count=283
+    value=161 count=54
+    value=436 count=34
+    ... (1828 more values)
+- original_width: unique_count=1674
+    value=191 count=75
+    value=274 count=59
+    value=110 count=994
+    value=236 count=1123
+    value=238 count=426
+    value=180 count=1467
+    value=99 count=67
+    value=311 count=43
+    value=166 count=94
+    value=270 count=463
+    value=240 count=1787
+    value=260 count=478
+    value=736 count=206
+    value=220 count=1757
+    value=259 count=163
+    value=600 count=2693
+    value=480 count=2105
+    value=225 count=1481
+    value=250 count=2069
+    value=338 count=115
+    ... (1654 more values)
+- shard_id: unique_count=16
+    value=19848 count=9785
+    value=19849 count=9799
+    value=19850 count=9836
+    value=19851 count=9835
+    value=19852 count=9843
+    value=19853 count=9822
+    value=19854 count=9845
+    value=19855 count=9824
+    value=19640 count=3015
+    value=19641 count=3001
+    value=19642 count=2964
+    value=19643 count=2613
+    value=19644 count=2445
+    value=19645 count=2466
+    value=19646 count=2443
+    value=19647 count=2464
+- similarity: unique_count=97798
+    value=0.3332441747 count=1
+    value=0.3014149666 count=1
+    value=0.3320641518 count=1
+    value=0.3704208136 count=1
+    value=0.3683409691 count=1
+    value=0.3516582251 count=1
+    value=0.3378410041 count=1
+    value=0.3089698255 count=1
+    value=0.3200181425 count=1
+    value=0.3325041234 count=1
+    value=0.3096775413 count=1
+    value=0.3202753961 count=1
+    value=0.3334628344 count=1
+    value=0.3083612025 count=1
+    value=0.3357306421 count=1
+    value=0.3195315301 count=1
+    value=0.3158891499 count=1
+    value=0.307749182 count=1
+    value=0.3581180274 count=1
+    value=0.4805696607 count=1
+    ... (97778 more values)
+- status: unique_count=1
+    value='success' count=100000
+- url: unique_count=99984
+    value='http://media.rightmove.co.uk/dir/87k/86030/41964130/86030_4197229_IMG_00_0000_max_214x143.jpg' count=1
+    value='http://images.shopflowers.net/images/products/HW0_372712.jpg' count=1
+    value='http://static9.depositphotos.com/1040688/1124/i/110/depositphotos_11247113-Happy-little-girl--on-the-meadow.jpg' count=1
+    value='https://i.pinimg.com/236x/86/ef/2a/86ef2aa1e8cf26980d3708b103ff466c--all-things-purple-purple-stuff.jpg' count=1
+    value='https://cdn.vectorstock.com/i/thumb-large/56/15/seamless-metal-background-vector-945615.jpg' count=1
+    value='http://3.bp.blogspot.com/-BUOJyc50tZ0/UoZ_ACPOOSI/AAAAAAAAMhE/oWfdm-1deUc/s270/BPRA%2BPrinterPoster.jpg' count=1
+    value='http://images.contentreserve.com/ImageType-200/1181-1/%7B1B087B3E-67F4-4A2E-B6B2-2AEC7B082559%7DImg200.jpg' count=1
+    value='http://news.images.itv.com/image/file/1128248/article_update_img.jpg' count=1
+    value='http://img4.wfrcdn.com/lf/45/hash/17579/5646321/1/%22Shh..I+am+Sleeping%22+Living+Life+Door+Hanger.jpg' count=1
+    value='https://cdn.shopify.com/s/files/1/0387/8601/products/Upper_Madison_grande_5dda2e0f-4ff2-4bda-a0d8-7c453c900c9c_300x.jpg?v=1535398265' count=1
+    value='https://cdn.shopify.com/s/files/1/0118/1597/7019/products/B3531852_CHR_F_240x.jpg?v=1540836577' count=1
+    value='http://img1.imagesbn.com/p/9781846012822_p0_v1_s260x420.JPG' count=1
+    value='https://i.pinimg.com/736x/61/f6/ab/61f6ab8053dac22d6c1c2b4226151d29.jpg' count=1
+    value='https://ae01.alicdn.com/kf/Hebff8674bec049d3bf373cd5529bdd89Y/24-Pcs-Reusable-Eyebrow-Stencil-Set-DIY-Eye-Brow-Drawing-Guide-Styling-Shaping-Makeup-Template-Card.jpg_220x220xz.jpg' count=1
+    value='http://t0.gstatic.com/images?q=tbn:ANd9GcSvy98RsBQimjSS3y2nBtPBHSUE3P1HZfq_zqb-us-37E01RD6kRQ' count=1
+    value='http://ak1.ostkcdn.com/images/products/11167374/2-Piece-Large-White-Pearl-Set-3cdee3f6-1b63-4be9-b085-d8992cf3ca90_600.jpg' count=1
+    value='http://i3.ytimg.com/vi/iIDuv0YvbAg/0.jpg' count=1
+    value='https://i.ebayimg.com/thumbs/images/g/RGkAAOSwNDZbRG4i/s-l225.jpg' count=1
+    value='https://www1.pictures.stylebistro.com/gi/91st+Annual+Macy+Thanksgiving+Day+Parade+QQeQvazkkbpp.jpg' count=1
+    value='http://media.musicarts.com/is/image/MMGS7/DR-Strings-Tite-Fit-LT7-9-Lite-7-String-Nickel-Plated-Electric-Guitar-Strings-Standard/105248000000000-00-250x250.jpg' count=1
+    ... (99964 more values)
+- width: unique_count=1
+    value=256 count=100000
