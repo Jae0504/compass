@@ -45,6 +45,8 @@ Advanced overrides:
   --acorn-index-1pct <path>
   --acorn-index-10pct <path>
   --payload-jsonl <path>
+  --iaa-config-dir <path>
+  --iaa-device-owner <user>
   --fid-block-size-bytes <int>
   --tb-block-size-bytes <int>
 
@@ -119,8 +121,12 @@ MANIFEST_10PCT=""
 ACORN_INDEX_1PCT=""
 ACORN_INDEX_10PCT=""
 PAYLOAD_JSONL=""
+IAA_CONFIG_DIR="/home/jykang5/compass/scripts/iaa"
+IAA_DEVICE_OWNER="jykang5"
 FID_BLOCK_SIZE_BYTES="$((1024*128))"
 TB_BLOCK_SIZE_BYTES="$((1024*1024))"
+CURRENT_IAA_ENGINE_PROFILE=""
+SUDO_KEEPALIVE_PID=""
 
 # Build flags used by this script when --build is enabled.
 # Default: disable AVX/AVX512.
@@ -231,6 +237,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --payload-jsonl)
       PAYLOAD_JSONL="$2"
+      shift 2
+      ;;
+    --iaa-config-dir)
+      IAA_CONFIG_DIR="$2"
+      shift 2
+      ;;
+    --iaa-device-owner)
+      IAA_DEVICE_OWNER="$2"
       shift 2
       ;;
     --fid-block-size-bytes)
@@ -377,6 +391,57 @@ ensure_readable_file "$ACORN_INDEX_10PCT" "ACORN 10% index file not found"
 if [[ "$HNSW_DATASET_TYPE" != "sift" ]]; then
   ensure_readable_file "$PAYLOAD_JSONL" "payload JSONL is required for non-sift hnsw baseline"
 fi
+for iaa_engines in 1 2 4 8; do
+  ensure_readable_file \
+    "$IAA_CONFIG_DIR/configure_iaa_user_${iaa_engines}.sh" \
+    "IAA config script not found for ${iaa_engines} engine(s)"
+done
+
+configure_iaa_profile() {
+  local engine_count="$1"
+  local cfg_script="$IAA_CONFIG_DIR/configure_iaa_user_${engine_count}.sh"
+  if [[ "$CURRENT_IAA_ENGINE_PROFILE" == "$engine_count" ]]; then
+    return
+  fi
+
+  echo "  [IAA] configure ${engine_count} engine(s): $cfg_script"
+  if ! sudo bash "$cfg_script"; then
+    echo "Error: failed to run IAA config script: $cfg_script" >&2
+    exit 1
+  fi
+  if ! sudo chown -R "$IAA_DEVICE_OWNER" /dev/iax; then
+    echo "Error: failed to change /dev/iax ownership to '$IAA_DEVICE_OWNER'" >&2
+    exit 1
+  fi
+
+  CURRENT_IAA_ENGINE_PROFILE="$engine_count"
+}
+
+start_sudo_keepalive() {
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    return
+  fi
+  # Prompt once at the beginning, then keep credentials fresh in the background.
+  sudo -v
+  (
+    while true; do
+      sudo -n true
+      sleep 50
+    done
+  ) >/dev/null 2>&1 &
+  SUDO_KEEPALIVE_PID=$!
+}
+
+stop_sudo_keepalive() {
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+    SUDO_KEEPALIVE_PID=""
+  fi
+}
+
+trap stop_sudo_keepalive EXIT
+
+start_sudo_keepalive
 
 parse_ef_list_into_array() {
   local ef_list="$1"
@@ -606,6 +671,16 @@ run_single() {
   fi
   local summary_path="$summary_dir/${summary_stem}.summary.txt"
   local log_path="$summary_dir/${summary_stem}.log"
+  local iaa_engine_profile=""
+  case "$method" in
+    compass_iaa_1) iaa_engine_profile="1" ;;
+    compass_iaa_2) iaa_engine_profile="2" ;;
+    compass_iaa_4) iaa_engine_profile="4" ;;
+    compass_iaa_8) iaa_engine_profile="8" ;;
+  esac
+  if [[ -n "$iaa_engine_profile" ]]; then
+    configure_iaa_profile "$iaa_engine_profile"
+  fi
 
   local -a cmd
   case "$method" in
@@ -669,7 +744,7 @@ run_single() {
         cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
       fi
       ;;
-    compass_iaa)
+    compass_iaa|compass_iaa_1|compass_iaa_2|compass_iaa_4|compass_iaa_8)
       cmd=(
         "$IAA_RUN"
         --dataset-type "$IAA_DATASET_TYPE"
@@ -782,16 +857,19 @@ run_selectivity() {
   local -n ef_values_ref="$ef_values_name"
 
   local methods=(
-    "post_filter_hnsw"
-    "in_search_filter_hnsw"
-    "acorn"
+    # "post_filter_hnsw"
+    # "in_search_filter_hnsw"
+    # "acorn"
     "compass_lz4"
-    "compass_iaa"
+    "compass_iaa_1"
+    "compass_iaa_2"
+    "compass_iaa_4"
+    "compass_iaa_8"
   )
 
-  for ef in "${ef_values_ref[@]}"; do
-    for method in "${methods[@]}"; do
-      if [[ "$method" == "post_filter_hnsw" ]]; then
+  for method in "${methods[@]}"; do
+    if [[ "$method" == "post_filter_hnsw" ]]; then
+      for ef in "${ef_values_ref[@]}"; do
         for postfilter_max_candidates in "${POSTFILTER_MAX_VALUES[@]}"; do
           run_single \
             "$method" \
@@ -804,18 +882,21 @@ run_selectivity() {
             "$filter_expr" \
             "$postfilter_max_candidates"
         done
-      else
-        run_single \
-          "$method" \
-          "$selectivity_pct" \
-          "$ef" \
-          "$manifest_path" \
-          "$metadata_csv" \
-          "$acorn_index_path" \
-          "$out_csv" \
-          "$filter_expr" \
-          "$POSTFILTER_MAX_CANDIDATES"
-      fi
+      done
+      continue
+    fi
+
+    for ef in "${ef_values_ref[@]}"; do
+      run_single \
+        "$method" \
+        "$selectivity_pct" \
+        "$ef" \
+        "$manifest_path" \
+        "$metadata_csv" \
+        "$acorn_index_path" \
+        "$out_csv" \
+        "$filter_expr" \
+        "$POSTFILTER_MAX_CANDIDATES"
     done
   done
 }
@@ -838,6 +919,8 @@ echo "  in_search_filter_hnsw postfilter-max-candidates: $POSTFILTER_MAX_CANDIDA
 echo "  num-queries: $NUM_QUERIES"
 echo "  filter (1%): $EFFECTIVE_FILTER_EXPR_1PCT"
 echo "  filter (10%): $EFFECTIVE_FILTER_EXPR_10PCT"
+echo "  iaa config dir: $IAA_CONFIG_DIR"
+echo "  iaa device owner: $IAA_DEVICE_OWNER"
 echo "  out-dir: $OUT_DIR"
 
 run_selectivity "1" "$MANIFEST_1PCT" "$META_1PCT" "$ACORN_INDEX_1PCT" "$RESULTS_1PCT" "$EFFECTIVE_FILTER_EXPR_1PCT" EF_VALUES_1PCT

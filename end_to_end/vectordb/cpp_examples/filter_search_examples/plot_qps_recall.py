@@ -13,6 +13,10 @@ METHOD_LABELS = {
     "acorn": "ACORN",
     "compass_lz4": "COMPASS-LZ4",
     "compass_iaa": "COMPASS-IAA",
+    "compass_iaa_1": "COMPASS-IAA_1",
+    "compass_iaa_2": "COMPASS-IAA_2",
+    "compass_iaa_4": "COMPASS-IAA_4",
+    "compass_iaa_8": "COMPASS-IAA_8",
 }
 
 METHOD_ORDER = [
@@ -20,6 +24,10 @@ METHOD_ORDER = [
     "in_search_filter_hnsw",
     "acorn",
     "compass_lz4",
+    "compass_iaa_1",
+    "compass_iaa_2",
+    "compass_iaa_4",
+    "compass_iaa_8",
     "compass_iaa",
 ]
 
@@ -29,6 +37,10 @@ METHOD_COLORS = {
     "acorn": "#2ca02c",
     "compass_lz4": "#ff7f0e",
     "compass_iaa": "#1f77b4",
+    "compass_iaa_1": "#9ecae1",
+    "compass_iaa_2": "#6baed6",
+    "compass_iaa_4": "#3182bd",
+    "compass_iaa_8": "#08519c",
 }
 
 METHOD_MARKERS = {
@@ -37,6 +49,10 @@ METHOD_MARKERS = {
     "acorn": "P",
     "compass_lz4": "o",
     "compass_iaa": "^",
+    "compass_iaa_1": "v",
+    "compass_iaa_2": ">",
+    "compass_iaa_4": "<",
+    "compass_iaa_8": "^",
 }
 
 
@@ -135,7 +151,6 @@ def make_plot(series, selectivities, output_path):
             legend_entries[method] = METHOD_LABELS.get(method, method)
 
         ax.set_title(f"Selectivity: {sel}%")
-        ax.set_xlabel("Recall")
         if idx == 0:
             ax.set_ylabel("QPS")
         ax.set_yscale("log")
@@ -160,7 +175,13 @@ def make_plot(series, selectivities, output_path):
     if handles:
         fig.legend(handles, labels, loc="upper center", ncol=min(4, len(labels)), frameon=False)
 
-    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    # Show a single global x-axis label centered under all subplots.
+    if hasattr(fig, "supxlabel"):
+        fig.supxlabel("Recall")
+    else:
+        fig.text(0.5, 0.02, "Recall", ha="center")
+
+    fig.tight_layout(rect=[0, 0.03, 1, 0.92])
 
     out_dir = os.path.dirname(output_path)
     if out_dir:
