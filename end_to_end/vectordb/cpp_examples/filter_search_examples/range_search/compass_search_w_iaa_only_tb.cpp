@@ -1,16 +1,18 @@
 #include "../../../hnswlib/filter_search_hnswlib/hnswlib.h"
-#include "../../../hnswlib/filter_search_hnswlib_with_lz4/compass_lz4_filter.h"
+#include "../../../hnswlib/filter_search_iaa/compass_iaa_filter.h"
 
 #include "../filter_expr.h"
 #include "../io_utils.h"
 
-#include <algorithm>
-#include <array>
-#include <bitset>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -32,8 +34,6 @@ using filter_search_io::MetadataTable;
 using filter_search_io::VecFileInfo;
 
 namespace {
-constexpr size_t kDefaultLz4FidBlockSizeBytes = 8192 * 8;
-constexpr size_t kDefaultLz4TbBlockSizeBytes = 8192 * 128;
 
 struct Args {
     std::string dataset_type;
@@ -48,10 +48,10 @@ struct Args {
     bool ef_explicit = false;
     bool break_factor_explicit = false;
     int num_queries = -1;
-    size_t fid_block_size_bytes = kDefaultLz4FidBlockSizeBytes;
-    size_t tb_block_size_bytes = kDefaultLz4TbBlockSizeBytes;
+    size_t fid_block_size_bytes = compass_iaa_filter::kDefaultFidBlockSizeBytes;
+    size_t tb_block_size_bytes = compass_iaa_filter::kDefaultTbBlockSizeBytes;
 
-    // Backward-compatible optional flags. Not used in the LZ4 FID/TB path.
+    // Backward-compatible optional flags. Not used in the IAA FID/TB path.
     std::string payload_jsonl;
     std::string metadata_csv;
     std::string id_column = "id";
@@ -74,13 +74,11 @@ struct QueryMetrics {
     uint64_t filter_time_ns = 0;
     uint64_t search_time_ns = 0;
 
-    uint64_t lz4_decompress_time_ns = 0;
+    uint64_t iaa_decompress_time_ns = 0;
     uint64_t fid_blocks_decompressed = 0;
     uint64_t tb_blocks_decompressed = 0;
     uint64_t fid_cache_hits = 0;
     uint64_t tb_cache_hits = 0;
-    uint64_t fid_tb_mismatch_count = 0;
-    uint64_t fid_tb_mismatch_log_capped = 0;
 };
 
 struct RunStats {
@@ -93,21 +91,21 @@ struct RunStats {
     uint64_t filter_time_total_ns = 0;
     uint64_t search_time_total_ns = 0;
 
-    uint64_t lz4_decompress_time_ns = 0;
+    uint64_t iaa_decompress_time_ns = 0;
     uint64_t fid_blocks_decompressed = 0;
     uint64_t tb_blocks_decompressed = 0;
     uint64_t fid_cache_hits = 0;
     uint64_t tb_cache_hits = 0;
     uint64_t fid_bytes_decompressed = 0;
     uint64_t tb_bytes_decompressed = 0;
-    uint64_t fid_tb_mismatch_count = 0;
-    uint64_t fid_tb_mismatch_log_capped = 0;
     uint64_t neighbors_tb_passed = 0;
     uint64_t neighbors_tb_rejected = 0;
     uint64_t fid_ready_candidates = 0;
     uint64_t deferred_candidates_enqueued = 0;
     uint64_t deferred_retry_rounds = 0;
-    uint64_t fid_blocks_submitted = 0;
+    uint64_t fid_jobs_submitted = 0;
+    uint64_t job_poll_calls = 0;
+    uint64_t job_poll_ready = 0;
 
     size_t returned_results = 0;
     size_t selectivity_count = 0;
@@ -117,6 +115,7 @@ struct RunStats {
     double recall_sum = 0.0;
     double average_recall_at_k = 0.0;
     size_t queries_with_enns_lt_k = 0;
+    std::string execution_mode = "async_range";
     size_t resolved_ef = 0;
     double effective_break_factor = 0.0;
 
@@ -126,21 +125,125 @@ struct RunStats {
 struct SearchCallStats {
     uint64_t filter_eval_calls = 0;
     uint64_t filter_eval_time_ns = 0;
-    compass_lz4_filter::QueryDecompressionMetrics decomp;
-    uint64_t fid_tb_mismatch_count = 0;
-    uint64_t fid_tb_mismatch_log_capped = 0;
+    compass_iaa_filter::QueryDecompressionMetrics decomp;
     uint64_t neighbors_tb_passed = 0;
     uint64_t neighbors_tb_rejected = 0;
     uint64_t fid_ready_candidates = 0;
     uint64_t deferred_candidates_enqueued = 0;
     uint64_t deferred_retry_rounds = 0;
-    uint64_t fid_blocks_submitted = 0;
+    uint64_t fid_jobs_submitted = 0;
+    uint64_t job_poll_calls = 0;
+    uint64_t job_poll_ready = 0;
 };
+
+struct CompressionStats {
+    uint64_t number_raw_bytes = 0;
+    uint64_t number_compressed_bytes = 0;
+    uint64_t fid_baseline_raw_bytes = 0;
+    uint64_t fid_baseline_compressed_bytes = 0;
+    uint64_t tb_raw_bytes = 0;
+    uint64_t tb_compressed_bytes = 0;
+};
+
+uint64_t safe_size_t_to_u64(size_t value) {
+    return static_cast<uint64_t>(value);
+}
+
+template <typename ElemT>
+uint64_t total_compressed_block_bytes(const std::vector<std::vector<ElemT>>& blocks) {
+    uint64_t total = 0;
+    for (const auto& block : blocks) {
+        total += safe_size_t_to_u64(block.size());
+    }
+    return total;
+}
+
+double compression_ratio_raw_over_compressed(uint64_t raw_bytes, uint64_t compressed_bytes) {
+    if (raw_bytes == 0 || compressed_bytes == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(raw_bytes) / static_cast<double>(compressed_bytes);
+}
+
+double compression_pct_of_raw(uint64_t raw_bytes, uint64_t compressed_bytes) {
+    if (raw_bytes == 0) {
+        return 0.0;
+    }
+    return (static_cast<double>(compressed_bytes) * 100.0) / static_cast<double>(raw_bytes);
+}
+
+uint32_t encode_numeric_to_u32(double value) {
+    const float fv = static_cast<float>(value);
+    uint32_t out = 0;
+    static_assert(sizeof(float) == sizeof(uint32_t), "float must be 32-bit");
+    std::memcpy(&out, &fv, sizeof(uint32_t));
+    return out;
+}
+
+std::vector<uint8_t> load_numeric_field_as_u32_bytes(
+    const std::string& payload_jsonl_path,
+    const std::string& field,
+    size_t expected_rows) {
+    std::ifstream in(payload_jsonl_path);
+    if (!in.is_open()) {
+        throw std::runtime_error("Failed to open payload JSONL: " + payload_jsonl_path);
+    }
+
+    std::vector<uint8_t> out(expected_rows * sizeof(uint32_t), 0);
+    std::string line;
+    size_t row_id = 0;
+    while (row_id < expected_rows && std::getline(in, line)) {
+        if (line.empty()) {
+            throw std::runtime_error(
+                "Encountered empty JSONL line while reading numeric field '" + field +
+                "' at row " + std::to_string(row_id));
+        }
+
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(line);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                "Failed to parse payload JSONL row " + std::to_string(row_id) +
+                ": " + std::string(e.what()));
+        }
+        if (!j.is_object()) {
+            throw std::runtime_error(
+                "Payload JSONL row is not an object at row " + std::to_string(row_id));
+        }
+        auto it = j.find(field);
+        if (it == j.end() || it->is_null()) {
+            throw std::runtime_error(
+                "Missing numeric field '" + field + "' in payload JSONL row " +
+                std::to_string(row_id));
+        }
+        if (!it->is_number()) {
+            throw std::runtime_error(
+                "Field '" + field + "' is non-numeric at row " +
+                std::to_string(row_id) + " (only numeric fields are supported)");
+        }
+
+        const double value = it->get<double>();
+        const uint32_t encoded = encode_numeric_to_u32(value);
+        std::memcpy(
+            out.data() + row_id * sizeof(uint32_t),
+            &encoded,
+            sizeof(uint32_t));
+        ++row_id;
+    }
+
+    if (row_id < expected_rows) {
+        throw std::runtime_error(
+            "Payload JSONL has fewer rows than graph elements: rows=" +
+            std::to_string(row_id) + ", expected=" + std::to_string(expected_rows));
+    }
+    return out;
+}
 
 void usage(const char* argv0) {
     std::cerr
         << "Usage:\n"
-        << "  " << argv0 << " --dataset-type <sift|laion|hnm>"
+        << "  " << argv0 << " --dataset-type <sift|sift1m|sift1b|laion|hnm>"
         << " --graph <path>"
         << " --query <path(.fvecs|.bvecs)>"
         << " --k <int>"
@@ -226,13 +329,24 @@ Args parse_args(int argc, char** argv) {
         }
     }
 
-    if (args.dataset_type != "sift" && args.dataset_type != "laion" && args.dataset_type != "hnm") {
-        throw std::runtime_error("--dataset-type must be one of: sift, laion, hnm");
+    if (args.dataset_type != "sift" &&
+        args.dataset_type != "sift1m" &&
+        args.dataset_type != "sift1b" &&
+        args.dataset_type != "laion" &&
+        args.dataset_type != "hnm") {
+        throw std::runtime_error("--dataset-type must be one of: sift, sift1m, sift1b, laion, hnm");
     }
 
     ensure_readable_file(args.graph_path, "--graph");
     ensure_readable_file(args.query_path, "--query");
     ensure_readable_file(args.fidtb_manifest, "--fidtb-manifest");
+    ensure_readable_file(args.payload_jsonl, "--payload-jsonl");
+
+    const bool graph_bin = filter_search_io::ends_with(args.graph_path, ".bin");
+    const bool graph_index = filter_search_io::ends_with(args.graph_path, ".index");
+    if (!graph_bin && !graph_index) {
+        throw std::runtime_error("--graph must end with .bin or .index");
+    }
 
     if (args.k <= 0) {
         throw std::runtime_error("--k must be > 0");
@@ -302,70 +416,6 @@ using CandidateQueue = std::priority_queue<
     std::vector<Pair<DistT>>,
     typename hnswlib::HierarchicalNSW<DistT>::CompareByFirst>;
 
-struct SequentialEqRuntime {
-    bool enabled = false;
-    bool empty_result = false;
-    std::string field;
-    std::bitset<compass_lz4_filter::kMaxBuckets> allowed_buckets;
-    size_t n_elements = 0;
-    compass_lz4_filter::detail::Lz4BlockStorage fid_storage;
-    compass_lz4_filter::detail::Lz4BlockStorage tb_storage;
-};
-
-struct CompressionStats {
-    uint64_t fid_raw_bytes = 0;
-    uint64_t fid_compressed_bytes = 0;
-    uint64_t tb_raw_bytes = 0;
-    uint64_t tb_compressed_bytes = 0;
-};
-
-uint64_t safe_size_t_to_u64(size_t value) {
-    return static_cast<uint64_t>(value);
-}
-
-template <typename ElemT>
-uint64_t total_compressed_block_bytes(const std::vector<std::vector<ElemT>>& blocks) {
-    uint64_t total = 0;
-    for (const auto& block : blocks) {
-        total += safe_size_t_to_u64(block.size());
-    }
-    return total;
-}
-
-CompressionStats compute_compression_stats(const SequentialEqRuntime& runtime) {
-    CompressionStats out;
-    out.fid_raw_bytes = safe_size_t_to_u64(runtime.fid_storage.raw_size);
-    out.fid_compressed_bytes = total_compressed_block_bytes(runtime.fid_storage.compressed_blocks);
-    out.tb_raw_bytes = safe_size_t_to_u64(runtime.tb_storage.raw_size);
-    out.tb_compressed_bytes = total_compressed_block_bytes(runtime.tb_storage.compressed_blocks);
-    return out;
-}
-
-double compression_ratio_raw_over_compressed(uint64_t raw_bytes, uint64_t compressed_bytes) {
-    if (raw_bytes == 0 || compressed_bytes == 0) {
-        return 0.0;
-    }
-    return static_cast<double>(raw_bytes) / static_cast<double>(compressed_bytes);
-}
-
-double compression_pct_of_raw(uint64_t raw_bytes, uint64_t compressed_bytes) {
-    if (raw_bytes == 0) {
-        return 0.0;
-    }
-    return (static_cast<double>(compressed_bytes) * 100.0) / static_cast<double>(raw_bytes);
-}
-
-struct SequentialEqQueryCache {
-    std::vector<std::vector<uint8_t>> tb_blocks;
-    std::vector<uint8_t> tb_ready;
-    std::vector<std::vector<uint8_t>> fid_blocks;
-    std::vector<uint8_t> fid_ready;
-};
-
-struct SequentialEqSearchWorkspace {
-    std::vector<hnswlib::tableint> neighbor_ids;
-};
-
 struct RangePredicateSpec {
     std::string field;
     double low = -std::numeric_limits<double>::infinity();
@@ -374,34 +424,52 @@ struct RangePredicateSpec {
     bool high_inclusive = true;
 };
 
-struct RangeBucketMappingReport {
-    bool applicable = false;
+struct AsyncRangeRuntime {
+    bool enabled = true;
     bool empty_result = false;
-    std::string status = "not_applicable";
-    std::string detail;
     std::string field;
+    uint32_t bucket_low = 0;
+    uint32_t bucket_high = 0;
+    size_t n_elements = 0;
+    size_t numeric_value_bytes = sizeof(uint32_t);
+    int nfilters = 0;
+    int missing_bucket = -1;
+    int usable_bins = 0;
+    double min_value = 0.0;
+    double max_value = 0.0;
     double low = 0.0;
     double high = 0.0;
     bool low_bounded = false;
     bool high_bounded = false;
     bool low_inclusive = true;
     bool high_inclusive = true;
-    int nfilters = 0;
-    int missing_bucket = -1;
-    int usable_bins = 0;
-    double min_value = 0.0;
-    double max_value = 0.0;
-    double bucket_width = 0.0;
-    int bucket_low = -1;
-    int bucket_high = -1;
-    int selected_bucket_count = 0;
+    uint32_t scan_low_u32 = 0;
+    uint32_t scan_high_u32 = std::numeric_limits<uint32_t>::max();
+    uint64_t fid_baseline_raw_bytes = 0;
+    uint64_t fid_baseline_compressed_bytes = 0;
+    std::vector<size_t> numeric_result_nodes;
+    compass_iaa_filter::detail::IaaBlockStorage fid_storage;
+    compass_iaa_filter::detail::IaaBlockStorage tb_storage;
 };
 
-std::unique_ptr<filter_expr::Node> parse_filter_ast(const std::string& expression) {
-    std::vector<filter_expr::detail::Token> tokens = filter_expr::detail::tokenize(expression);
-    filter_expr::detail::Parser parser(std::move(tokens));
-    return parser.parse();
-}
+struct FidScanBlock {
+    std::vector<uint8_t> matches;
+    uint32_t input_elements = 0;
+    uint32_t output_bytes = 0;
+    bool byte_per_element = false;
+};
+
+struct AsyncRangeQueryCache {
+    std::vector<std::vector<uint8_t>> tb_blocks;
+    std::vector<uint8_t> tb_ready;
+    std::vector<FidScanBlock> fid_blocks;
+    std::vector<uint8_t> fid_ready;
+    std::vector<uint8_t> fid_state;
+};
+
+constexpr uint8_t kFidStateNotSubmitted = 0;
+constexpr uint8_t kFidStateInflight = 1;
+constexpr uint8_t kFidStateReady = 2;
 
 std::optional<RangePredicateSpec> parse_single_numeric_range_predicate(
     const std::string& expression,
@@ -411,16 +479,14 @@ std::optional<RangePredicateSpec> parse_single_numeric_range_predicate(
     std::unique_ptr<filter_expr::Node> root = parser.parse();
     if (root == nullptr) {
         if (reason != nullptr) {
-            *reason = "parser returned null root";
+            *reason = "parsed filter expression is empty";
         }
         return std::nullopt;
     }
 
     auto parse_number = [&](const filter_expr::Literal& lit, double* out) -> bool {
         if (lit.is_number) {
-            if (out != nullptr) {
-                *out = lit.number;
-            }
+            *out = lit.number;
             return true;
         }
         return filter_expr::detail::try_parse_double(lit.text, out);
@@ -542,107 +608,6 @@ std::optional<RangePredicateSpec> parse_single_numeric_range_predicate(
     return std::nullopt;
 }
 
-bool numeric_value_matches_range(double value, const RangePredicateSpec& spec) {
-    if (std::isfinite(spec.low)) {
-        if (spec.low_inclusive) {
-            if (value < spec.low) {
-                return false;
-            }
-        } else if (value <= spec.low) {
-            return false;
-        }
-    }
-    if (std::isfinite(spec.high)) {
-        if (spec.high_inclusive) {
-            if (value > spec.high) {
-                return false;
-            }
-        } else if (value >= spec.high) {
-            return false;
-        }
-    }
-    return true;
-}
-
-std::vector<size_t> collect_numeric_result_nodes_from_jsonl(
-    const std::string& payload_jsonl_path,
-    const RangePredicateSpec& spec,
-    size_t expected_rows) {
-    std::ifstream in(payload_jsonl_path);
-    if (!in.is_open()) {
-        throw std::runtime_error("Failed to open payload JSONL for ENNS GT: " + payload_jsonl_path);
-    }
-
-    std::vector<size_t> out;
-    out.reserve(expected_rows / 8);
-    std::string line;
-    size_t row_id = 0;
-    while (row_id < expected_rows && std::getline(in, line)) {
-        if (line.empty()) {
-            throw std::runtime_error(
-                "Encountered empty JSONL line while building ENNS GT at row " +
-                std::to_string(row_id));
-        }
-
-        nlohmann::json j;
-        try {
-            j = nlohmann::json::parse(line);
-        } catch (const std::exception& e) {
-            throw std::runtime_error(
-                "Failed to parse payload JSONL row " + std::to_string(row_id) +
-                " while building ENNS GT: " + std::string(e.what()));
-        }
-        if (!j.is_object()) {
-            throw std::runtime_error(
-                "Payload JSONL row is not an object while building ENNS GT at row " +
-                std::to_string(row_id));
-        }
-
-        auto it = j.find(spec.field);
-        if (it == j.end() || it->is_null()) {
-            throw std::runtime_error(
-                "Missing numeric field '" + spec.field + "' in payload JSONL row " +
-                std::to_string(row_id) + " while building ENNS GT");
-        }
-        if (!it->is_number()) {
-            throw std::runtime_error(
-                "Field '" + spec.field + "' is non-numeric in payload JSONL row " +
-                std::to_string(row_id) + " while building ENNS GT");
-        }
-
-        const double value = it->get<double>();
-        if (numeric_value_matches_range(value, spec)) {
-            out.push_back(row_id);
-        }
-        ++row_id;
-    }
-
-    if (row_id < expected_rows) {
-        throw std::runtime_error(
-            "Payload JSONL has fewer rows than graph elements while building ENNS GT: rows=" +
-            std::to_string(row_id) + ", expected=" + std::to_string(expected_rows));
-    }
-    return out;
-}
-
-bool is_single_field_expression(const filter_expr::Node* node, std::string* field_out) {
-    if (node == nullptr) {
-        return false;
-    }
-    if (node->kind == filter_expr::Node::Kind::Logical) {
-        return is_single_field_expression(node->left.get(), field_out) &&
-               is_single_field_expression(node->right.get(), field_out);
-    }
-    if (field_out == nullptr) {
-        return false;
-    }
-    if (field_out->empty()) {
-        *field_out = node->field;
-        return true;
-    }
-    return *field_out == node->field;
-}
-
 int derive_usable_bins(int nfilters, int used_bins) {
     int usable_bins = used_bins;
     if (usable_bins <= 0) {
@@ -650,25 +615,6 @@ int derive_usable_bins(int nfilters, int used_bins) {
     }
     usable_bins = std::min(usable_bins, std::max(1, nfilters - 1));
     return usable_bins;
-}
-
-int bucket_from_numeric_builder(
-    int usable_bins,
-    double min_value,
-    double max_value,
-    double rhs) {
-    if (usable_bins <= 1 || max_value <= min_value) {
-        return 0;
-    }
-    const double normalized = (rhs - min_value) / (max_value - min_value);
-    int bucket = static_cast<int>(normalized * static_cast<double>(usable_bins));
-    if (bucket < 0) {
-        bucket = 0;
-    }
-    if (bucket >= usable_bins) {
-        bucket = usable_bins - 1;
-    }
-    return bucket;
 }
 
 int bucket_from_numeric(
@@ -691,462 +637,200 @@ int bucket_from_numeric(
     return bucket;
 }
 
-bool parse_numeric_literal(const filter_expr::Literal& lit, double* out) {
-    if (lit.is_number) {
-        if (out != nullptr) {
-            *out = lit.number;
-        }
-        return true;
-    }
-    return filter_expr::detail::try_parse_double(lit.text, out);
-}
-
-double bucket_representative(int usable_bins, double min_value, double max_value, int bucket) {
-    if (usable_bins <= 1 || max_value <= min_value) {
-        return min_value;
-    }
-    const double ratio = static_cast<double>(bucket) / static_cast<double>(usable_bins - 1);
-    return min_value + ratio * (max_value - min_value);
-}
-
-std::bitset<compass_lz4_filter::kMaxBuckets> all_data_buckets(int usable_bins) {
-    std::bitset<compass_lz4_filter::kMaxBuckets> out;
-    const int limit = std::min(usable_bins, static_cast<int>(compass_lz4_filter::kMaxBuckets));
-    for (int b = 0; b < limit; ++b) {
-        out.set(static_cast<size_t>(b));
-    }
-    return out;
-}
-
-std::bitset<compass_lz4_filter::kMaxBuckets> compile_compare_numeric_buckets(
-    const compass_lz4_filter::ManifestAttribute& attr,
-    int usable_bins,
-    filter_expr::CompareOp op,
-    const filter_expr::Literal& lit) {
-    double rhs = 0.0;
-    if (!parse_numeric_literal(lit, &rhs)) {
-        throw std::runtime_error(
-            "Numeric predicate has non-numeric literal for field '" + attr.key + "': " + lit.text);
-    }
-
-    std::bitset<compass_lz4_filter::kMaxBuckets> out;
-    if (op == filter_expr::CompareOp::Eq) {
-        out.set(static_cast<size_t>(bucket_from_numeric(usable_bins, attr.min_value, attr.max_value, rhs)));
-        return out;
-    }
-    if (op == filter_expr::CompareOp::Ne) {
-        out = all_data_buckets(usable_bins);
-        out.reset(static_cast<size_t>(bucket_from_numeric(usable_bins, attr.min_value, attr.max_value, rhs)));
-        return out;
-    }
-
-    const int limit = std::min(usable_bins, static_cast<int>(compass_lz4_filter::kMaxBuckets));
-    for (int b = 0; b < limit; ++b) {
-        const double rep = bucket_representative(usable_bins, attr.min_value, attr.max_value, b);
-        if (filter_expr::detail::compare_numeric(rep, rhs, op)) {
-            out.set(static_cast<size_t>(b));
-        }
-    }
-    return out;
-}
-
-std::bitset<compass_lz4_filter::kMaxBuckets> compile_between_numeric_buckets(
-    const compass_lz4_filter::ManifestAttribute& attr,
-    int usable_bins,
-    const filter_expr::Literal& lo,
-    const filter_expr::Literal& hi) {
-    double lo_v = 0.0;
-    double hi_v = 0.0;
-    if (!parse_numeric_literal(lo, &lo_v) || !parse_numeric_literal(hi, &hi_v)) {
-        throw std::runtime_error("Numeric BETWEEN has non-numeric bounds for field '" + attr.key + "'");
-    }
-    if (lo_v > hi_v) {
-        return std::bitset<compass_lz4_filter::kMaxBuckets>();
-    }
-
-    std::bitset<compass_lz4_filter::kMaxBuckets> out;
-    const int limit = std::min(usable_bins, static_cast<int>(compass_lz4_filter::kMaxBuckets));
-    for (int b = 0; b < limit; ++b) {
-        const double rep = bucket_representative(usable_bins, attr.min_value, attr.max_value, b);
-        if (rep >= lo_v && rep <= hi_v) {
-            out.set(static_cast<size_t>(b));
-        }
-    }
-    return out;
-}
-
-std::bitset<compass_lz4_filter::kMaxBuckets> compile_in_numeric_buckets(
-    const compass_lz4_filter::ManifestAttribute& attr,
-    int usable_bins,
-    const std::vector<filter_expr::Literal>& list) {
-    std::bitset<compass_lz4_filter::kMaxBuckets> out;
-    for (const filter_expr::Literal& lit : list) {
-        double v = 0.0;
-        if (!parse_numeric_literal(lit, &v)) {
-            throw std::runtime_error(
-                "Numeric IN has non-numeric literal for field '" + attr.key + "': " + lit.text);
-        }
-        out.set(static_cast<size_t>(bucket_from_numeric(usable_bins, attr.min_value, attr.max_value, v)));
-    }
-    return out;
-}
-
-std::bitset<compass_lz4_filter::kMaxBuckets> compile_compare_categorical_buckets(
-    const compass_lz4_filter::ManifestAttribute& attr,
-    int usable_bins,
-    filter_expr::CompareOp op,
-    const filter_expr::Literal& lit) {
-    std::bitset<compass_lz4_filter::kMaxBuckets> out;
-    auto bucket_it = attr.category_map.find(lit.text);
-    if (op == filter_expr::CompareOp::Eq) {
-        if (bucket_it != attr.category_map.end() &&
-            bucket_it->second >= 0 &&
-            bucket_it->second < usable_bins) {
-            out.set(static_cast<size_t>(bucket_it->second));
-        }
-        return out;
-    }
-    if (op == filter_expr::CompareOp::Ne) {
-        out = all_data_buckets(usable_bins);
-        if (bucket_it != attr.category_map.end() &&
-            bucket_it->second >= 0 &&
-            bucket_it->second < usable_bins) {
-            out.reset(static_cast<size_t>(bucket_it->second));
-        }
-        return out;
-    }
-
-    for (const auto& kv : attr.category_map) {
-        const std::string& key = kv.first;
-        const int bucket = kv.second;
-        if (bucket < 0 || bucket >= usable_bins || bucket >= static_cast<int>(compass_lz4_filter::kMaxBuckets)) {
-            continue;
-        }
-        if (filter_expr::detail::compare_string(key, lit.text, op)) {
-            out.set(static_cast<size_t>(bucket));
-        }
-    }
-    return out;
-}
-
-std::bitset<compass_lz4_filter::kMaxBuckets> compile_between_categorical_buckets(
-    const compass_lz4_filter::ManifestAttribute& attr,
-    int usable_bins,
-    const filter_expr::Literal& lo,
-    const filter_expr::Literal& hi) {
-    std::bitset<compass_lz4_filter::kMaxBuckets> out;
-    if (lo.text > hi.text) {
-        return out;
-    }
-    for (const auto& kv : attr.category_map) {
-        const std::string& key = kv.first;
-        const int bucket = kv.second;
-        if (bucket < 0 || bucket >= usable_bins || bucket >= static_cast<int>(compass_lz4_filter::kMaxBuckets)) {
-            continue;
-        }
-        if (key >= lo.text && key <= hi.text) {
-            out.set(static_cast<size_t>(bucket));
-        }
-    }
-    return out;
-}
-
-std::bitset<compass_lz4_filter::kMaxBuckets> compile_in_categorical_buckets(
-    const compass_lz4_filter::ManifestAttribute& attr,
-    int usable_bins,
-    const std::vector<filter_expr::Literal>& list) {
-    std::bitset<compass_lz4_filter::kMaxBuckets> out;
-    for (const filter_expr::Literal& lit : list) {
-        auto it = attr.category_map.find(lit.text);
-        if (it == attr.category_map.end()) {
-            continue;
-        }
-        if (it->second < 0 || it->second >= usable_bins || it->second >= static_cast<int>(compass_lz4_filter::kMaxBuckets)) {
-            continue;
-        }
-        out.set(static_cast<size_t>(it->second));
-    }
-    return out;
-}
-
-std::bitset<compass_lz4_filter::kMaxBuckets> compile_leaf_buckets(
-    const compass_lz4_filter::ManifestAttribute& attr,
-    int usable_bins,
-    const filter_expr::Node* node) {
-    if (node == nullptr) {
-        throw std::runtime_error("Internal error: null filter node");
-    }
-    if (node->kind == filter_expr::Node::Kind::Compare) {
-        if (attr.numeric) {
-            return compile_compare_numeric_buckets(attr, usable_bins, node->compare_op, node->literal);
-        }
-        return compile_compare_categorical_buckets(attr, usable_bins, node->compare_op, node->literal);
-    }
-    if (node->kind == filter_expr::Node::Kind::Between) {
-        if (attr.numeric) {
-            return compile_between_numeric_buckets(attr, usable_bins, node->lower, node->upper);
-        }
-        return compile_between_categorical_buckets(attr, usable_bins, node->lower, node->upper);
-    }
-    if (node->kind == filter_expr::Node::Kind::In) {
-        if (attr.numeric) {
-            return compile_in_numeric_buckets(attr, usable_bins, node->list);
-        }
-        return compile_in_categorical_buckets(attr, usable_bins, node->list);
-    }
-    throw std::runtime_error("Unexpected logical node passed to compile_leaf_buckets");
-}
-
-std::bitset<compass_lz4_filter::kMaxBuckets> compile_node_buckets(
-    const compass_lz4_filter::ManifestAttribute& attr,
-    int usable_bins,
-    const filter_expr::Node* node) {
-    if (node == nullptr) {
-        throw std::runtime_error("Parsed filter expression node is null");
-    }
-    if (node->kind == filter_expr::Node::Kind::Logical) {
-        const std::bitset<compass_lz4_filter::kMaxBuckets> lhs =
-            compile_node_buckets(attr, usable_bins, node->left.get());
-        const std::bitset<compass_lz4_filter::kMaxBuckets> rhs =
-            compile_node_buckets(attr, usable_bins, node->right.get());
-        if (node->logical_op == filter_expr::LogicalOp::And) {
-            return lhs & rhs;
-        }
-        return lhs | rhs;
-    }
-    return compile_leaf_buckets(attr, usable_bins, node);
-}
-
-RangeBucketMappingReport derive_range_bucket_mapping_report(
+AsyncRangeRuntime build_async_range_runtime(
     const Args& args,
-    const compass_lz4_filter::CompassLz4FilterEngine& engine) {
-    RangeBucketMappingReport report;
-
+    const compass_iaa_filter::CompassIaaFilterEngine& engine) {
+    AsyncRangeRuntime runtime;
     std::string parse_reason;
     const std::optional<RangePredicateSpec> spec =
         parse_single_numeric_range_predicate(args.filter_expression, &parse_reason);
     if (!spec.has_value()) {
-        report.detail = parse_reason;
-        return report;
+        throw std::runtime_error(
+            "Unsupported filter for async range mode: " + args.filter_expression +
+            ". Accepted: single-field numeric BETWEEN / > / >= / < / <= / AND-combined range. Details: " +
+            parse_reason);
     }
 
-    const compass_lz4_filter::ManifestData& manifest = engine.manifest();
+    const compass_iaa_filter::ManifestData& manifest = engine.manifest();
+    const int nfilters = manifest.nfilters;
+    if (nfilters <= 0 || nfilters > static_cast<int>(compass_iaa_filter::kMaxBuckets)) {
+        throw std::runtime_error("Manifest nfilters is out of range for async range runtime");
+    }
+
     auto attr_it = std::find_if(
         manifest.attributes.begin(),
         manifest.attributes.end(),
-        [&](const compass_lz4_filter::ManifestAttribute& attr) {
+        [&](const compass_iaa_filter::ManifestAttribute& attr) {
             return attr.key == spec->field;
         });
     if (attr_it == manifest.attributes.end()) {
-        report.detail = "field not found in manifest: " + spec->field;
-        return report;
+        throw std::runtime_error("Range filter field not found in manifest: " + spec->field);
     }
 
-    const compass_lz4_filter::ManifestAttribute& attr = *attr_it;
+    const compass_iaa_filter::ManifestAttribute& attr = *attr_it;
     if (!attr.numeric || attr.encoding != "numeric_minmax_quantized") {
-        report.detail =
-            "field is not numeric_minmax_quantized: " + attr.key + " (" + attr.encoding + ")";
-        return report;
+        throw std::runtime_error(
+            "Async range mode supports only numeric_minmax_quantized fields; field=" + attr.key);
     }
-    if (manifest.nfilters <= 0 || manifest.nfilters > static_cast<int>(compass_lz4_filter::kMaxBuckets)) {
-        report.detail = "manifest nfilters is out of range";
-        return report;
-    }
-
-    report.applicable = true;
-    report.status = "ok";
-    report.field = spec->field;
-    report.low = spec->low;
-    report.high = spec->high;
-    report.low_bounded = std::isfinite(spec->low);
-    report.high_bounded = std::isfinite(spec->high);
-    report.low_inclusive = spec->low_inclusive;
-    report.high_inclusive = spec->high_inclusive;
-    report.nfilters = manifest.nfilters;
-    report.missing_bucket = manifest.nfilters - 1;
-    report.usable_bins = std::max(1, report.missing_bucket);
-    report.min_value = attr.min_value;
-    report.max_value = attr.max_value;
-    if (report.usable_bins > 0 && report.max_value > report.min_value) {
-        report.bucket_width = (report.max_value - report.min_value) / static_cast<double>(report.usable_bins);
+    const int usable_bins = derive_usable_bins(nfilters, attr.used_bins);
+    if (usable_bins <= 0) {
+        throw std::runtime_error("Derived usable_bins is invalid for async range runtime");
     }
 
     int bucket_lo = 0;
-    int bucket_hi = report.usable_bins - 1;
-    if (report.low_bounded) {
-        const int b = bucket_from_numeric_builder(
-            report.usable_bins,
-            report.min_value,
-            report.max_value,
-            report.low);
-        bucket_lo = report.low_inclusive ? b : std::min(report.usable_bins, b + 1);
+    int bucket_hi = usable_bins - 1;
+    if (std::isfinite(spec->low)) {
+        const int b = bucket_from_numeric(usable_bins, attr.min_value, attr.max_value, spec->low);
+        bucket_lo = spec->low_inclusive ? b : std::min(usable_bins, b + 1);
     }
-    if (report.high_bounded) {
-        const int b = bucket_from_numeric_builder(
-            report.usable_bins,
-            report.min_value,
-            report.max_value,
-            report.high);
-        bucket_hi = report.high_inclusive ? b : std::max(-1, b - 1);
+    if (std::isfinite(spec->high)) {
+        const int b = bucket_from_numeric(usable_bins, attr.min_value, attr.max_value, spec->high);
+        bucket_hi = spec->high_inclusive ? b : std::max(-1, b - 1);
     }
 
+    runtime.field = spec->field;
+    runtime.n_elements = manifest.n_elements;
+    runtime.nfilters = nfilters;
+    runtime.missing_bucket = nfilters - 1;
+    runtime.usable_bins = usable_bins;
+    runtime.min_value = attr.min_value;
+    runtime.max_value = attr.max_value;
+    runtime.low = spec->low;
+    runtime.high = spec->high;
+    runtime.low_bounded = std::isfinite(spec->low);
+    runtime.high_bounded = std::isfinite(spec->high);
+    runtime.low_inclusive = spec->low_inclusive;
+    runtime.high_inclusive = spec->high_inclusive;
     if (bucket_lo > bucket_hi) {
-        report.empty_result = true;
-        report.status = "empty";
-        report.bucket_low = 0;
-        report.bucket_high = -1;
-        report.selected_bucket_count = 0;
-        return report;
-    }
-
-    report.bucket_low = bucket_lo;
-    report.bucket_high = bucket_hi;
-    report.selected_bucket_count = bucket_hi - bucket_lo + 1;
-    return report;
-}
-
-SequentialEqRuntime build_sequential_eq_runtime(
-    const Args& args,
-    const compass_lz4_filter::CompassLz4FilterEngine& engine) {
-    SequentialEqRuntime runtime;
-    std::unique_ptr<filter_expr::Node> root = parse_filter_ast(args.filter_expression);
-    if (root == nullptr) {
-        return runtime;
-    }
-    std::string field;
-    if (!is_single_field_expression(root.get(), &field) || field.empty()) {
+        runtime.empty_result = true;
+        runtime.bucket_low = 0;
+        runtime.bucket_high = 0;
         return runtime;
     }
 
-    const compass_lz4_filter::ManifestData& manifest = engine.manifest();
-    const int nfilters = manifest.nfilters;
-    if (nfilters <= 0 || nfilters > static_cast<int>(compass_lz4_filter::kMaxBuckets)) {
-        return runtime;
+    if (bucket_lo < 0 || bucket_hi >= usable_bins) {
+        throw std::runtime_error("Computed bucket range is out of bounds for async range runtime");
     }
 
-    auto attr_it = std::find_if(
-        manifest.attributes.begin(),
-        manifest.attributes.end(),
-        [&](const compass_lz4_filter::ManifestAttribute& attr) {
-            return attr.key == field;
-        });
-    if (attr_it == manifest.attributes.end()) {
-        return runtime;
+    size_t tb_count = 0;
+    std::vector<uint8_t> tb_raw = compass_iaa_filter::detail::read_payload_with_size_header(
+        attr.tb_file,
+        &tb_count,
+        compass_iaa_filter::kTbBytesPerNode);
+    if (tb_count != manifest.n_elements) {
+        throw std::runtime_error(
+            "TB element count mismatch while building async runtime for field '" + attr.key + "'");
     }
 
-    const compass_lz4_filter::ManifestAttribute& attr = *attr_it;
-    const int usable_bins = derive_usable_bins(nfilters, attr.used_bins);
-    if (usable_bins <= 0) {
-        return runtime;
-    }
-
-    std::bitset<compass_lz4_filter::kMaxBuckets> allowed_buckets;
-    bool mapped_from_numeric_range = false;
-    std::string parse_reason;
-    const std::optional<RangePredicateSpec> range_spec =
-        parse_single_numeric_range_predicate(args.filter_expression, &parse_reason);
-    if (range_spec.has_value() &&
-        range_spec->field == field &&
-        attr.numeric &&
-        attr.encoding == "numeric_minmax_quantized") {
-        int bucket_lo = 0;
-        int bucket_hi = usable_bins - 1;
-        if (std::isfinite(range_spec->low)) {
-            const int b = bucket_from_numeric_builder(
-                usable_bins,
-                attr.min_value,
-                attr.max_value,
-                range_spec->low);
-            bucket_lo = range_spec->low_inclusive ? b : std::min(usable_bins, b + 1);
-        }
-        if (std::isfinite(range_spec->high)) {
-            const int b = bucket_from_numeric_builder(
-                usable_bins,
-                attr.min_value,
-                attr.max_value,
-                range_spec->high);
-            bucket_hi = range_spec->high_inclusive ? b : std::max(-1, b - 1);
-        }
-
-        if (bucket_lo <= bucket_hi) {
-            const int limit = std::min(usable_bins, static_cast<int>(compass_lz4_filter::kMaxBuckets));
-            for (int b = std::max(0, bucket_lo); b <= bucket_hi && b < limit; ++b) {
-                allowed_buckets.set(static_cast<size_t>(b));
+    std::vector<uint8_t> tb_bucket_bits((manifest.n_elements + 7) / 8, 0);
+    for (size_t node_id = 0; node_id < manifest.n_elements; ++node_id) {
+        bool matches = false;
+        for (int bucket = bucket_lo; bucket <= bucket_hi; ++bucket) {
+            const size_t bucket_byte = static_cast<size_t>(bucket) / 8;
+            const uint8_t bucket_mask = static_cast<uint8_t>(1u << (bucket % 8));
+            const size_t offset = node_id * compass_iaa_filter::kTbBytesPerNode + bucket_byte;
+            if ((tb_raw[offset] & bucket_mask) != 0) {
+                matches = true;
+                break;
             }
         }
-        mapped_from_numeric_range = true;
+        if (matches) {
+            tb_bucket_bits[node_id / 8] |= static_cast<uint8_t>(1u << (node_id % 8));
+        }
     }
 
-    if (!mapped_from_numeric_range) {
-        allowed_buckets = compile_node_buckets(attr, usable_bins, root.get());
-    }
-    if (allowed_buckets.none()) {
-        runtime.enabled = true;
-        runtime.empty_result = true;
-        runtime.field = field;
-        runtime.allowed_buckets = allowed_buckets;
-        runtime.n_elements = manifest.n_elements;
-        return runtime;
-    }
-
+    std::vector<uint8_t> numeric_raw = load_numeric_field_as_u32_bytes(
+        args.payload_jsonl,
+        spec->field,
+        manifest.n_elements);
     size_t fid_count = 0;
-    std::vector<uint8_t> fid_raw = compass_lz4_filter::detail::read_payload_with_size_header(
+    std::vector<uint8_t> fid_baseline_raw = compass_iaa_filter::detail::read_payload_with_size_header(
         attr.fid_file,
         &fid_count,
         sizeof(uint8_t));
     if (fid_count != manifest.n_elements) {
         throw std::runtime_error(
-            "FID element count mismatch while building sequential runtime for field '" + attr.key + "'");
+            "FID element count mismatch while building baseline compression for field '" + attr.key + "'");
     }
 
-    size_t tb_count = 0;
-    std::vector<uint8_t> tb_raw = compass_lz4_filter::detail::read_payload_with_size_header(
-        attr.tb_file,
-        &tb_count,
-        compass_lz4_filter::kTbBytesPerNode);
-    if (tb_count != manifest.n_elements) {
-        throw std::runtime_error(
-            "TB element count mismatch while building sequential runtime for field '" + attr.key + "'");
-    }
+    std::unique_ptr<compass_iaa_filter::detail::QplJobHandle> compressor =
+        compass_iaa_filter::detail::make_hardware_job("async range runtime compressor");
+    const compass_iaa_filter::detail::IaaBlockStorage fid_baseline_storage =
+        compass_iaa_filter::detail::compress_to_iaa_blocks(
+            fid_baseline_raw,
+            args.fid_block_size_bytes,
+            compressor.get());
+    runtime.fid_storage = compass_iaa_filter::detail::compress_to_iaa_blocks(
+        numeric_raw,
+        args.fid_block_size_bytes,
+        compressor.get());
+    runtime.tb_storage = compass_iaa_filter::detail::compress_to_iaa_blocks(
+        tb_bucket_bits,
+        args.tb_block_size_bytes,
+        compressor.get());
 
-    std::array<uint8_t, compass_lz4_filter::kTbBytesPerNode> tb_mask{};
-    for (size_t bucket = 0; bucket < compass_lz4_filter::kMaxBuckets; ++bucket) {
-        if (allowed_buckets.test(bucket)) {
-            tb_mask[bucket / 8] |= static_cast<uint8_t>(1u << (bucket % 8));
-        }
+    runtime.empty_result = false;
+    runtime.bucket_low = static_cast<uint32_t>(bucket_lo);
+    runtime.bucket_high = static_cast<uint32_t>(bucket_hi);
+    runtime.scan_low_u32 = runtime.low_bounded ? encode_numeric_to_u32(spec->low) : 0;
+    runtime.scan_high_u32 =
+        runtime.high_bounded ? encode_numeric_to_u32(spec->high) : std::numeric_limits<uint32_t>::max();
+    if (runtime.low_bounded && !runtime.low_inclusive && runtime.scan_low_u32 < std::numeric_limits<uint32_t>::max()) {
+        ++runtime.scan_low_u32;
     }
-
-    std::vector<uint8_t> tb_bucket_bits((manifest.n_elements + 7) / 8, 0);
-    for (size_t node_id = 0; node_id < manifest.n_elements; ++node_id) {
-        const size_t base = node_id * compass_lz4_filter::kTbBytesPerNode;
-        bool any_bucket_match = false;
-        for (size_t i = 0; i < compass_lz4_filter::kTbBytesPerNode; ++i) {
-            if ((tb_raw[base + i] & tb_mask[i]) != 0) {
-                any_bucket_match = true;
-                break;
+    if (runtime.high_bounded && !runtime.high_inclusive && runtime.scan_high_u32 > 0) {
+        --runtime.scan_high_u32;
+    }
+    if (runtime.scan_low_u32 > runtime.scan_high_u32) {
+        runtime.empty_result = true;
+    }
+    runtime.numeric_result_nodes.clear();
+    runtime.numeric_result_nodes.reserve(manifest.n_elements / 8);
+    if (!runtime.empty_result) {
+        for (size_t node_id = 0; node_id < manifest.n_elements; ++node_id) {
+            uint32_t encoded = 0;
+            std::memcpy(
+                &encoded,
+                numeric_raw.data() + node_id * sizeof(uint32_t),
+                sizeof(uint32_t));
+            if (encoded >= runtime.scan_low_u32 && encoded <= runtime.scan_high_u32) {
+                runtime.numeric_result_nodes.push_back(node_id);
             }
         }
-        if (any_bucket_match) {
-            tb_bucket_bits[node_id / 8] |= static_cast<uint8_t>(1u << (node_id % 8));
-        }
     }
-
-    runtime.fid_storage = compass_lz4_filter::detail::compress_to_lz4_blocks(
-        fid_raw,
-        args.fid_block_size_bytes);
-    runtime.tb_storage = compass_lz4_filter::detail::compress_to_lz4_blocks(
-        tb_bucket_bits,
-        args.tb_block_size_bytes);
-    runtime.enabled = true;
-    runtime.empty_result = false;
-    runtime.field = field;
-    runtime.allowed_buckets = allowed_buckets;
-    runtime.n_elements = manifest.n_elements;
+    runtime.fid_baseline_raw_bytes = safe_size_t_to_u64(fid_baseline_storage.raw_size);
+    runtime.fid_baseline_compressed_bytes =
+        total_compressed_block_bytes(fid_baseline_storage.compressed_blocks);
     return runtime;
 }
 
-SequentialEqQueryCache make_preallocated_query_cache(const SequentialEqRuntime& runtime) {
-    SequentialEqQueryCache cache;
+size_t max_raw_block_size(const compass_iaa_filter::detail::IaaBlockStorage& storage) {
+    size_t out = 0;
+    for (uint32_t raw_len : storage.raw_block_sizes) {
+        out = std::max(out, static_cast<size_t>(raw_len));
+    }
+    return out;
+}
+
+size_t required_async_job_output_bytes(const AsyncRangeRuntime& runtime) {
+    const size_t max_fid = max_raw_block_size(runtime.fid_storage);
+    const size_t max_tb = max_raw_block_size(runtime.tb_storage);
+    return std::max<size_t>(1, std::max(max_fid, max_tb));
+}
+
+CompressionStats compute_compression_stats(const AsyncRangeRuntime& runtime) {
+    CompressionStats out;
+    out.number_raw_bytes = safe_size_t_to_u64(runtime.fid_storage.raw_size);
+    out.number_compressed_bytes = total_compressed_block_bytes(runtime.fid_storage.compressed_blocks);
+    out.fid_baseline_raw_bytes = runtime.fid_baseline_raw_bytes;
+    out.fid_baseline_compressed_bytes = runtime.fid_baseline_compressed_bytes;
+    out.tb_raw_bytes = safe_size_t_to_u64(runtime.tb_storage.raw_size);
+    out.tb_compressed_bytes = total_compressed_block_bytes(runtime.tb_storage.compressed_blocks);
+    return out;
+}
+
+AsyncRangeQueryCache make_preallocated_query_cache(const AsyncRangeRuntime& runtime) {
+    AsyncRangeQueryCache cache;
 
     const size_t tb_blocks = runtime.tb_storage.block_count();
     cache.tb_blocks.resize(tb_blocks);
@@ -1158,154 +842,444 @@ SequentialEqQueryCache make_preallocated_query_cache(const SequentialEqRuntime& 
     const size_t fid_blocks = runtime.fid_storage.block_count();
     cache.fid_blocks.resize(fid_blocks);
     cache.fid_ready.assign(fid_blocks, 0);
+    cache.fid_state.assign(fid_blocks, kFidStateNotSubmitted);
     for (size_t block_id = 0; block_id < fid_blocks; ++block_id) {
-        cache.fid_blocks[block_id].assign(runtime.fid_storage.raw_block_sizes[block_id], 0);
+        FidScanBlock& block = cache.fid_blocks[block_id];
+        block.matches.assign(runtime.fid_storage.raw_block_sizes[block_id], 0);
+        block.input_elements = static_cast<uint32_t>(
+            runtime.fid_storage.raw_block_sizes[block_id] / runtime.numeric_value_bytes);
+        block.output_bytes = 0;
+        block.byte_per_element = false;
     }
 
     return cache;
 }
 
-void decompress_lz4_block_into(
-    const compass_lz4_filter::detail::Lz4BlockStorage& storage,
-    size_t block_id,
-    bool is_fid,
-    std::vector<uint8_t>* output,
-    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
-    if (output == nullptr) {
-        throw std::runtime_error("LZ4 decompress destination buffer is null");
+void reset_preallocated_query_cache(
+    const AsyncRangeRuntime& runtime,
+    AsyncRangeQueryCache* cache) {
+    if (cache == nullptr) {
+        throw std::runtime_error("AsyncRangeQueryCache reset received null pointer");
     }
-    if (block_id >= storage.block_count()) {
-        throw std::runtime_error("Block id out of range during decompression");
-    }
-
-    const size_t raw_len = static_cast<size_t>(storage.raw_block_sizes[block_id]);
-    if (output->size() < raw_len) {
-        throw std::runtime_error("Preallocated LZ4 output buffer is too small");
-    }
-    if (raw_len == 0) {
-        return;
+    if (cache->tb_blocks.size() != runtime.tb_storage.block_count() ||
+        cache->tb_ready.size() != runtime.tb_storage.block_count() ||
+        cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
+        cache->fid_ready.size() != runtime.fid_storage.block_count() ||
+        cache->fid_state.size() != runtime.fid_storage.block_count()) {
+        throw std::runtime_error("AsyncRangeQueryCache reset size mismatch");
     }
 
-    const int ret = LZ4_decompress_safe(
-        storage.compressed_blocks[block_id].data(),
-        reinterpret_cast<char*>(output->data()),
-        static_cast<int>(storage.compressed_blocks[block_id].size()),
-        static_cast<int>(raw_len));
-
-    if (ret != static_cast<int>(raw_len)) {
-        throw std::runtime_error("LZ4 decompression failed at block " + std::to_string(block_id));
-    }
-
-    if (metrics != nullptr) {
-        if (is_fid) {
-            ++metrics->fid_blocks_decompressed;
-            metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
-        } else {
-            ++metrics->tb_blocks_decompressed;
-            metrics->tb_bytes_decompressed += static_cast<uint64_t>(raw_len);
-        }
+    std::fill(cache->tb_ready.begin(), cache->tb_ready.end(), static_cast<uint8_t>(0));
+    std::fill(cache->fid_ready.begin(), cache->fid_ready.end(), static_cast<uint8_t>(0));
+    std::fill(cache->fid_state.begin(), cache->fid_state.end(), kFidStateNotSubmitted);
+    for (size_t block_id = 0; block_id < cache->fid_blocks.size(); ++block_id) {
+        FidScanBlock& block = cache->fid_blocks[block_id];
+        block.input_elements = static_cast<uint32_t>(
+            runtime.fid_storage.raw_block_sizes[block_id] / runtime.numeric_value_bytes);
+        block.output_bytes = 0;
+        block.byte_per_element = false;
     }
 }
 
-void prefetch_tb_blocks(
-    const SequentialEqRuntime& runtime,
-    SequentialEqQueryCache* cache,
-    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
+void prefault_query_cache_buffers(AsyncRangeQueryCache* cache) {
     if (cache == nullptr) {
-        throw std::runtime_error("TB prefetch received null cache");
+        throw std::runtime_error("AsyncRangeQueryCache prefault received null pointer");
+    }
+
+    volatile uint8_t sink = 0;
+    constexpr size_t kPageBytes = 4096;
+
+    auto touch_vec = [&](std::vector<uint8_t>& vec) {
+        if (vec.empty()) {
+            return;
+        }
+        for (size_t i = 0; i < vec.size(); i += kPageBytes) {
+            sink ^= vec[i];
+        }
+        sink ^= vec.back();
+    };
+
+    touch_vec(cache->tb_ready);
+    touch_vec(cache->fid_ready);
+    touch_vec(cache->fid_state);
+    for (std::vector<uint8_t>& block : cache->tb_blocks) {
+        touch_vec(block);
+    }
+    for (FidScanBlock& block : cache->fid_blocks) {
+        touch_vec(block.matches);
+    }
+    (void)sink;
+}
+
+class AsyncJobRing {
+public:
+    AsyncJobRing(size_t queue_size = 128, size_t wait_batch = 64, size_t output_buffer_bytes = 1)
+        : queue_size_(queue_size), wait_batch_(wait_batch), output_buffer_bytes_(output_buffer_bytes) {
+        if (queue_size_ == 0 || wait_batch_ == 0 || wait_batch_ > queue_size_) {
+            throw std::runtime_error("Invalid AsyncJobRing configuration");
+        }
+        if (output_buffer_bytes_ == 0) {
+            throw std::runtime_error("AsyncJobRing output buffer must be > 0");
+        }
+
+        uint32_t job_size = 0;
+        qpl_status status = qpl_get_job_size(qpl_path_hardware, &job_size);
+        if (status != QPL_STS_OK) {
+            throw std::runtime_error("AsyncJobRing: qpl_get_job_size failed");
+        }
+
+        slots_.resize(queue_size_);
+        for (size_t i = 0; i < queue_size_; ++i) {
+            slots_[i].job_storage = std::make_unique<uint8_t[]>(job_size);
+            slots_[i].job = reinterpret_cast<qpl_job*>(slots_[i].job_storage.get());
+            status = qpl_init_job(qpl_path_hardware, slots_[i].job);
+            if (status != QPL_STS_OK) {
+                throw std::runtime_error("AsyncJobRing: qpl_init_job failed");
+            }
+            slots_[i].output.resize(output_buffer_bytes_);
+            free_slots_.push_back(i);
+        }
+    }
+
+    ~AsyncJobRing() {
+        for (Slot& slot : slots_) {
+            if (slot.job != nullptr) {
+                (void)qpl_fini_job(slot.job);
+            }
+        }
+    }
+
+    template <typename SetupFn, typename CompleteFn>
+    void submit(size_t output_capacity, SetupFn&& setup_fn, CompleteFn&& complete_fn) {
+        ensure_free_slot();
+
+        const size_t slot_id = free_slots_.front();
+        free_slots_.pop_front();
+
+        Slot& slot = slots_[slot_id];
+        if (output_capacity > output_buffer_bytes_) {
+            throw std::runtime_error(
+                "AsyncJobRing submit output capacity exceeds preallocated slot buffer");
+        }
+
+        setup_fn(slot.job, slot.output);
+        const qpl_status submit_status = qpl_submit_job(slot.job);
+        if (submit_status != QPL_STS_OK) {
+            throw std::runtime_error(
+                "AsyncJobRing: qpl_submit_job failed with status " +
+                std::to_string(static_cast<int>(submit_status)));
+        }
+
+        slot.submit_time = std::chrono::steady_clock::now();
+        slot.complete = std::forward<CompleteFn>(complete_fn);
+        pending_slots_.push_back(slot_id);
+
+        if (pending_slots_.size() >= queue_size_) {
+            wait_oldest(wait_batch_);
+        }
+    }
+
+    void flush() {
+        wait_oldest(pending_slots_.size());
+    }
+
+    void wait_one() {
+        wait_oldest(1);
+    }
+
+    bool has_pending() const {
+        return !pending_slots_.empty();
+    }
+
+    void prefault_output_buffers() {
+        volatile uint8_t sink = 0;
+        constexpr size_t kPageBytes = 4096;
+        for (Slot& slot : slots_) {
+            if (slot.output.empty()) {
+                continue;
+            }
+            for (size_t i = 0; i < slot.output.size(); i += kPageBytes) {
+                sink ^= slot.output[i];
+            }
+            sink ^= slot.output.back();
+        }
+        (void)sink;
+    }
+
+    size_t poll_ready_jobs() {
+        size_t completed = 0;
+        const size_t pending_count = pending_slots_.size();
+        for (size_t i = 0; i < pending_count; ++i) {
+            const size_t slot_id = pending_slots_.front();
+            pending_slots_.pop_front();
+            Slot& slot = slots_[slot_id];
+
+            const qpl_status status = qpl_check_job(slot.job);
+            if (status == QPL_STS_OK) {
+                const auto done_time = std::chrono::steady_clock::now();
+                complete_slot(slot_id, done_time);
+                ++completed;
+            } else if (status == QPL_STS_BEING_PROCESSED) {
+                pending_slots_.push_back(slot_id);
+            } else {
+                throw std::runtime_error(
+                    "AsyncJobRing: qpl_check_job failed with status " +
+                    std::to_string(static_cast<int>(status)));
+            }
+        }
+        return completed;
+    }
+
+private:
+    struct Slot {
+        std::unique_ptr<uint8_t[]> job_storage;
+        qpl_job* job = nullptr;
+        std::vector<uint8_t> output;
+        std::chrono::steady_clock::time_point submit_time;
+        std::function<void(qpl_job*, std::vector<uint8_t>&, uint64_t)> complete;
+    };
+
+    void ensure_free_slot() {
+        if (!free_slots_.empty()) {
+            return;
+        }
+        wait_oldest(wait_batch_);
+        if (free_slots_.empty()) {
+            throw std::runtime_error("AsyncJobRing internal error: no free slots after wait");
+        }
+    }
+
+    void wait_oldest(size_t count) {
+        const size_t wait_count = std::min(count, pending_slots_.size());
+        for (size_t i = 0; i < wait_count; ++i) {
+            const size_t slot_id = pending_slots_.front();
+            pending_slots_.pop_front();
+            Slot& slot = slots_[slot_id];
+
+            const qpl_status wait_status = qpl_wait_job(slot.job);
+            const auto done_time = std::chrono::steady_clock::now();
+            if (wait_status != QPL_STS_OK) {
+                throw std::runtime_error(
+                    "AsyncJobRing: qpl_wait_job failed with status " +
+                    std::to_string(static_cast<int>(wait_status)));
+            }
+
+            complete_slot(slot_id, done_time);
+        }
+    }
+
+    void complete_slot(size_t slot_id, const std::chrono::steady_clock::time_point& done_time) {
+        Slot& slot = slots_[slot_id];
+        const uint64_t elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(done_time - slot.submit_time).count());
+        if (slot.complete) {
+            slot.complete(slot.job, slot.output, elapsed_ns);
+        }
+        slot.complete = nullptr;
+        slot.output.clear();
+        free_slots_.push_back(slot_id);
+    }
+
+    size_t queue_size_ = 128;
+    size_t wait_batch_ = 64;
+    size_t output_buffer_bytes_ = 1;
+    std::vector<Slot> slots_;
+    std::deque<size_t> free_slots_;
+    std::deque<size_t> pending_slots_;
+};
+
+void submit_tb_prefetch_jobs(
+    AsyncJobRing* ring,
+    const AsyncRangeRuntime& runtime,
+    AsyncRangeQueryCache* cache,
+    compass_iaa_filter::QueryDecompressionMetrics* metrics) {
+    if (ring == nullptr || cache == nullptr) {
+        throw std::runtime_error("TB prefetch received null pointer");
     }
     for (size_t block_id = 0; block_id < runtime.tb_storage.block_count(); ++block_id) {
-        if (block_id >= cache->tb_ready.size() || block_id >= cache->tb_blocks.size()) {
-            throw std::runtime_error("TB query cache is not preallocated for all blocks");
-        }
-        if (cache->tb_ready[block_id] != 0) {
+        if (block_id >= cache->tb_ready.size() || cache->tb_ready[block_id] != 0) {
             continue;
         }
-        decompress_lz4_block_into(
-            runtime.tb_storage,
-            block_id,
-            false,
-            &cache->tb_blocks[block_id],
-            metrics);
-        cache->tb_ready[block_id] = 1;
+        const uint32_t raw_len = runtime.tb_storage.raw_block_sizes[block_id];
+        if (raw_len == 0) {
+            cache->tb_blocks[block_id].clear();
+            cache->tb_ready[block_id] = 1;
+            continue;
+        }
+
+        ring->submit(
+            static_cast<size_t>(raw_len),
+            [&](qpl_job* job, std::vector<uint8_t>& out) {
+                job->op = qpl_op_extract;
+                job->next_in_ptr = const_cast<uint8_t*>(runtime.tb_storage.compressed_blocks[block_id].data());
+                job->available_in = static_cast<uint32_t>(runtime.tb_storage.compressed_blocks[block_id].size());
+                job->next_out_ptr = out.data();
+                job->available_out = raw_len;
+                job->src1_bit_width = 8;
+                job->out_bit_width = qpl_ow_nom;
+                job->param_low = 0;
+                job->param_high = raw_len - 1;
+                job->num_input_elements = raw_len;
+                job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_DECOMPRESS_ENABLE;
+            },
+            [cache, metrics, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out, uint64_t elapsed_ns) {
+                const size_t produced = static_cast<size_t>(job->total_out);
+                std::vector<uint8_t>& dst = cache->tb_blocks[block_id];
+                if (produced > dst.size()) {
+                    throw std::runtime_error("TB output exceeds preallocated query cache block");
+                }
+                std::copy_n(out.begin(), produced, dst.begin());
+                cache->tb_ready[block_id] = 1;
+                if (metrics != nullptr) {
+                    metrics->iaa_decompress_time_ns += elapsed_ns;
+                    ++metrics->tb_blocks_decompressed;
+                    metrics->tb_bytes_decompressed += static_cast<uint64_t>(raw_len);
+                }
+            });
     }
 }
 
-void prefetch_fid_block(
-    const SequentialEqRuntime& runtime,
+void submit_fid_scan_job(
+    AsyncJobRing* ring,
+    const AsyncRangeRuntime& runtime,
     size_t block_id,
-    SequentialEqQueryCache* cache,
-    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
-    if (cache == nullptr) {
-        throw std::runtime_error("FID prefetch received null cache");
+    AsyncRangeQueryCache* cache,
+    compass_iaa_filter::QueryDecompressionMetrics* metrics) {
+    if (ring == nullptr || cache == nullptr) {
+        throw std::runtime_error("FID async scan received null pointer");
     }
     if (block_id >= runtime.fid_storage.block_count()) {
         return;
     }
-    if (block_id >= cache->fid_ready.size() || block_id >= cache->fid_blocks.size()) {
-        throw std::runtime_error("FID query cache is not preallocated for all blocks");
-    }
-    if (cache->fid_ready[block_id] != 0) {
+    if (block_id >= cache->fid_ready.size() || block_id >= cache->fid_state.size()) {
         return;
     }
-    decompress_lz4_block_into(
-        runtime.fid_storage,
-        block_id,
-        true,
-        &cache->fid_blocks[block_id],
-        metrics);
-    cache->fid_ready[block_id] = 1;
+    if (cache->fid_state[block_id] == kFidStateInflight ||
+        cache->fid_state[block_id] == kFidStateReady) {
+        return;
+    }
+
+    const uint32_t raw_len = runtime.fid_storage.raw_block_sizes[block_id];
+    if (raw_len == 0) {
+        FidScanBlock& block = cache->fid_blocks[block_id];
+        block.input_elements = 0;
+        block.output_bytes = 0;
+        block.byte_per_element = false;
+        cache->fid_ready[block_id] = 1;
+        cache->fid_state[block_id] = kFidStateReady;
+        return;
+    }
+
+    ring->submit(
+        static_cast<size_t>(raw_len),
+        [&](qpl_job* job, std::vector<uint8_t>& out) {
+            job->op = qpl_op_scan_range;
+            job->next_in_ptr = const_cast<uint8_t*>(runtime.fid_storage.compressed_blocks[block_id].data());
+            job->available_in = static_cast<uint32_t>(runtime.fid_storage.compressed_blocks[block_id].size());
+            job->next_out_ptr = out.data();
+            job->available_out = raw_len;
+            job->src1_bit_width = 32;
+            job->out_bit_width = qpl_ow_nom;
+            job->param_low = runtime.scan_low_u32;
+            job->param_high = runtime.scan_high_u32;
+            job->num_input_elements = static_cast<uint32_t>(raw_len / runtime.numeric_value_bytes);
+            job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_DECOMPRESS_ENABLE;
+        },
+        [cache, metrics, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out, uint64_t elapsed_ns) {
+            const size_t produced = static_cast<size_t>(job->total_out);
+            FidScanBlock& block = cache->fid_blocks[block_id];
+            if (produced > block.matches.size()) {
+                throw std::runtime_error("FID output exceeds preallocated query cache block");
+            }
+            std::copy_n(out.begin(), produced, block.matches.begin());
+            block.input_elements = static_cast<uint32_t>(raw_len / sizeof(uint32_t));
+            block.output_bytes = static_cast<uint32_t>(produced);
+            block.byte_per_element = (job->total_out >= block.input_elements);
+            cache->fid_ready[block_id] = 1;
+            cache->fid_state[block_id] = kFidStateReady;
+            if (metrics != nullptr) {
+                metrics->iaa_decompress_time_ns += elapsed_ns;
+                ++metrics->fid_blocks_decompressed;
+                metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
+            }
+        });
+    cache->fid_state[block_id] = kFidStateInflight;
 }
 
 bool tb_match_node(
-    const SequentialEqRuntime& runtime,
-    SequentialEqQueryCache* cache,
+    const AsyncRangeRuntime& runtime,
+    AsyncJobRing* ring,
+    AsyncRangeQueryCache* cache,
     size_t node_id,
-    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
+    compass_iaa_filter::QueryDecompressionMetrics* metrics) {
     if (cache == nullptr || runtime.tb_storage.block_size == 0 || node_id >= runtime.n_elements) {
         return false;
     }
-
     const size_t byte_offset = node_id / 8;
     const size_t block_id = byte_offset / runtime.tb_storage.block_size;
     const size_t in_block = byte_offset % runtime.tb_storage.block_size;
-    if (block_id >= cache->tb_blocks.size() || block_id >= cache->tb_ready.size() || cache->tb_ready[block_id] == 0) {
-        return false;
-    }
-    if (in_block >= cache->tb_blocks[block_id].size()) {
-        return false;
-    }
 
+    if (block_id >= cache->tb_blocks.size()) {
+        return false;
+    }
+    while (cache->tb_ready[block_id] == 0) {
+        if (ring == nullptr || !ring->has_pending()) {
+            throw std::runtime_error(
+                "TB block is not ready and no pending async jobs exist");
+        }
+        ring->wait_one();
+    }
+    const std::vector<uint8_t>& block = cache->tb_blocks[block_id];
+    if (in_block >= block.size()) {
+        return false;
+    }
     if (metrics != nullptr) {
         ++metrics->tb_cache_hits;
     }
-    const uint8_t byte = cache->tb_blocks[block_id][in_block];
+    const uint8_t byte = block[in_block];
     return ((byte >> (node_id % 8)) & 1u) != 0;
 }
 
 bool fid_match_node(
-    const SequentialEqRuntime& runtime,
-    SequentialEqQueryCache* cache,
+    const AsyncRangeRuntime& runtime,
+    AsyncJobRing* ring,
+    AsyncRangeQueryCache* cache,
     size_t node_id,
-    compass_lz4_filter::QueryDecompressionMetrics* metrics) {
-    if (cache == nullptr || runtime.fid_storage.block_size == 0 || node_id >= runtime.n_elements) {
+    compass_iaa_filter::QueryDecompressionMetrics* metrics) {
+    if (cache == nullptr ||
+        runtime.fid_storage.block_size == 0 ||
+        runtime.numeric_value_bytes == 0 ||
+        node_id >= runtime.n_elements) {
         return false;
     }
 
-    const size_t block_id = node_id / runtime.fid_storage.block_size;
-    const size_t in_block = node_id % runtime.fid_storage.block_size;
-    if (block_id >= cache->fid_blocks.size() || block_id >= cache->fid_ready.size() || cache->fid_ready[block_id] == 0) {
+    const size_t byte_offset = node_id * runtime.numeric_value_bytes;
+    const size_t block_id = byte_offset / runtime.fid_storage.block_size;
+    const size_t in_block_element = (byte_offset % runtime.fid_storage.block_size) / runtime.numeric_value_bytes;
+    if (block_id >= cache->fid_blocks.size()) {
         return false;
     }
-    if (in_block >= cache->fid_blocks[block_id].size()) {
-        return false;
+    while (cache->fid_ready[block_id] == 0) {
+        if (ring == nullptr || !ring->has_pending()) {
+            throw std::runtime_error(
+                "FID block is not ready and no pending async jobs exist");
+        }
+        ring->wait_one();
     }
-
     if (metrics != nullptr) {
         ++metrics->fid_cache_hits;
     }
-    const uint8_t bucket = cache->fid_blocks[block_id][in_block];
-    return runtime.allowed_buckets.test(static_cast<size_t>(bucket));
+
+    const FidScanBlock& block = cache->fid_blocks[block_id];
+    if (block.byte_per_element) {
+        return in_block_element < block.output_bytes && block.matches[in_block_element] != 0;
+    }
+
+    const size_t byte_idx = in_block_element / 8;
+    if (byte_idx >= block.output_bytes) {
+        return false;
+    }
+    return ((block.matches[byte_idx] >> (in_block_element % 8)) & 1u) != 0;
 }
 
 template <typename DistT, typename QueryT>
@@ -1314,11 +1288,10 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     const QueryT* query_data,
     size_t k,
     size_t ef,
-    const compass_lz4_filter::CompassLz4FilterEngine& engine,
-    compass_lz4_filter::QueryBlockCache* cache,
+    const compass_iaa_filter::CompassIaaFilterEngine& engine,
+    compass_iaa_filter::QueryBlockCache* cache,
     SearchCallStats* call_stats) {
     std::vector<std::pair<DistT, hnswlib::labeltype>> result;
-    result.reserve(k);
     if (index.cur_element_count == 0) {
         return result;
     }
@@ -1370,13 +1343,17 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     DistT lower_bound = std::numeric_limits<DistT>::max();
 
     auto timed_eval = [&](bool traversal_mode, size_t node_id) -> bool {
+        const auto t0 = std::chrono::steady_clock::now();
         bool allowed = false;
         if (traversal_mode) {
             allowed = engine.allow_traversal(node_id, cache, &call_stats->decomp);
         } else {
             allowed = engine.allow_result(node_id, cache, &call_stats->decomp);
         }
+        const auto t1 = std::chrono::steady_clock::now();
         ++call_stats->filter_eval_calls;
+        call_stats->filter_eval_time_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
         return allowed;
     };
 
@@ -1434,52 +1411,49 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
         top_candidates.pop();
     }
 
+    size_t sz = top_candidates.size();
+    result.resize(sz);
     while (!top_candidates.empty()) {
         const Pair<DistT> item = top_candidates.top();
         top_candidates.pop();
-        result.emplace_back(item.first, index.getExternalLabel(item.second));
+        result[--sz] = std::make_pair(item.first, index.getExternalLabel(item.second));
     }
-    std::reverse(result.begin(), result.end());
 
     index.visited_list_pool_->releaseVisitedList(vl);
     return result;
 }
 
 template <typename DistT, typename QueryT>
-std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filter(
+std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter(
     const hnswlib::HierarchicalNSW<DistT>& index,
     const QueryT* query_data,
     size_t k,
     size_t ef,
     size_t break_threshold_count,
-    const SequentialEqRuntime& runtime,
-    SequentialEqQueryCache* cache,
-    SequentialEqSearchWorkspace* workspace,
+    const AsyncRangeRuntime& runtime,
+    AsyncJobRing* ring,
+    AsyncRangeQueryCache* cache,
     SearchCallStats* call_stats) {
     std::vector<std::pair<DistT, hnswlib::labeltype>> result;
-    result.reserve(k);
     if (index.cur_element_count == 0 || runtime.empty_result) {
         return result;
     }
 
     if (runtime.n_elements != index.cur_element_count) {
-        throw std::runtime_error("Sequential runtime element count does not match index");
+        throw std::runtime_error("Async runtime element count does not match index");
     }
 
     SearchCallStats local_stats;
     if (call_stats == nullptr) {
         call_stats = &local_stats;
     }
-    if (cache == nullptr || workspace == nullptr) {
-        throw std::runtime_error("SequentialEq search received null cache/workspace");
+    if (ring == nullptr) {
+        throw std::runtime_error("AsyncJobRing is null");
     }
-    if (cache->tb_blocks.size() != runtime.tb_storage.block_count() ||
-        cache->tb_ready.size() != runtime.tb_storage.block_count() ||
-        cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
-        cache->fid_ready.size() != runtime.fid_storage.block_count()) {
-        throw std::runtime_error(
-            "SequentialEq query cache must be fully preallocated before search");
+    if (cache == nullptr) {
+        throw std::runtime_error("AsyncRangeQueryCache is null");
     }
+    ring->flush();
 
     hnswlib::tableint curr_obj = index.enterpoint_node_;
     if (static_cast<int>(curr_obj) == -1) {
@@ -1487,6 +1461,16 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
     }
 
     DistT curdist = index.fstdistfunc_(query_data, index.getDataByInternalId(curr_obj), index.dist_func_param_);
+
+    if (cache->tb_blocks.size() != runtime.tb_storage.block_count() ||
+        cache->tb_ready.size() != runtime.tb_storage.block_count() ||
+        cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
+        cache->fid_ready.size() != runtime.fid_storage.block_count() ||
+        cache->fid_state.size() != runtime.fid_storage.block_count()) {
+        throw std::runtime_error(
+            "AsyncRangeQueryCache must be fully preallocated before search");
+    }
+    submit_tb_prefetch_jobs(ring, runtime, cache, &call_stats->decomp);
 
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
@@ -1512,9 +1496,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         }
     }
 
-    // Decompress TB blocks after upper-layer traversal, before level-0 expansion.
-    prefetch_tb_blocks(runtime, cache, &call_stats->decomp);
-
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
     const hnswlib::vl_type tag = vl->curV;
@@ -1528,7 +1509,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
 
     visited[curr_obj] = tag;
     DistT lower_bound = std::numeric_limits<DistT>::max();
-
     struct FrontierCandidate {
         hnswlib::tableint candidate_id = 0;
         DistT dist{};
@@ -1537,16 +1517,39 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         bool need_fid = false;
     };
 
+    std::vector<hnswlib::tableint> neighbor_ids;
+    neighbor_ids.reserve(index.maxM0_);
     std::vector<FrontierCandidate> frontier_candidates;
     frontier_candidates.reserve(index.maxM0_);
+    std::vector<size_t> pending_fid_blocks_to_submit;
+    pending_fid_blocks_to_submit.reserve(index.maxM0_ * 2);
+    std::vector<uint8_t> pending_fid_block_marks(cache->fid_state.size(), static_cast<uint8_t>(0));
     std::vector<FrontierCandidate> temp_result_buffer;
     temp_result_buffer.reserve(index.maxM0_ * 4);
     std::vector<FrontierCandidate> next_temp_result_buffer;
     next_temp_result_buffer.reserve(index.maxM0_ * 4);
 
-    std::vector<size_t> pending_fid_blocks_to_submit;
-    pending_fid_blocks_to_submit.reserve(index.maxM0_ * 2);
-    std::vector<uint8_t> pending_fid_block_marks(cache->fid_ready.size(), static_cast<uint8_t>(0));
+    auto poll_ready_jobs = [&]() {
+        ++call_stats->job_poll_calls;
+        call_stats->job_poll_ready += static_cast<uint64_t>(ring->poll_ready_jobs());
+    };
+
+    auto submit_pending_fid_blocks = [&]() {
+        if (pending_fid_blocks_to_submit.empty()) {
+            return;
+        }
+        for (size_t fid_block_id : pending_fid_blocks_to_submit) {
+            if (fid_block_id >= pending_fid_block_marks.size()) {
+                continue;
+            }
+            pending_fid_block_marks[fid_block_id] = static_cast<uint8_t>(0);
+            if (cache->fid_state[fid_block_id] == kFidStateNotSubmitted) {
+                submit_fid_scan_job(ring, runtime, fid_block_id, cache, &call_stats->decomp);
+                ++call_stats->fid_jobs_submitted;
+            }
+        }
+        pending_fid_blocks_to_submit.clear();
+    };
 
     auto push_result_candidate_if_allowed = [&](const FrontierCandidate& entry) {
         if (entry.deleted) {
@@ -1561,24 +1564,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         }
     };
 
-    auto submit_pending_fid_blocks = [&]() -> bool {
-        // For synchronous LZ4 range flow, submit as soon as any grouped block is pending.
-        // A threshold gate can starve small block-count datasets (e.g., 2 total FID blocks).
-        if (pending_fid_blocks_to_submit.empty()) {
-            return false;
-        }
-        for (size_t fid_block_id : pending_fid_blocks_to_submit) {
-            if (fid_block_id >= pending_fid_block_marks.size()) {
-                continue;
-            }
-            pending_fid_block_marks[fid_block_id] = static_cast<uint8_t>(0);
-            prefetch_fid_block(runtime, fid_block_id, cache, &call_stats->decomp);
-            ++call_stats->fid_blocks_submitted;
-        }
-        pending_fid_blocks_to_submit.clear();
-        return true;
-    };
-
     auto retry_temp_buffer_once = [&]() {
         if (temp_result_buffer.empty()) {
             return;
@@ -1591,16 +1576,20 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 push_result_candidate_if_allowed(entry);
                 continue;
             }
-            if (entry.fid_block_id >= cache->fid_ready.size()) {
+            if (entry.fid_block_id >= cache->fid_state.size()) {
                 ++call_stats->filter_eval_calls;
                 continue;
             }
-            if (cache->fid_ready[entry.fid_block_id] == 0) {
+            if (cache->fid_state[entry.fid_block_id] != kFidStateReady) {
                 next_temp_result_buffer.push_back(entry);
                 continue;
             }
-            const bool fid_match =
-                fid_match_node(runtime, cache, static_cast<size_t>(entry.candidate_id), &call_stats->decomp);
+            const bool fid_match = fid_match_node(
+                runtime,
+                ring,
+                cache,
+                static_cast<size_t>(entry.candidate_id),
+                &call_stats->decomp);
             ++call_stats->filter_eval_calls;
             ++call_stats->fid_ready_candidates;
             if (fid_match) {
@@ -1610,43 +1599,64 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         temp_result_buffer.swap(next_temp_result_buffer);
     };
 
-    // Base-layer traversal loop with staged LZ4 grouping.
+    // Base-layer traversal loop with staged non-blocking range FID handling.
     while (true) {
-        // Stage 0: retry buffered result candidates whose FID may now be ready.
-        retry_temp_buffer_once();
+        // Stage 0: progress async jobs and retry deferred entries.
+        poll_ready_jobs();
+        if (!temp_result_buffer.empty()) {
+            retry_temp_buffer_once();
+        }
 
         if (top_candidates.size() >= break_threshold_count) {
             break;
         }
 
         if (candidate_set.empty()) {
-            // Stage 6a: no frontier left.
-            // If enough pending FID blocks exist, decompress them and retry buffered entries;
-            // otherwise terminate without forcing a sub-threshold flush.
-            if (!submit_pending_fid_blocks()) {
-                break;
+            if (temp_result_buffer.empty()) {
+                if (!ring->has_pending()) {
+                    break;
+                }
+                ring->wait_one();
+                poll_ready_jobs();
+                retry_temp_buffer_once();
+                continue;
             }
-            retry_temp_buffer_once();
-            if (candidate_set.empty()) {
-                break;
+            if (ring->has_pending()) {
+                ring->wait_one();
+                poll_ready_jobs();
+                retry_temp_buffer_once();
+                continue;
             }
-            continue;
+
+            bool has_inflight = false;
+            for (const FrontierCandidate& buffered_entry : temp_result_buffer) {
+                if (buffered_entry.need_fid &&
+                    buffered_entry.fid_block_id < cache->fid_state.size() &&
+                    cache->fid_state[buffered_entry.fid_block_id] == kFidStateInflight) {
+                    has_inflight = true;
+                    break;
+                }
+            }
+            if (has_inflight) {
+                throw std::runtime_error(
+                    "Temporary result entries remain while FID blocks are inflight but no pending jobs exist");
+            }
+            break;
         }
 
         const Pair<DistT> current = candidate_set.top();
         const DistT candidate_dist = -current.first;
-
         if (candidate_dist > lower_bound && top_candidates.size() >= ef) {
-            // Stage 6b: ef/lower_bound early-stop.
-            // Before stopping, allow one batched FID decompress/retry pass if available.
-            if (!submit_pending_fid_blocks()) {
+            if (temp_result_buffer.empty() && !ring->has_pending()) {
                 break;
             }
-            retry_temp_buffer_once();
-            if (candidate_set.empty()) {
-                break;
+            if (ring->has_pending()) {
+                ring->wait_one();
+                poll_ready_jobs();
+                retry_temp_buffer_once();
+                continue;
             }
-            continue;
+            break;
         }
         candidate_set.pop();
 
@@ -1654,10 +1664,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         int* data = reinterpret_cast<int*>(index.get_linklist0(current_node_id));
         const size_t size = index.getListCount(reinterpret_cast<hnswlib::linklistsizeint*>(data));
 
-        // Stage 1: gather unvisited neighbors, apply TB prefilter, and group survivors.
-        std::vector<hnswlib::tableint>& neighbor_ids = workspace->neighbor_ids;
+        // Stage 1: gather unvisited neighbors and apply TB prefilter (OR over selected range buckets).
         neighbor_ids.clear();
-
         for (size_t j = 1; j <= size; ++j) {
             const hnswlib::tableint candidate_id = static_cast<hnswlib::tableint>(*(data + j));
             if (candidate_id >= index.cur_element_count) {
@@ -1673,22 +1681,29 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         frontier_candidates.clear();
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
-            const bool tb_match = tb_match_node(runtime, cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
+            const bool tb_match = tb_match_node(
+                runtime,
+                ring,
+                cache,
+                static_cast<size_t>(candidate_id),
+                &call_stats->decomp);
             ++call_stats->filter_eval_calls;
             if (!tb_match) {
                 ++call_stats->neighbors_tb_rejected;
                 continue;
             }
-            ++call_stats->neighbors_tb_passed;
 
+            ++call_stats->neighbors_tb_passed;
             FrontierCandidate entry;
             entry.candidate_id = candidate_id;
             entry.deleted = index.isMarkedDeleted(candidate_id);
             if (runtime.fid_storage.block_size != 0) {
-                entry.fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
+                const size_t byte_offset =
+                    static_cast<size_t>(candidate_id) * runtime.numeric_value_bytes;
+                entry.fid_block_id = byte_offset / runtime.fid_storage.block_size;
                 entry.need_fid = true;
-                if (entry.fid_block_id < cache->fid_ready.size() &&
-                    cache->fid_ready[entry.fid_block_id] == 0 &&
+                if (entry.fid_block_id < cache->fid_state.size() &&
+                    cache->fid_state[entry.fid_block_id] == kFidStateNotSubmitted &&
                     entry.fid_block_id < pending_fid_block_marks.size() &&
                     pending_fid_block_marks[entry.fid_block_id] == 0) {
                     pending_fid_block_marks[entry.fid_block_id] = static_cast<uint8_t>(1);
@@ -1698,10 +1713,10 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             frontier_candidates.push_back(entry);
         }
 
-        // Stage 2: submit/decompress grouped FID blocks before distance.
+        // Stage 2: submit grouped FID range-scan jobs before distance calculation.
         submit_pending_fid_blocks();
 
-        // Stage 3: compute distance for grouped TB-passed neighbors.
+        // Stage 3: compute distances for all TB-passed neighbors.
         for (FrontierCandidate& entry : frontier_candidates) {
             entry.dist = index.fstdistfunc_(
                 query_data,
@@ -1709,9 +1724,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 index.dist_func_param_);
         }
 
-        // Stage 4: traversal/result split.
-        // Keep traversal quality by pushing TB-passed candidates immediately to candidate_set.
-        // For final result insertion, require FID ready+match; otherwise keep in temporary buffer.
+        // Stage 4: non-blocking completion checks and candidate/result updates.
+        poll_ready_jobs();
         for (const FrontierCandidate& entry : frontier_candidates) {
             const bool consider = (top_candidates.size() < ef || lower_bound > entry.dist);
             if (!consider) {
@@ -1727,9 +1741,14 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 continue;
             }
 
-            if (entry.fid_block_id < cache->fid_ready.size() && cache->fid_ready[entry.fid_block_id] != 0) {
-                const bool fid_match =
-                    fid_match_node(runtime, cache, static_cast<size_t>(entry.candidate_id), &call_stats->decomp);
+            if (entry.fid_block_id < cache->fid_state.size() &&
+                cache->fid_state[entry.fid_block_id] == kFidStateReady) {
+                const bool fid_match = fid_match_node(
+                    runtime,
+                    ring,
+                    cache,
+                    static_cast<size_t>(entry.candidate_id),
+                    &call_stats->decomp);
                 ++call_stats->filter_eval_calls;
                 ++call_stats->fid_ready_candidates;
                 if (fid_match) {
@@ -1742,21 +1761,29 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             ++call_stats->deferred_candidates_enqueued;
         }
 
-        // Stage 5: re-check temporary buffer after newly decompressed FID blocks.
+        // Stage 5: retry deferred candidates that may now be ready.
         retry_temp_buffer_once();
+
+        // Keep pruning effective: if no accepted result exists yet, wait for at least one
+        // FID completion to avoid over-expanding candidate_set with lower_bound=inf.
+        if (top_candidates.empty() && !temp_result_buffer.empty() && ring->has_pending()) {
+            ring->wait_one();
+            poll_ready_jobs();
+            retry_temp_buffer_once();
+        }
     }
 
-    // Stage 7: finalize top-k result ordering.
     while (top_candidates.size() > k) {
         top_candidates.pop();
     }
 
+    size_t sz = top_candidates.size();
+    result.resize(sz);
     while (!top_candidates.empty()) {
         const Pair<DistT> item = top_candidates.top();
         top_candidates.pop();
-        result.emplace_back(item.first, index.getExternalLabel(item.second));
+        result[--sz] = std::make_pair(item.first, index.getExternalLabel(item.second));
     }
-    std::reverse(result.begin(), result.end());
 
     index.visited_list_pool_->releaseVisitedList(vl);
     return result;
@@ -1788,9 +1815,9 @@ RunStats run_search_typed(
     const Args& args,
     int dim,
     const DenseVectors<QueryT>& queries,
-    const compass_lz4_filter::CompassLz4FilterEngine& engine,
+    const compass_iaa_filter::CompassIaaFilterEngine& engine,
     const MetadataTable& metadata,
-    const SequentialEqRuntime* sequential_runtime) {
+    const AsyncRangeRuntime* async_runtime) {
     const size_t resolved_ef = resolve_ef(args);
     const double effective_break_factor = resolve_effective_break_factor(args, resolved_ef);
     size_t break_threshold_count = static_cast<size_t>(
@@ -1809,24 +1836,20 @@ RunStats run_search_typed(
             ", graph=" + std::to_string(index.getCurrentElementCount()));
     }
 
+    if (async_runtime == nullptr || !async_runtime->enabled) {
+        throw std::runtime_error("Async range runtime is not initialized");
+    }
+
     RunStats stats;
-    const bool use_sequential_eq = (sequential_runtime != nullptr && sequential_runtime->enabled);
+    stats.execution_mode = "async_range";
     stats.resolved_ef = resolved_ef;
     stats.effective_break_factor = effective_break_factor;
     const size_t total_elements = index.getCurrentElementCount();
+    const size_t async_job_output_bytes = required_async_job_output_bytes(*async_runtime);
+    std::unique_ptr<AsyncJobRing> shared_ring;
+    shared_ring = std::make_unique<AsyncJobRing>(128, 64, async_job_output_bytes);
 
-    std::vector<size_t> result_nodes;
-    std::string gt_parse_reason;
-    const std::optional<RangePredicateSpec> gt_spec =
-        parse_single_numeric_range_predicate(args.filter_expression, &gt_parse_reason);
-    if (gt_spec.has_value() && !args.payload_jsonl.empty()) {
-        result_nodes = collect_numeric_result_nodes_from_jsonl(
-            args.payload_jsonl,
-            *gt_spec,
-            index.getCurrentElementCount());
-    } else {
-        result_nodes = engine.collect_result_candidates();
-    }
+    std::vector<size_t> result_nodes = async_runtime->numeric_result_nodes;
     std::vector<FilteredCandidate> filtered_candidates;
     filtered_candidates.reserve(result_nodes.size());
     for (size_t node_id : result_nodes) {
@@ -1874,13 +1897,36 @@ RunStats run_search_typed(
         }
         per_query_out
             << "query_id,recall_at_k,enns_size,anns_size,filter_time_ms,search_time_ms,"
-            << "lz4_decompress_time_ms,fid_blocks_decompressed,tb_blocks_decompressed,"
-            << "fid_cache_hits,tb_cache_hits,fid_tb_mismatch_count,fid_tb_mismatch_log_capped\n";
+            << "lz4_decompress_time_ms,iaa_decompress_time_ms,fid_blocks_decompressed,tb_blocks_decompressed,"
+            << "fid_cache_hits,tb_cache_hits\n";
     }
 
     const bool capture_per_query = per_query_out.is_open();
     if (capture_per_query) {
         stats.per_query_metrics.reserve(query_count);
+    }
+
+    AsyncRangeQueryCache query_async_cache = make_preallocated_query_cache(*async_runtime);
+    reset_preallocated_query_cache(*async_runtime, &query_async_cache);
+    shared_ring->prefault_output_buffers();
+    prefault_query_cache_buffers(&query_async_cache);
+
+    // Untimed warm-up to prefault/touch async paths before measured queries.
+    if (query_count > 0) {
+        const QueryT* warmup_qptr = queries.values.data();
+        SearchCallStats warmup_stats;
+        reset_preallocated_query_cache(*async_runtime, &query_async_cache);
+        (void)search_with_async_range_filter<DistT, QueryT>(
+            index,
+            warmup_qptr,
+            static_cast<size_t>(args.k),
+            resolved_ef,
+            break_threshold_count,
+            *async_runtime,
+            shared_ring.get(),
+            &query_async_cache,
+            &warmup_stats);
+        shared_ring->flush();
     }
 
     size_t returned_results = 0;
@@ -1889,41 +1935,26 @@ RunStats run_search_typed(
         const QueryT* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
 
         SearchCallStats call_stats;
-        SequentialEqQueryCache query_cache;
-        SequentialEqSearchWorkspace query_workspace;
-        if (use_sequential_eq) {
-            query_cache = make_preallocated_query_cache(*sequential_runtime);
-            query_workspace.neighbor_ids.reserve(index.maxM0_);
-        }
+        reset_preallocated_query_cache(*async_runtime, &query_async_cache);
 
         const auto search_start = std::chrono::steady_clock::now();
-        std::vector<std::pair<DistT, hnswlib::labeltype>> result;
-        if (use_sequential_eq) {
-            result = search_with_sequential_eq_filter<DistT, QueryT>(
+        std::vector<std::pair<DistT, hnswlib::labeltype>> result =
+            search_with_async_range_filter<DistT, QueryT>(
                 index,
                 qptr,
                 static_cast<size_t>(args.k),
                 resolved_ef,
                 break_threshold_count,
-                *sequential_runtime,
-                &query_cache,
-                &query_workspace,
+                *async_runtime,
+                shared_ring.get(),
+                &query_async_cache,
                 &call_stats);
-        } else {
-            compass_lz4_filter::QueryBlockCache engine_query_cache(engine.attribute_count());
-            result = search_with_compass_filter<DistT, QueryT>(
-                index,
-                qptr,
-                static_cast<size_t>(args.k),
-                resolved_ef,
-                engine,
-                &engine_query_cache,
-                &call_stats);
-        }
         const auto search_end = std::chrono::steady_clock::now();
 
         const uint64_t query_search_ns = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(search_end - search_start).count());
+        // Exclude final async-ring drain from measured search latency.
+        shared_ring->flush();
 
         std::priority_queue<std::pair<DistT, hnswlib::labeltype>> enns_heap =
             build_enns_heap(index, qptr, static_cast<size_t>(args.k), filtered_candidates);
@@ -1967,21 +1998,21 @@ RunStats run_search_typed(
         stats.filter_time_total_ns += call_stats.filter_eval_time_ns;
         stats.search_time_total_ns += query_search_ns;
 
-        stats.lz4_decompress_time_ns += call_stats.decomp.lz4_decompress_time_ns;
+        stats.iaa_decompress_time_ns += call_stats.decomp.iaa_decompress_time_ns;
         stats.fid_blocks_decompressed += call_stats.decomp.fid_blocks_decompressed;
         stats.tb_blocks_decompressed += call_stats.decomp.tb_blocks_decompressed;
         stats.fid_cache_hits += call_stats.decomp.fid_cache_hits;
         stats.tb_cache_hits += call_stats.decomp.tb_cache_hits;
         stats.fid_bytes_decompressed += call_stats.decomp.fid_bytes_decompressed;
         stats.tb_bytes_decompressed += call_stats.decomp.tb_bytes_decompressed;
-        stats.fid_tb_mismatch_count += call_stats.fid_tb_mismatch_count;
-        stats.fid_tb_mismatch_log_capped += call_stats.fid_tb_mismatch_log_capped;
         stats.neighbors_tb_passed += call_stats.neighbors_tb_passed;
         stats.neighbors_tb_rejected += call_stats.neighbors_tb_rejected;
         stats.fid_ready_candidates += call_stats.fid_ready_candidates;
         stats.deferred_candidates_enqueued += call_stats.deferred_candidates_enqueued;
         stats.deferred_retry_rounds += call_stats.deferred_retry_rounds;
-        stats.fid_blocks_submitted += call_stats.fid_blocks_submitted;
+        stats.fid_jobs_submitted += call_stats.fid_jobs_submitted;
+        stats.job_poll_calls += call_stats.job_poll_calls;
+        stats.job_poll_ready += call_stats.job_poll_ready;
         stats.search_loop_time_ns += query_search_ns;
 
         returned_results += result.size();
@@ -2006,13 +2037,11 @@ RunStats run_search_typed(
             m.filter_time_ns = call_stats.filter_eval_time_ns;
             m.search_time_ns = query_search_ns;
 
-            m.lz4_decompress_time_ns = call_stats.decomp.lz4_decompress_time_ns;
+            m.iaa_decompress_time_ns = call_stats.decomp.iaa_decompress_time_ns;
             m.fid_blocks_decompressed = call_stats.decomp.fid_blocks_decompressed;
             m.tb_blocks_decompressed = call_stats.decomp.tb_blocks_decompressed;
             m.fid_cache_hits = call_stats.decomp.fid_cache_hits;
             m.tb_cache_hits = call_stats.decomp.tb_cache_hits;
-            m.fid_tb_mismatch_count = call_stats.fid_tb_mismatch_count;
-            m.fid_tb_mismatch_log_capped = call_stats.fid_tb_mismatch_log_capped;
             stats.per_query_metrics.push_back(m);
 
             per_query_out
@@ -2022,13 +2051,12 @@ RunStats run_search_typed(
                 << result.size() << ','
                 << std::setprecision(6) << (static_cast<double>(call_stats.filter_eval_time_ns) / 1e6) << ','
                 << std::setprecision(6) << (static_cast<double>(query_search_ns) / 1e6) << ','
-                << std::setprecision(6) << (static_cast<double>(call_stats.decomp.lz4_decompress_time_ns) / 1e6) << ','
+                << std::setprecision(6) << (static_cast<double>(call_stats.decomp.iaa_decompress_time_ns) / 1e6) << ','
+                << std::setprecision(6) << (static_cast<double>(call_stats.decomp.iaa_decompress_time_ns) / 1e6) << ','
                 << call_stats.decomp.fid_blocks_decompressed << ','
                 << call_stats.decomp.tb_blocks_decompressed << ','
                 << call_stats.decomp.fid_cache_hits << ','
-                << call_stats.decomp.tb_cache_hits << ','
-                << call_stats.fid_tb_mismatch_count << ','
-                << call_stats.fid_tb_mismatch_log_capped
+                << call_stats.decomp.tb_cache_hits
                 << '\n';
         }
     }
@@ -2051,8 +2079,8 @@ std::string build_summary(
     const MetadataTable& metadata,
     const filter_expr::Expression& expr,
     const RunStats& stats,
-    const CompressionStats& compression_stats,
-    const RangeBucketMappingReport& range_bucket_report) {
+    const AsyncRangeRuntime& runtime,
+    const CompressionStats& compression_stats) {
     const double loop_ms = static_cast<double>(stats.search_loop_time_ns) / 1e6;
     const double avg_query_ms =
         (stats.query_count > 0) ? (loop_ms / static_cast<double>(stats.query_count)) : 0.0;
@@ -2070,7 +2098,7 @@ std::string build_summary(
             ? (static_cast<double>(stats.search_time_total_ns) / 1e6 / static_cast<double>(stats.query_count))
             : 0.0;
 
-    const double decomp_ms = static_cast<double>(stats.lz4_decompress_time_ns) / 1e6;
+    const double decomp_ms = static_cast<double>(stats.iaa_decompress_time_ns) / 1e6;
     const double avg_decomp_per_query_ms =
         (stats.query_count > 0)
             ? (decomp_ms / static_cast<double>(stats.query_count))
@@ -2079,26 +2107,36 @@ std::string build_summary(
         (stats.search_loop_time_ns > 0)
             ? (static_cast<double>(stats.query_count) * 1e9 / static_cast<double>(stats.search_loop_time_ns))
             : 0.0;
-    const uint64_t total_raw_bytes = compression_stats.fid_raw_bytes + compression_stats.tb_raw_bytes;
+    const uint64_t total_raw_bytes =
+        compression_stats.number_raw_bytes + compression_stats.tb_raw_bytes;
     const uint64_t total_compressed_bytes =
-        compression_stats.fid_compressed_bytes + compression_stats.tb_compressed_bytes;
-    const double fid_ratio = compression_ratio_raw_over_compressed(
-        compression_stats.fid_raw_bytes,
-        compression_stats.fid_compressed_bytes);
+        compression_stats.number_compressed_bytes + compression_stats.tb_compressed_bytes;
+    const double number_ratio = compression_ratio_raw_over_compressed(
+        compression_stats.number_raw_bytes,
+        compression_stats.number_compressed_bytes);
     const double tb_ratio = compression_ratio_raw_over_compressed(
         compression_stats.tb_raw_bytes,
         compression_stats.tb_compressed_bytes);
-    const double total_ratio =
-        compression_ratio_raw_over_compressed(total_raw_bytes, total_compressed_bytes);
-    const double total_compressed_pct = compression_pct_of_raw(total_raw_bytes, total_compressed_bytes);
+    const double total_ratio = compression_ratio_raw_over_compressed(
+        total_raw_bytes,
+        total_compressed_bytes);
+    const double total_compressed_pct = compression_pct_of_raw(
+        total_raw_bytes,
+        total_compressed_bytes);
+    const double fid_baseline_ratio = compression_ratio_raw_over_compressed(
+        compression_stats.fid_baseline_raw_bytes,
+        compression_stats.fid_baseline_compressed_bytes);
+    const double number_vs_fid_delta = number_ratio - fid_baseline_ratio;
 
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(3);
-    oss << "hnswlib_filter_search summary\n";
+    oss << "compass_search_w_iaa summary\n";
     oss << "dataset_type: " << args.dataset_type << "\n";
     oss << "query_path: " << args.query_path << "\n";
     oss << "graph_path: " << args.graph_path << "\n";
     oss << "fidtb_manifest: " << args.fidtb_manifest << "\n";
+    oss << "fid_block_size_bytes: " << args.fid_block_size_bytes << "\n";
+    oss << "tb_block_size_bytes: " << args.tb_block_size_bytes << "\n";
     oss << "index_elements: " << index_info.cur_element_count << "\n";
     oss << "index_dimension: " << index_dim << "\n";
     oss << "index_vector_type: " << index_vector_type << "\n";
@@ -2109,46 +2147,52 @@ std::string build_summary(
         << ", break_factor: " << stats.effective_break_factor << "\n";
     oss << "fid_block_size_bytes: " << args.fid_block_size_bytes << "\n";
     oss << "tb_block_size_bytes: " << args.tb_block_size_bytes << "\n";
-    oss << "fid_raw_bytes: " << compression_stats.fid_raw_bytes << "\n";
-    oss << "fid_compressed_bytes: " << compression_stats.fid_compressed_bytes << "\n";
+    oss << "number_raw_bytes: " << compression_stats.number_raw_bytes << "\n";
+    oss << "number_compressed_bytes: " << compression_stats.number_compressed_bytes << "\n";
+    oss << "fid_baseline_raw_bytes: " << compression_stats.fid_baseline_raw_bytes << "\n";
+    oss << "fid_baseline_compressed_bytes: " << compression_stats.fid_baseline_compressed_bytes << "\n";
     oss << "tb_raw_bytes: " << compression_stats.tb_raw_bytes << "\n";
     oss << "tb_compressed_bytes: " << compression_stats.tb_compressed_bytes << "\n";
-    oss << "fid_compression_ratio_raw_over_compressed: " << fid_ratio << "\n";
+    // Keep legacy key for CSV parser compatibility: now points to number compression ratio.
+    oss << "fid_compression_ratio_raw_over_compressed: " << number_ratio << "\n";
     oss << "tb_compression_ratio_raw_over_compressed: " << tb_ratio << "\n";
+    oss << "number_compression_ratio_raw_over_compressed: " << number_ratio << "\n";
+    oss << "fid_baseline_compression_ratio_raw_over_compressed: " << fid_baseline_ratio << "\n";
+    oss << "number_vs_fid_compression_ratio_delta: " << number_vs_fid_delta << "\n";
     oss << "filter_payload_raw_bytes: " << total_raw_bytes << "\n";
     oss << "filter_payload_compressed_bytes: " << total_compressed_bytes << "\n";
     oss << "filter_payload_compression_ratio_raw_over_compressed: " << total_ratio << "\n";
     oss << "filter_payload_compressed_pct_of_raw: " << total_compressed_pct << "\n";
     oss << "filter: " << expr.source() << "\n";
-    oss << "range_bucket_mapping_status: " << range_bucket_report.status << "\n";
-    if (!range_bucket_report.detail.empty()) {
-        oss << "range_bucket_mapping_detail: " << range_bucket_report.detail << "\n";
+    oss << "execution_mode: " << stats.execution_mode << "\n";
+    oss << "range_bucket_mapping_status: " << (runtime.empty_result ? "empty" : "ok") << "\n";
+    oss << "range_bucket_mapping_field: " << runtime.field << "\n";
+    oss << "range_bucket_mapping_nfilters: " << runtime.nfilters << "\n";
+    oss << "range_bucket_mapping_missing_bucket: " << runtime.missing_bucket << "\n";
+    oss << "range_bucket_mapping_usable_bins: " << runtime.usable_bins << "\n";
+    oss << "range_bucket_mapping_min_value: " << runtime.min_value << "\n";
+    oss << "range_bucket_mapping_max_value: " << runtime.max_value << "\n";
+    oss << "range_bucket_mapping_bucket_width: "
+        << ((runtime.usable_bins > 0 && runtime.max_value > runtime.min_value)
+                ? ((runtime.max_value - runtime.min_value) / static_cast<double>(runtime.usable_bins))
+                : 0.0)
+        << "\n";
+    if (runtime.low_bounded) {
+        oss << "range_bucket_mapping_low: " << runtime.low << "\n";
+        oss << "range_bucket_mapping_low_inclusive: "
+            << (runtime.low_inclusive ? "true" : "false") << "\n";
     }
-    if (range_bucket_report.applicable) {
-        oss << "range_bucket_mapping_field: " << range_bucket_report.field << "\n";
-        oss << "range_bucket_mapping_nfilters: " << range_bucket_report.nfilters << "\n";
-        oss << "range_bucket_mapping_missing_bucket: " << range_bucket_report.missing_bucket << "\n";
-        oss << "range_bucket_mapping_usable_bins: " << range_bucket_report.usable_bins << "\n";
-        oss << "range_bucket_mapping_min_value: " << range_bucket_report.min_value << "\n";
-        oss << "range_bucket_mapping_max_value: " << range_bucket_report.max_value << "\n";
-        oss << "range_bucket_mapping_bucket_width: " << range_bucket_report.bucket_width << "\n";
-        if (range_bucket_report.low_bounded) {
-            oss << "range_bucket_mapping_low: " << range_bucket_report.low << "\n";
-            oss << "range_bucket_mapping_low_inclusive: "
-                << (range_bucket_report.low_inclusive ? "true" : "false") << "\n";
-        }
-        if (range_bucket_report.high_bounded) {
-            oss << "range_bucket_mapping_high: " << range_bucket_report.high << "\n";
-            oss << "range_bucket_mapping_high_inclusive: "
-                << (range_bucket_report.high_inclusive ? "true" : "false") << "\n";
-        }
-        oss << "range_bucket_mapping_empty_result: "
-            << (range_bucket_report.empty_result ? "true" : "false") << "\n";
-        oss << "range_bucket_mapping_bucket_low: " << range_bucket_report.bucket_low << "\n";
-        oss << "range_bucket_mapping_bucket_high: " << range_bucket_report.bucket_high << "\n";
-        oss << "range_bucket_mapping_selected_bucket_count: "
-            << range_bucket_report.selected_bucket_count << "\n";
+    if (runtime.high_bounded) {
+        oss << "range_bucket_mapping_high: " << runtime.high << "\n";
+        oss << "range_bucket_mapping_high_inclusive: "
+            << (runtime.high_inclusive ? "true" : "false") << "\n";
     }
+    oss << "range_bucket_mapping_empty_result: " << (runtime.empty_result ? "true" : "false") << "\n";
+    oss << "range_bucket_mapping_bucket_low: " << static_cast<int>(runtime.bucket_low) << "\n";
+    oss << "range_bucket_mapping_bucket_high: " << static_cast<int>(runtime.bucket_high) << "\n";
+    oss << "range_bucket_mapping_selected_bucket_count: "
+        << (runtime.empty_result ? 0 : (static_cast<int>(runtime.bucket_high) - static_cast<int>(runtime.bucket_low) + 1))
+        << "\n";
 
     // Keep legacy metadata_* keys for script compatibility.
     oss << "metadata_total_labels: " << metadata.total_labels << "\n";
@@ -2174,7 +2218,9 @@ std::string build_summary(
     oss << "avg_filter_time_per_query_ms: " << avg_filter_per_query_ms << "\n";
     oss << "avg_search_time_per_query_ms: " << avg_search_per_query_ms << "\n";
 
+    // Keep the legacy key for compatibility with scripts that parse previous output.
     oss << "lz4_decompress_time_ms: " << decomp_ms << "\n";
+    oss << "iaa_decompress_time_ms: " << decomp_ms << "\n";
     oss << "avg_decompress_time_per_query_ms: " << avg_decomp_per_query_ms << "\n";
     oss << "fid_blocks_decompressed: " << stats.fid_blocks_decompressed << "\n";
     oss << "tb_blocks_decompressed: " << stats.tb_blocks_decompressed << "\n";
@@ -2182,21 +2228,18 @@ std::string build_summary(
     oss << "tb_cache_hits: " << stats.tb_cache_hits << "\n";
     oss << "fid_bytes_decompressed: " << stats.fid_bytes_decompressed << "\n";
     oss << "tb_bytes_decompressed: " << stats.tb_bytes_decompressed << "\n";
-    oss << "fid_tb_mismatch_count: " << stats.fid_tb_mismatch_count << "\n";
-    oss << "fid_tb_mismatch_log_capped: " << stats.fid_tb_mismatch_log_capped << "\n";
     oss << "debug_neighbors_tb_passed: " << stats.neighbors_tb_passed << "\n";
     oss << "debug_neighbors_tb_rejected: " << stats.neighbors_tb_rejected << "\n";
     oss << "debug_fid_ready_candidates: " << stats.fid_ready_candidates << "\n";
     oss << "debug_deferred_candidates_enqueued: " << stats.deferred_candidates_enqueued << "\n";
     oss << "debug_deferred_retry_rounds: " << stats.deferred_retry_rounds << "\n";
-    oss << "debug_fid_blocks_submitted: " << stats.fid_blocks_submitted << "\n";
+    oss << "debug_fid_jobs_submitted: " << stats.fid_jobs_submitted << "\n";
+    oss << "debug_job_poll_calls: " << stats.job_poll_calls << "\n";
+    oss << "debug_job_poll_ready: " << stats.job_poll_ready << "\n";
 
     if (stats.queries_with_enns_lt_k > 0) {
         oss << "warning: filtering condition is too restrictive for k on "
             << stats.queries_with_enns_lt_k << " queries\n";
-    }
-    if (stats.fid_tb_mismatch_count > 0) {
-        oss << "warning: FID/TB consistency mismatches detected\n";
     }
     return oss.str();
 }
@@ -2216,7 +2259,7 @@ void write_summary_if_needed(const std::string& summary_text, const std::string&
     ofs << summary_text;
 }
 
-MetadataTable build_manifest_backed_metadata(const compass_lz4_filter::ManifestData& manifest) {
+MetadataTable build_manifest_backed_metadata(const compass_iaa_filter::ManifestData& manifest) {
     MetadataTable table;
     table.total_labels = manifest.n_elements;
     table.populated_rows = manifest.n_elements;
@@ -2241,40 +2284,36 @@ int main(int argc, char** argv) {
             throw std::runtime_error("Filter expression did not reference any fields");
         }
 
-        const compass_lz4_filter::CompassLz4FilterEngine engine =
-            compass_lz4_filter::CompassLz4FilterEngine::Build(
+        const compass_iaa_filter::CompassIaaFilterEngine engine =
+            compass_iaa_filter::CompassIaaFilterEngine::Build(
                 args.fidtb_manifest,
                 args.filter_expression,
                 fields,
                 args.fid_block_size_bytes,
                 args.tb_block_size_bytes);
-        const RangeBucketMappingReport range_bucket_report =
-            derive_range_bucket_mapping_report(args, engine);
-        if (range_bucket_report.applicable) {
-            std::cout
-                << "[RANGE_BUCKET_MAP] field=" << range_bucket_report.field
-                << " status=" << range_bucket_report.status
-                << " low="
-                << (range_bucket_report.low_bounded ? std::to_string(range_bucket_report.low) : std::string("-inf"))
-                << " high="
-                << (range_bucket_report.high_bounded ? std::to_string(range_bucket_report.high) : std::string("+inf"))
-                << " min_value=" << range_bucket_report.min_value
-                << " max_value=" << range_bucket_report.max_value
-                << " bucket_width=" << range_bucket_report.bucket_width
-                << " usable_bins=" << range_bucket_report.usable_bins
-                << " missing_bucket=" << range_bucket_report.missing_bucket
-                << " bucket_low=" << range_bucket_report.bucket_low
-                << " bucket_high=" << range_bucket_report.bucket_high
-                << " selected_bucket_count=" << range_bucket_report.selected_bucket_count
-                << "\n";
-        } else {
-            std::cout
-                << "[RANGE_BUCKET_MAP] status=" << range_bucket_report.status
-                << " detail=" << range_bucket_report.detail
-                << "\n";
-        }
-        const SequentialEqRuntime sequential_runtime = build_sequential_eq_runtime(args, engine);
-        const CompressionStats compression_stats = compute_compression_stats(sequential_runtime);
+        const AsyncRangeRuntime async_runtime = build_async_range_runtime(args, engine);
+        std::cout
+            << "[RANGE_BUCKET_MAP] field=" << async_runtime.field
+            << " status=" << (async_runtime.empty_result ? "empty" : "ok")
+            << " low="
+            << (async_runtime.low_bounded ? std::to_string(async_runtime.low) : std::string("-inf"))
+            << " high="
+            << (async_runtime.high_bounded ? std::to_string(async_runtime.high) : std::string("+inf"))
+            << " min_value=" << async_runtime.min_value
+            << " max_value=" << async_runtime.max_value
+            << " bucket_width="
+            << ((async_runtime.usable_bins > 0 && async_runtime.max_value > async_runtime.min_value)
+                    ? ((async_runtime.max_value - async_runtime.min_value) / static_cast<double>(async_runtime.usable_bins))
+                    : 0.0)
+            << " usable_bins=" << async_runtime.usable_bins
+            << " missing_bucket=" << async_runtime.missing_bucket
+            << " bucket_low=" << static_cast<int>(async_runtime.bucket_low)
+            << " bucket_high=" << static_cast<int>(async_runtime.bucket_high)
+            << " selected_bucket_count="
+            << (async_runtime.empty_result
+                ? 0
+                : (static_cast<int>(async_runtime.bucket_high) - static_cast<int>(async_runtime.bucket_low) + 1))
+            << "\n";
 
         const bool query_is_fvecs = filter_search_io::ends_with(args.query_path, ".fvecs");
         const size_t query_elem_bytes = query_is_fvecs ? sizeof(float) : sizeof(uint8_t);
@@ -2309,7 +2348,7 @@ int main(int argc, char** argv) {
                 queries,
                 engine,
                 metadata,
-                sequential_runtime.enabled ? &sequential_runtime : nullptr);
+                &async_runtime);
         } else {
             DenseVectors<uint8_t> queries = filter_search_io::read_bvecs(args.query_path);
             stats = run_search_typed<int, hnswlib::L2SpaceI, uint8_t>(
@@ -2318,9 +2357,10 @@ int main(int argc, char** argv) {
                 queries,
                 engine,
                 metadata,
-                sequential_runtime.enabled ? &sequential_runtime : nullptr);
+                &async_runtime);
         }
 
+        const CompressionStats compression_stats = compute_compression_stats(async_runtime);
         const std::string summary = build_summary(
             args,
             query_info,
@@ -2330,8 +2370,8 @@ int main(int argc, char** argv) {
             metadata,
             expr,
             stats,
-            compression_stats,
-            range_bucket_report);
+            async_runtime,
+            compression_stats);
         std::cout << summary;
         write_summary_if_needed(summary, args.summary_out);
         return 0;
@@ -2340,3 +2380,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 }
+
+// ./compass_search_w_iaa_async.run \
+//   --dataset-type sift1m \
+//   --graph /storage/jykang5/compass_graphs/sift_m128_efc200.bin \
+//   --query /storage/jykang5/compass_base_query/sift1m_query.fvecs \
+//   --fidtb-manifest /storage/jykang5/fid_tb/n_filter_100/sift1m/manifest.json \
+//   --filter "synthetic_id_bucket == 0" \
+//   --k 10 \
+//   --ef 200 \
+//   --num-queries 100 \
+//   --summary-out /tmp/iaa_async_summary.txt \
+//   --per-query-out /tmp/iaa_async_per_query.csv

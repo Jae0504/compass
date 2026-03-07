@@ -599,8 +599,8 @@ private:
             return 0;
         }
 
-        const double scale = static_cast<double>(attr.usable_bins - 1) / (attr.max_value - attr.min_value);
-        int bucket = static_cast<int>(std::floor((value - attr.min_value) * scale));
+        const double normalized = (value - attr.min_value) / (attr.max_value - attr.min_value);
+        int bucket = static_cast<int>(normalized * static_cast<double>(attr.usable_bins));
         if (bucket < 0) {
             bucket = 0;
         }
@@ -649,11 +649,32 @@ private:
         }
 
         const int limit = std::min(attr.usable_bins, static_cast<int>(kMaxBuckets));
-        for (int b = 0; b < limit; ++b) {
-            const double rep = bucket_representative(attr, b);
-            if (detail::compare_numeric(rep, rhs, op)) {
-                out.set(static_cast<size_t>(b));
-            }
+        const int b = bucket_from_numeric(attr, rhs);
+        int lo = 0;
+        int hi = limit - 1;
+        switch (op) {
+          case filter_expr::CompareOp::Gt:
+            lo = std::min(limit, b + 1);
+            break;
+          case filter_expr::CompareOp::Ge:
+            lo = b;
+            break;
+          case filter_expr::CompareOp::Lt:
+            hi = b - 1;
+            break;
+          case filter_expr::CompareOp::Le:
+            hi = b;
+            break;
+          default:
+            break;
+        }
+        lo = std::max(0, lo);
+        hi = std::min(limit - 1, hi);
+        if (lo > hi) {
+            return out;
+        }
+        for (int bucket = lo; bucket <= hi; ++bucket) {
+            out.set(static_cast<size_t>(bucket));
         }
         return out;
     }
@@ -674,11 +695,15 @@ private:
 
         std::bitset<kMaxBuckets> out;
         const int limit = std::min(attr.usable_bins, static_cast<int>(kMaxBuckets));
-        for (int b = 0; b < limit; ++b) {
-            const double rep = bucket_representative(attr, b);
-            if (rep >= lo_v && rep <= hi_v) {
-                out.set(static_cast<size_t>(b));
-            }
+        const int low_bucket = bucket_from_numeric(attr, lo_v);
+        const int high_bucket = bucket_from_numeric(attr, hi_v);
+        int start_bucket = std::max(0, low_bucket);
+        int end_bucket = std::min(limit - 1, high_bucket);
+        if (start_bucket > end_bucket) {
+            return out;
+        }
+        for (int bucket = start_bucket; bucket <= end_bucket; ++bucket) {
+            out.set(static_cast<size_t>(bucket));
         }
         return out;
     }

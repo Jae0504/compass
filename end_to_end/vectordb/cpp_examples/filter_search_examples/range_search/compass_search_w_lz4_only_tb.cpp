@@ -8,6 +8,8 @@
 #include <array>
 #include <bitset>
 #include <chrono>
+#include <cstdint>
+#include <cstring>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -233,6 +235,7 @@ Args parse_args(int argc, char** argv) {
     ensure_readable_file(args.graph_path, "--graph");
     ensure_readable_file(args.query_path, "--query");
     ensure_readable_file(args.fidtb_manifest, "--fidtb-manifest");
+    ensure_readable_file(args.payload_jsonl, "--payload-jsonl");
 
     if (args.k <= 0) {
         throw std::runtime_error("--k must be > 0");
@@ -306,15 +309,25 @@ struct SequentialEqRuntime {
     bool enabled = false;
     bool empty_result = false;
     std::string field;
-    std::bitset<compass_lz4_filter::kMaxBuckets> allowed_buckets;
     size_t n_elements = 0;
+    size_t numeric_value_bytes = sizeof(uint32_t);
+    bool low_bounded = false;
+    bool high_bounded = false;
+    bool low_inclusive = true;
+    bool high_inclusive = true;
+    uint32_t numeric_low_u32 = 0;
+    uint32_t numeric_high_u32 = std::numeric_limits<uint32_t>::max();
+    uint64_t fid_baseline_raw_bytes = 0;
+    uint64_t fid_baseline_compressed_bytes = 0;
     compass_lz4_filter::detail::Lz4BlockStorage fid_storage;
     compass_lz4_filter::detail::Lz4BlockStorage tb_storage;
 };
 
 struct CompressionStats {
-    uint64_t fid_raw_bytes = 0;
-    uint64_t fid_compressed_bytes = 0;
+    uint64_t number_raw_bytes = 0;
+    uint64_t number_compressed_bytes = 0;
+    uint64_t fid_baseline_raw_bytes = 0;
+    uint64_t fid_baseline_compressed_bytes = 0;
     uint64_t tb_raw_bytes = 0;
     uint64_t tb_compressed_bytes = 0;
 };
@@ -334,8 +347,10 @@ uint64_t total_compressed_block_bytes(const std::vector<std::vector<ElemT>>& blo
 
 CompressionStats compute_compression_stats(const SequentialEqRuntime& runtime) {
     CompressionStats out;
-    out.fid_raw_bytes = safe_size_t_to_u64(runtime.fid_storage.raw_size);
-    out.fid_compressed_bytes = total_compressed_block_bytes(runtime.fid_storage.compressed_blocks);
+    out.number_raw_bytes = safe_size_t_to_u64(runtime.fid_storage.raw_size);
+    out.number_compressed_bytes = total_compressed_block_bytes(runtime.fid_storage.compressed_blocks);
+    out.fid_baseline_raw_bytes = runtime.fid_baseline_raw_bytes;
+    out.fid_baseline_compressed_bytes = runtime.fid_baseline_compressed_bytes;
     out.tb_raw_bytes = safe_size_t_to_u64(runtime.tb_storage.raw_size);
     out.tb_compressed_bytes = total_compressed_block_bytes(runtime.tb_storage.compressed_blocks);
     return out;
@@ -353,6 +368,96 @@ double compression_pct_of_raw(uint64_t raw_bytes, uint64_t compressed_bytes) {
         return 0.0;
     }
     return (static_cast<double>(compressed_bytes) * 100.0) / static_cast<double>(raw_bytes);
+}
+
+uint32_t encode_numeric_to_u32(double value) {
+    const float fv = static_cast<float>(value);
+    uint32_t out = 0;
+    static_assert(sizeof(float) == sizeof(uint32_t), "float must be 32-bit");
+    std::memcpy(&out, &fv, sizeof(uint32_t));
+    return out;
+}
+
+std::vector<uint8_t> load_numeric_field_as_u32_bytes(
+    const std::string& payload_jsonl_path,
+    const std::string& field,
+    size_t expected_rows) {
+    std::ifstream in(payload_jsonl_path);
+    if (!in.is_open()) {
+        throw std::runtime_error("Failed to open payload JSONL: " + payload_jsonl_path);
+    }
+
+    std::vector<uint8_t> out(expected_rows * sizeof(uint32_t), 0);
+    std::string line;
+    size_t row_id = 0;
+    while (row_id < expected_rows && std::getline(in, line)) {
+        if (line.empty()) {
+            throw std::runtime_error(
+                "Encountered empty JSONL line while reading numeric field '" + field +
+                "' at row " + std::to_string(row_id));
+        }
+
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(line);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                "Failed to parse payload JSONL row " + std::to_string(row_id) +
+                ": " + std::string(e.what()));
+        }
+        if (!j.is_object()) {
+            throw std::runtime_error(
+                "Payload JSONL row is not an object at row " + std::to_string(row_id));
+        }
+        auto it = j.find(field);
+        if (it == j.end() || it->is_null()) {
+            throw std::runtime_error(
+                "Missing numeric field '" + field + "' in payload JSONL row " +
+                std::to_string(row_id));
+        }
+        if (!it->is_number()) {
+            throw std::runtime_error(
+                "Field '" + field + "' is non-numeric at row " +
+                std::to_string(row_id) + " (only numeric fields are supported)");
+        }
+
+        const double value = it->get<double>();
+        const uint32_t encoded = encode_numeric_to_u32(value);
+        std::memcpy(
+            out.data() + row_id * sizeof(uint32_t),
+            &encoded,
+            sizeof(uint32_t));
+        ++row_id;
+    }
+
+    if (row_id < expected_rows) {
+        throw std::runtime_error(
+            "Payload JSONL has fewer rows than graph elements: rows=" +
+            std::to_string(row_id) + ", expected=" + std::to_string(expected_rows));
+    }
+    return out;
+}
+
+bool encoded_numeric_match(uint32_t encoded_value, const SequentialEqRuntime& runtime) {
+    if (runtime.low_bounded) {
+        if (runtime.low_inclusive) {
+            if (encoded_value < runtime.numeric_low_u32) {
+                return false;
+            }
+        } else if (encoded_value <= runtime.numeric_low_u32) {
+            return false;
+        }
+    }
+    if (runtime.high_bounded) {
+        if (runtime.high_inclusive) {
+            if (encoded_value > runtime.numeric_high_u32) {
+                return false;
+            }
+        } else if (encoded_value >= runtime.numeric_high_u32) {
+            return false;
+        }
+    }
+    return true;
 }
 
 struct SequentialEqQueryCache {
@@ -373,6 +478,89 @@ struct RangePredicateSpec {
     bool low_inclusive = true;
     bool high_inclusive = true;
 };
+
+bool numeric_value_matches_range(double value, const RangePredicateSpec& spec) {
+    if (std::isfinite(spec.low)) {
+        if (spec.low_inclusive) {
+            if (value < spec.low) {
+                return false;
+            }
+        } else if (value <= spec.low) {
+            return false;
+        }
+    }
+    if (std::isfinite(spec.high)) {
+        if (spec.high_inclusive) {
+            if (value > spec.high) {
+                return false;
+            }
+        } else if (value >= spec.high) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<size_t> collect_numeric_result_nodes_from_jsonl(
+    const std::string& payload_jsonl_path,
+    const RangePredicateSpec& spec,
+    size_t expected_rows) {
+    std::ifstream in(payload_jsonl_path);
+    if (!in.is_open()) {
+        throw std::runtime_error("Failed to open payload JSONL for ENNS GT: " + payload_jsonl_path);
+    }
+
+    std::vector<size_t> out;
+    out.reserve(expected_rows / 8);
+    std::string line;
+    size_t row_id = 0;
+    while (row_id < expected_rows && std::getline(in, line)) {
+        if (line.empty()) {
+            throw std::runtime_error(
+                "Encountered empty JSONL line while building ENNS GT at row " +
+                std::to_string(row_id));
+        }
+
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(line);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                "Failed to parse payload JSONL row " + std::to_string(row_id) +
+                " while building ENNS GT: " + std::string(e.what()));
+        }
+        if (!j.is_object()) {
+            throw std::runtime_error(
+                "Payload JSONL row is not an object while building ENNS GT at row " +
+                std::to_string(row_id));
+        }
+
+        auto it = j.find(spec.field);
+        if (it == j.end() || it->is_null()) {
+            throw std::runtime_error(
+                "Missing numeric field '" + spec.field + "' in payload JSONL row " +
+                std::to_string(row_id) + " while building ENNS GT");
+        }
+        if (!it->is_number()) {
+            throw std::runtime_error(
+                "Field '" + spec.field + "' is non-numeric in payload JSONL row " +
+                std::to_string(row_id) + " while building ENNS GT");
+        }
+
+        const double value = it->get<double>();
+        if (numeric_value_matches_range(value, spec)) {
+            out.push_back(row_id);
+        }
+        ++row_id;
+    }
+
+    if (row_id < expected_rows) {
+        throw std::runtime_error(
+            "Payload JSONL has fewer rows than graph elements while building ENNS GT: rows=" +
+            std::to_string(row_id) + ", expected=" + std::to_string(expected_rows));
+    }
+    return out;
+}
 
 struct RangeBucketMappingReport {
     bool applicable = false;
@@ -540,89 +728,6 @@ std::optional<RangePredicateSpec> parse_single_numeric_range_predicate(
         *reason = "supported range shapes: BETWEEN, single compare, or AND of two compares on one field";
     }
     return std::nullopt;
-}
-
-bool numeric_value_matches_range(double value, const RangePredicateSpec& spec) {
-    if (std::isfinite(spec.low)) {
-        if (spec.low_inclusive) {
-            if (value < spec.low) {
-                return false;
-            }
-        } else if (value <= spec.low) {
-            return false;
-        }
-    }
-    if (std::isfinite(spec.high)) {
-        if (spec.high_inclusive) {
-            if (value > spec.high) {
-                return false;
-            }
-        } else if (value >= spec.high) {
-            return false;
-        }
-    }
-    return true;
-}
-
-std::vector<size_t> collect_numeric_result_nodes_from_jsonl(
-    const std::string& payload_jsonl_path,
-    const RangePredicateSpec& spec,
-    size_t expected_rows) {
-    std::ifstream in(payload_jsonl_path);
-    if (!in.is_open()) {
-        throw std::runtime_error("Failed to open payload JSONL for ENNS GT: " + payload_jsonl_path);
-    }
-
-    std::vector<size_t> out;
-    out.reserve(expected_rows / 8);
-    std::string line;
-    size_t row_id = 0;
-    while (row_id < expected_rows && std::getline(in, line)) {
-        if (line.empty()) {
-            throw std::runtime_error(
-                "Encountered empty JSONL line while building ENNS GT at row " +
-                std::to_string(row_id));
-        }
-
-        nlohmann::json j;
-        try {
-            j = nlohmann::json::parse(line);
-        } catch (const std::exception& e) {
-            throw std::runtime_error(
-                "Failed to parse payload JSONL row " + std::to_string(row_id) +
-                " while building ENNS GT: " + std::string(e.what()));
-        }
-        if (!j.is_object()) {
-            throw std::runtime_error(
-                "Payload JSONL row is not an object while building ENNS GT at row " +
-                std::to_string(row_id));
-        }
-
-        auto it = j.find(spec.field);
-        if (it == j.end() || it->is_null()) {
-            throw std::runtime_error(
-                "Missing numeric field '" + spec.field + "' in payload JSONL row " +
-                std::to_string(row_id) + " while building ENNS GT");
-        }
-        if (!it->is_number()) {
-            throw std::runtime_error(
-                "Field '" + spec.field + "' is non-numeric in payload JSONL row " +
-                std::to_string(row_id) + " while building ENNS GT");
-        }
-
-        const double value = it->get<double>();
-        if (numeric_value_matches_range(value, spec)) {
-            out.push_back(row_id);
-        }
-        ++row_id;
-    }
-
-    if (row_id < expected_rows) {
-        throw std::runtime_error(
-            "Payload JSONL has fewer rows than graph elements while building ENNS GT: rows=" +
-            std::to_string(row_id) + ", expected=" + std::to_string(expected_rows));
-    }
-    return out;
 }
 
 bool is_single_field_expression(const filter_expr::Node* node, std::string* field_out) {
@@ -1009,19 +1114,23 @@ SequentialEqRuntime build_sequential_eq_runtime(
     const Args& args,
     const compass_lz4_filter::CompassLz4FilterEngine& engine) {
     SequentialEqRuntime runtime;
-    std::unique_ptr<filter_expr::Node> root = parse_filter_ast(args.filter_expression);
-    if (root == nullptr) {
-        return runtime;
+    std::string parse_reason;
+    const std::optional<RangePredicateSpec> range_spec =
+        parse_single_numeric_range_predicate(args.filter_expression, &parse_reason);
+    if (!range_spec.has_value()) {
+        throw std::runtime_error(
+            "only_tb supports single-field numeric range predicates only: " + args.filter_expression +
+            ". Details: " + parse_reason);
     }
-    std::string field;
-    if (!is_single_field_expression(root.get(), &field) || field.empty()) {
-        return runtime;
+    const std::string& field = range_spec->field;
+    if (field.empty()) {
+        throw std::runtime_error("Range predicate field is empty");
     }
 
     const compass_lz4_filter::ManifestData& manifest = engine.manifest();
     const int nfilters = manifest.nfilters;
     if (nfilters <= 0 || nfilters > static_cast<int>(compass_lz4_filter::kMaxBuckets)) {
-        return runtime;
+        throw std::runtime_error("Manifest nfilters is out of range");
     }
 
     auto attr_it = std::find_if(
@@ -1031,72 +1140,54 @@ SequentialEqRuntime build_sequential_eq_runtime(
             return attr.key == field;
         });
     if (attr_it == manifest.attributes.end()) {
-        return runtime;
+        throw std::runtime_error("Range filter field not found in manifest: " + field);
     }
 
     const compass_lz4_filter::ManifestAttribute& attr = *attr_it;
+    if (!attr.numeric || attr.encoding != "numeric_minmax_quantized") {
+        throw std::runtime_error(
+            "only_tb supports numeric_minmax_quantized fields only; field=" + attr.key);
+    }
     const int usable_bins = derive_usable_bins(nfilters, attr.used_bins);
     if (usable_bins <= 0) {
-        return runtime;
+        throw std::runtime_error("Derived usable_bins is invalid");
     }
 
-    std::bitset<compass_lz4_filter::kMaxBuckets> allowed_buckets;
-    bool mapped_from_numeric_range = false;
-    std::string parse_reason;
-    const std::optional<RangePredicateSpec> range_spec =
-        parse_single_numeric_range_predicate(args.filter_expression, &parse_reason);
-    if (range_spec.has_value() &&
-        range_spec->field == field &&
-        attr.numeric &&
-        attr.encoding == "numeric_minmax_quantized") {
-        int bucket_lo = 0;
-        int bucket_hi = usable_bins - 1;
-        if (std::isfinite(range_spec->low)) {
-            const int b = bucket_from_numeric_builder(
-                usable_bins,
-                attr.min_value,
-                attr.max_value,
-                range_spec->low);
-            bucket_lo = range_spec->low_inclusive ? b : std::min(usable_bins, b + 1);
-        }
-        if (std::isfinite(range_spec->high)) {
-            const int b = bucket_from_numeric_builder(
-                usable_bins,
-                attr.min_value,
-                attr.max_value,
-                range_spec->high);
-            bucket_hi = range_spec->high_inclusive ? b : std::max(-1, b - 1);
-        }
-
-        if (bucket_lo <= bucket_hi) {
-            const int limit = std::min(usable_bins, static_cast<int>(compass_lz4_filter::kMaxBuckets));
-            for (int b = std::max(0, bucket_lo); b <= bucket_hi && b < limit; ++b) {
-                allowed_buckets.set(static_cast<size_t>(b));
-            }
-        }
-        mapped_from_numeric_range = true;
+    int bucket_lo = 0;
+    int bucket_hi = usable_bins - 1;
+    if (std::isfinite(range_spec->low)) {
+        const int b = bucket_from_numeric_builder(
+            usable_bins,
+            attr.min_value,
+            attr.max_value,
+            range_spec->low);
+        bucket_lo = range_spec->low_inclusive ? b : std::min(usable_bins, b + 1);
+    }
+    if (std::isfinite(range_spec->high)) {
+        const int b = bucket_from_numeric_builder(
+            usable_bins,
+            attr.min_value,
+            attr.max_value,
+            range_spec->high);
+        bucket_hi = range_spec->high_inclusive ? b : std::max(-1, b - 1);
     }
 
-    if (!mapped_from_numeric_range) {
-        allowed_buckets = compile_node_buckets(attr, usable_bins, root.get());
-    }
-    if (allowed_buckets.none()) {
+    if (bucket_lo > bucket_hi) {
         runtime.enabled = true;
         runtime.empty_result = true;
         runtime.field = field;
-        runtime.allowed_buckets = allowed_buckets;
         runtime.n_elements = manifest.n_elements;
+        runtime.low_bounded = std::isfinite(range_spec->low);
+        runtime.high_bounded = std::isfinite(range_spec->high);
+        runtime.low_inclusive = range_spec->low_inclusive;
+        runtime.high_inclusive = range_spec->high_inclusive;
+        if (runtime.low_bounded) {
+            runtime.numeric_low_u32 = encode_numeric_to_u32(range_spec->low);
+        }
+        if (runtime.high_bounded) {
+            runtime.numeric_high_u32 = encode_numeric_to_u32(range_spec->high);
+        }
         return runtime;
-    }
-
-    size_t fid_count = 0;
-    std::vector<uint8_t> fid_raw = compass_lz4_filter::detail::read_payload_with_size_header(
-        attr.fid_file,
-        &fid_count,
-        sizeof(uint8_t));
-    if (fid_count != manifest.n_elements) {
-        throw std::runtime_error(
-            "FID element count mismatch while building sequential runtime for field '" + attr.key + "'");
     }
 
     size_t tb_count = 0;
@@ -1110,10 +1201,9 @@ SequentialEqRuntime build_sequential_eq_runtime(
     }
 
     std::array<uint8_t, compass_lz4_filter::kTbBytesPerNode> tb_mask{};
-    for (size_t bucket = 0; bucket < compass_lz4_filter::kMaxBuckets; ++bucket) {
-        if (allowed_buckets.test(bucket)) {
-            tb_mask[bucket / 8] |= static_cast<uint8_t>(1u << (bucket % 8));
-        }
+    const int limit = std::min(usable_bins, static_cast<int>(compass_lz4_filter::kMaxBuckets));
+    for (int bucket = std::max(0, bucket_lo); bucket <= bucket_hi && bucket < limit; ++bucket) {
+        tb_mask[static_cast<size_t>(bucket) / 8] |= static_cast<uint8_t>(1u << (bucket % 8));
     }
 
     std::vector<uint8_t> tb_bucket_bits((manifest.n_elements + 7) / 8, 0);
@@ -1131,8 +1221,26 @@ SequentialEqRuntime build_sequential_eq_runtime(
         }
     }
 
+    std::vector<uint8_t> numeric_raw = load_numeric_field_as_u32_bytes(
+        args.payload_jsonl,
+        field,
+        manifest.n_elements);
+
+    size_t fid_count = 0;
+    std::vector<uint8_t> fid_baseline_raw = compass_lz4_filter::detail::read_payload_with_size_header(
+        attr.fid_file,
+        &fid_count,
+        sizeof(uint8_t));
+    if (fid_count != manifest.n_elements) {
+        throw std::runtime_error(
+            "FID element count mismatch while building baseline compression for field '" + attr.key + "'");
+    }
+    const auto fid_baseline_storage = compass_lz4_filter::detail::compress_to_lz4_blocks(
+        fid_baseline_raw,
+        args.fid_block_size_bytes);
+
     runtime.fid_storage = compass_lz4_filter::detail::compress_to_lz4_blocks(
-        fid_raw,
+        numeric_raw,
         args.fid_block_size_bytes);
     runtime.tb_storage = compass_lz4_filter::detail::compress_to_lz4_blocks(
         tb_bucket_bits,
@@ -1140,8 +1248,20 @@ SequentialEqRuntime build_sequential_eq_runtime(
     runtime.enabled = true;
     runtime.empty_result = false;
     runtime.field = field;
-    runtime.allowed_buckets = allowed_buckets;
     runtime.n_elements = manifest.n_elements;
+    runtime.low_bounded = std::isfinite(range_spec->low);
+    runtime.high_bounded = std::isfinite(range_spec->high);
+    runtime.low_inclusive = range_spec->low_inclusive;
+    runtime.high_inclusive = range_spec->high_inclusive;
+    if (runtime.low_bounded) {
+        runtime.numeric_low_u32 = encode_numeric_to_u32(range_spec->low);
+    }
+    if (runtime.high_bounded) {
+        runtime.numeric_high_u32 = encode_numeric_to_u32(range_spec->high);
+    }
+    runtime.fid_baseline_raw_bytes = safe_size_t_to_u64(fid_baseline_storage.raw_size);
+    runtime.fid_baseline_compressed_bytes =
+        total_compressed_block_bytes(fid_baseline_storage.compressed_blocks);
     return runtime;
 }
 
@@ -1288,24 +1408,32 @@ bool fid_match_node(
     SequentialEqQueryCache* cache,
     size_t node_id,
     compass_lz4_filter::QueryDecompressionMetrics* metrics) {
-    if (cache == nullptr || runtime.fid_storage.block_size == 0 || node_id >= runtime.n_elements) {
+    if (cache == nullptr ||
+        runtime.fid_storage.block_size == 0 ||
+        runtime.numeric_value_bytes == 0 ||
+        node_id >= runtime.n_elements) {
         return false;
     }
 
-    const size_t block_id = node_id / runtime.fid_storage.block_size;
-    const size_t in_block = node_id % runtime.fid_storage.block_size;
+    const size_t byte_offset = node_id * runtime.numeric_value_bytes;
+    const size_t block_id = byte_offset / runtime.fid_storage.block_size;
+    const size_t in_block_byte = byte_offset % runtime.fid_storage.block_size;
     if (block_id >= cache->fid_blocks.size() || block_id >= cache->fid_ready.size() || cache->fid_ready[block_id] == 0) {
         return false;
     }
-    if (in_block >= cache->fid_blocks[block_id].size()) {
+    if (in_block_byte + runtime.numeric_value_bytes > cache->fid_blocks[block_id].size()) {
         return false;
     }
 
     if (metrics != nullptr) {
         ++metrics->fid_cache_hits;
     }
-    const uint8_t bucket = cache->fid_blocks[block_id][in_block];
-    return runtime.allowed_buckets.test(static_cast<size_t>(bucket));
+    uint32_t encoded_value = 0;
+    std::memcpy(
+        &encoded_value,
+        cache->fid_blocks[block_id].data() + in_block_byte,
+        sizeof(uint32_t));
+    return encoded_numeric_match(encoded_value, runtime);
 }
 
 template <typename DistT, typename QueryT>
@@ -1685,7 +1813,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             entry.candidate_id = candidate_id;
             entry.deleted = index.isMarkedDeleted(candidate_id);
             if (runtime.fid_storage.block_size != 0) {
-                entry.fid_block_id = static_cast<size_t>(candidate_id) / runtime.fid_storage.block_size;
+                const size_t byte_offset =
+                    static_cast<size_t>(candidate_id) * runtime.numeric_value_bytes;
+                entry.fid_block_id = byte_offset / runtime.fid_storage.block_size;
                 entry.need_fid = true;
                 if (entry.fid_block_id < cache->fid_ready.size() &&
                     cache->fid_ready[entry.fid_block_id] == 0 &&
@@ -2079,12 +2209,16 @@ std::string build_summary(
         (stats.search_loop_time_ns > 0)
             ? (static_cast<double>(stats.query_count) * 1e9 / static_cast<double>(stats.search_loop_time_ns))
             : 0.0;
-    const uint64_t total_raw_bytes = compression_stats.fid_raw_bytes + compression_stats.tb_raw_bytes;
+    const uint64_t total_raw_bytes = compression_stats.number_raw_bytes + compression_stats.tb_raw_bytes;
     const uint64_t total_compressed_bytes =
-        compression_stats.fid_compressed_bytes + compression_stats.tb_compressed_bytes;
-    const double fid_ratio = compression_ratio_raw_over_compressed(
-        compression_stats.fid_raw_bytes,
-        compression_stats.fid_compressed_bytes);
+        compression_stats.number_compressed_bytes + compression_stats.tb_compressed_bytes;
+    const double number_ratio = compression_ratio_raw_over_compressed(
+        compression_stats.number_raw_bytes,
+        compression_stats.number_compressed_bytes);
+    const double fid_baseline_ratio = compression_ratio_raw_over_compressed(
+        compression_stats.fid_baseline_raw_bytes,
+        compression_stats.fid_baseline_compressed_bytes);
+    const double number_vs_fid_delta = number_ratio - fid_baseline_ratio;
     const double tb_ratio = compression_ratio_raw_over_compressed(
         compression_stats.tb_raw_bytes,
         compression_stats.tb_compressed_bytes);
@@ -2109,12 +2243,18 @@ std::string build_summary(
         << ", break_factor: " << stats.effective_break_factor << "\n";
     oss << "fid_block_size_bytes: " << args.fid_block_size_bytes << "\n";
     oss << "tb_block_size_bytes: " << args.tb_block_size_bytes << "\n";
-    oss << "fid_raw_bytes: " << compression_stats.fid_raw_bytes << "\n";
-    oss << "fid_compressed_bytes: " << compression_stats.fid_compressed_bytes << "\n";
+    oss << "number_raw_bytes: " << compression_stats.number_raw_bytes << "\n";
+    oss << "number_compressed_bytes: " << compression_stats.number_compressed_bytes << "\n";
+    oss << "fid_baseline_raw_bytes: " << compression_stats.fid_baseline_raw_bytes << "\n";
+    oss << "fid_baseline_compressed_bytes: " << compression_stats.fid_baseline_compressed_bytes << "\n";
     oss << "tb_raw_bytes: " << compression_stats.tb_raw_bytes << "\n";
     oss << "tb_compressed_bytes: " << compression_stats.tb_compressed_bytes << "\n";
-    oss << "fid_compression_ratio_raw_over_compressed: " << fid_ratio << "\n";
+    // Keep legacy key for CSV parser compatibility: now points to number compression ratio.
+    oss << "fid_compression_ratio_raw_over_compressed: " << number_ratio << "\n";
     oss << "tb_compression_ratio_raw_over_compressed: " << tb_ratio << "\n";
+    oss << "number_compression_ratio_raw_over_compressed: " << number_ratio << "\n";
+    oss << "fid_baseline_compression_ratio_raw_over_compressed: " << fid_baseline_ratio << "\n";
+    oss << "number_vs_fid_compression_ratio_delta: " << number_vs_fid_delta << "\n";
     oss << "filter_payload_raw_bytes: " << total_raw_bytes << "\n";
     oss << "filter_payload_compressed_bytes: " << total_compressed_bytes << "\n";
     oss << "filter_payload_compression_ratio_raw_over_compressed: " << total_ratio << "\n";

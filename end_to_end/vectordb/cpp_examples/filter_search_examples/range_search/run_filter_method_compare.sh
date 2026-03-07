@@ -17,6 +17,8 @@ Usage:
     [--out-dir <path>] \
     [--postfilter-max-candidates <int>] \
     [--postfilter-max-candidates-list <comma-separated>] \
+    [--iaa-engine-profiles <comma-separated 1|2|4|8>] \
+    [--skip-iaa-config] \
     [--build|--no-build] \
     [--plot|--no-plot]
 
@@ -28,10 +30,14 @@ Core defaults:
   --ef-list-10pct               (inherits --ef-list by default)
   --num-queries                 20
   --out-dir                     <this_dir>/out/filter_method_compare
+  --clean-out-dir               enabled (keeps only current run files under out-dir)
   --postfilter-max-candidates   3000 (in_search_filter_hnsw)
-  --postfilter-max-candidates-list 500,1000,1500,2000 (post_filter_hnsw sweep)
+  --postfilter-max-candidates-list 500,1000,1500,2000,2500 (post_filter_hnsw sweep)
   --fid-block-size-bytes        65536
   --tb-block-size-bytes         1048576
+  --manifest                    /storage/jykang5/fid_tb/laion/manifest.json
+  --iaa-engine-profiles         1,2,4,8
+  --skip-iaa-config             disabled
   --build                       enabled
   --plot                        enabled
 
@@ -49,6 +55,10 @@ Advanced overrides:
   --acorn-index-1pct <path>
   --acorn-index-10pct <path>
   --payload-jsonl <path>
+  --iaa-engine-profiles <csv 1|2|4|8>
+  --skip-iaa-config
+  --iaa-config-dir <path>
+  --iaa-device-owner <user>
   --fid-block-size-bytes <int>
   --tb-block-size-bytes <int>
 
@@ -257,6 +267,9 @@ usable_bins = max(1, missing_bucket)
 
 min_value = float(attr.get("min_value", 0.0))
 max_value = float(attr.get("max_value", 0.0))
+bucket_size = 0.0
+if usable_bins > 0 and max_value > min_value:
+    bucket_size = (max_value - min_value) / float(usable_bins)
 
 bucket_low = 0
 bucket_high = usable_bins - 1
@@ -300,6 +313,7 @@ print(f"MAP_MISSING_BUCKET={missing_bucket}")
 print(f"MAP_USABLE_BINS={usable_bins}")
 print(f"MAP_MIN_VALUE={min_value}")
 print(f"MAP_MAX_VALUE={max_value}")
+print(f"MAP_BUCKET_SIZE={bucket_size}")
 print(f"MAP_LOW={spec['low'] if math.isfinite(spec['low']) else ''}")
 print(f"MAP_HIGH={spec['high'] if math.isfinite(spec['high']) else ''}")
 print(f"MAP_LOW_INCLUSIVE={1 if spec['low_inclusive'] else 0}")
@@ -324,7 +338,7 @@ parse_map_output() {
   while IFS='=' read -r k v; do
     [[ -z "$k" ]] && continue
     case "$k" in
-      MAP_STATUS|MAP_DETAIL|MAP_FIELD|MAP_NFILTERS|MAP_MISSING_BUCKET|MAP_USABLE_BINS|MAP_MIN_VALUE|MAP_MAX_VALUE|MAP_LOW|MAP_HIGH|MAP_LOW_INCLUSIVE|MAP_HIGH_INCLUSIVE|MAP_BUCKET_LOW|MAP_BUCKET_HIGH|MAP_SELECTED_BUCKET_COUNT|MAP_EMPTY_RESULT|MAP_FID_ELEMENTS|MAP_FID_BUCKET_MATCH_COUNT|MAP_FID_MISSING_COUNT|MAP_FID_FILE)
+      MAP_STATUS|MAP_DETAIL|MAP_FIELD|MAP_NFILTERS|MAP_MISSING_BUCKET|MAP_USABLE_BINS|MAP_MIN_VALUE|MAP_MAX_VALUE|MAP_BUCKET_SIZE|MAP_LOW|MAP_HIGH|MAP_LOW_INCLUSIVE|MAP_HIGH_INCLUSIVE|MAP_BUCKET_LOW|MAP_BUCKET_HIGH|MAP_SELECTED_BUCKET_COUNT|MAP_EMPTY_RESULT|MAP_FID_ELEMENTS|MAP_FID_BUCKET_MATCH_COUNT|MAP_FID_MISSING_COUNT|MAP_FID_FILE)
         printf -v "${prefix}_${k#MAP_}" '%s' "$v"
         ;;
     esac
@@ -359,15 +373,69 @@ parse_positive_int_list() {
   fi
 }
 
-# Keep this list aligned with run_single() method names.
+parse_iaa_engine_profiles() {
+  local raw_list="$1"
+  local out_array_name="$2"
+  local field_name="$3"
+
+  local -n out_ref="$out_array_name"
+  out_ref=()
+
+  local -a raw_values=()
+  IFS=',' read -r -a raw_values <<< "$raw_list"
+
+  local item=""
+  for item in "${raw_values[@]}"; do
+    item="$(echo "$item" | tr -d '[:space:]')"
+    [[ -z "$item" ]] && continue
+    case "$item" in
+      1|2|4|8)
+        ;;
+      *)
+        echo "Error: invalid engine profile '$item' in $field_name (allowed: 1,2,4,8)" >&2
+        exit 1
+        ;;
+    esac
+    if [[ ! " ${out_ref[*]} " =~ [[:space:]]${item}[[:space:]] ]]; then
+      out_ref+=("$item")
+    fi
+  done
+
+  if [[ "${#out_ref[@]}" -eq 0 ]]; then
+    echo "Error: $field_name produced no valid engine profiles" >&2
+    exit 1
+  fi
+}
+
+# Methods to run.
+# Comment out entries here for quick manual method selection.
 METHODS=(
-  "acorn"
+  # "post_filter_hnsw"
+  # "in_search_filter_hnsw"
+  # "acorn"
+  "compass_lz4"
+  # "compass_iaa_1"
+  # "compass_iaa_2"
+  # "compass_iaa_4"
+  "compass_iaa_8"
 )
 
 method_requires_manifest() {
   local method="$1"
   case "$method" in
-    compass_lz4|compass_iaa)
+    compass_lz4|compass_iaa|compass_iaa_1|compass_iaa_2|compass_iaa_4|compass_iaa_8)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+method_requires_iaa_profile() {
+  local method="$1"
+  case "$method" in
+    compass_iaa_1|compass_iaa_2|compass_iaa_4|compass_iaa_8)
       return 0
       ;;
     *)
@@ -384,27 +452,35 @@ EF_LIST_10PCT=""
 EF_LIST_SET_BY_USER=0
 NUM_QUERIES=20
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
+CLEAN_OUT_DIR=1
 POSTFILTER_MAX_CANDIDATES=3000
 POSTFILTER_MAX_CANDIDATES_SET_BY_USER=0
-POSTFILTER_MAX_CANDIDATES_LIST="500,1000,1500,2000"
+POSTFILTER_MAX_CANDIDATES_LIST="500,1000,1500,2000,2500"
 POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=0
 DO_BUILD=1
 DO_PLOT=1
 
-FILTER_EXPR_1PCT='230 <= original_height <= 236'
-FILTER_EXPR_10PCT='290 <= original_height <= 329'
+FILTER_EXPR_1PCT='958 <= original_width <= 965'
+FILTER_EXPR_10PCT='598 <= original_width <= 769'
 
 GRAPH_PATH="/storage/jykang5/compass_graphs/laion_m128_efc200.bin"
 QUERY_PATH="/storage/jykang5/compass_base_query/laion_query.fvecs"
-MANIFEST=""
+MANIFEST="/storage/jykang5/fid_tb/laion/manifest.json"
 MANIFEST_1PCT=""
 MANIFEST_10PCT=""
 ACORN_INDEX=""
 ACORN_INDEX_1PCT=""
 ACORN_INDEX_10PCT=""
 PAYLOAD_JSONL="/fast-lab-share/benchmarks/VectorDB/FILTER/LAION/payloads.jsonl"
-FID_BLOCK_SIZE_BYTES="$((8192*8))"
-TB_BLOCK_SIZE_BYTES="$((8192*128))"
+FID_BLOCK_SIZE_BYTES="$((1024*128))"
+TB_BLOCK_SIZE_BYTES="$((1024*256))"
+IAA_ENGINE_PROFILES="1,2,4,8"
+SKIP_IAA_CONFIG=0
+IAA_CONFIG_DIR="/home/jykang5/compass/scripts/iaa"
+IAA_DEVICE_OWNER="jykang5"
+CURRENT_IAA_ENGINE_PROFILE=""
+SUDO_KEEPALIVE_PID=""
+IAA_ENGINE_VALUES=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -437,6 +513,14 @@ while [[ $# -gt 0 ]]; do
       OUT_DIR="$2"
       shift 2
       ;;
+    --clean-out-dir)
+      CLEAN_OUT_DIR=1
+      shift
+      ;;
+    --no-clean-out-dir)
+      CLEAN_OUT_DIR=0
+      shift
+      ;;
     --postfilter-max-candidates)
       POSTFILTER_MAX_CANDIDATES="$2"
       POSTFILTER_MAX_CANDIDATES_SET_BY_USER=1
@@ -446,6 +530,18 @@ while [[ $# -gt 0 ]]; do
       POSTFILTER_MAX_CANDIDATES_LIST="$2"
       POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=1
       shift 2
+      ;;
+    --iaa-engine-profiles)
+      IAA_ENGINE_PROFILES="$2"
+      shift 2
+      ;;
+    --skip-iaa-config)
+      SKIP_IAA_CONFIG=1
+      shift
+      ;;
+    --no-skip-iaa-config)
+      SKIP_IAA_CONFIG=0
+      shift
       ;;
     --build)
       DO_BUILD=1
@@ -507,6 +603,14 @@ while [[ $# -gt 0 ]]; do
       PAYLOAD_JSONL="$2"
       shift 2
       ;;
+    --iaa-config-dir)
+      IAA_CONFIG_DIR="$2"
+      shift 2
+      ;;
+    --iaa-device-owner)
+      IAA_DEVICE_OWNER="$2"
+      shift 2
+      ;;
     --fid-block-size-bytes)
       FID_BLOCK_SIZE_BYTES="$2"
       shift 2
@@ -558,12 +662,43 @@ if ! [[ "$TB_BLOCK_SIZE_BYTES" =~ ^[0-9]+$ ]] || [[ "$TB_BLOCK_SIZE_BYTES" -le 0
   echo "Error: --tb-block-size-bytes must be a positive integer" >&2
   exit 1
 fi
+if [[ "$SKIP_IAA_CONFIG" -ne 0 && "$SKIP_IAA_CONFIG" -ne 1 ]]; then
+  echo "Error: invalid --skip-iaa-config state" >&2
+  exit 1
+fi
+if [[ "$CLEAN_OUT_DIR" -ne 0 && "$CLEAN_OUT_DIR" -ne 1 ]]; then
+  echo "Error: invalid --clean-out-dir state" >&2
+  exit 1
+fi
+
+parse_iaa_engine_profiles "$IAA_ENGINE_PROFILES" IAA_ENGINE_VALUES "--iaa-engine-profiles"
+
+# Optional profile filter: keep non-IAA methods as-is, and keep only selected
+# IAA engine variants among explicitly listed METHODS above.
+FILTERED_METHODS=()
+for method in "${METHODS[@]}"; do
+  case "$method" in
+    compass_iaa_1|compass_iaa_2|compass_iaa_4|compass_iaa_8)
+      method_profile="${method##compass_iaa_}"
+      if [[ " ${IAA_ENGINE_VALUES[*]} " =~ (^|[[:space:]])${method_profile}([[:space:]]|$) ]]; then
+        FILTERED_METHODS+=("$method")
+      fi
+      ;;
+    *)
+      FILTERED_METHODS+=("$method")
+      ;;
+  esac
+done
+METHODS=("${FILTERED_METHODS[@]}")
 
 REQUIRE_MANIFEST=0
+REQUIRE_IAA_PROFILE=0
 for method in "${METHODS[@]}"; do
   if method_requires_manifest "$method"; then
     REQUIRE_MANIFEST=1
-    break
+  fi
+  if method_requires_iaa_profile "$method"; then
+    REQUIRE_IAA_PROFILE=1
   fi
 done
 
@@ -630,10 +765,18 @@ for max_candidates in "${POSTFILTER_MAX_VALUES[@]}"; do
 done
 
 mkdir -p "$OUT_DIR"
+if [[ "$CLEAN_OUT_DIR" -eq 1 ]]; then
+  rm -rf "$OUT_DIR/summaries"
+  rm -f "$OUT_DIR/results_1pct.csv" \
+        "$OUT_DIR/results_10pct.csv" \
+        "$OUT_DIR/results_merged.csv" \
+        "$OUT_DIR/qps_vs_recall.png" \
+        "$OUT_DIR/qps_vs_recall.svg"
+fi
 
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
-LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4.run"
-IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa.run"
+LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4_only_tb.run"
+IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa_only_tb.run"
 ACORN_RUN="$SCRIPT_DIR/acorn_search.run"
 
 if [[ "$DO_BUILD" -eq 1 ]]; then
@@ -644,10 +787,10 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
         MAKE_TARGETS+=("hnswlib_filter_search.run")
         ;;
       compass_lz4)
-        MAKE_TARGETS+=("compass_search_w_lz4.run")
+        MAKE_TARGETS+=("compass_search_w_lz4_only_tb.run")
         ;;
-      compass_iaa)
-        MAKE_TARGETS+=("compass_search_w_iaa.run")
+      compass_iaa|compass_iaa_1|compass_iaa_2|compass_iaa_4|compass_iaa_8)
+        MAKE_TARGETS+=("compass_search_w_iaa_only_tb.run")
         ;;
       acorn)
         MAKE_TARGETS+=("acorn_search.run")
@@ -669,10 +812,10 @@ for method in "${METHODS[@]}"; do
       ensure_executable_file "$HNSW_RUN" "hnswlib_filter_search.run is missing or not executable"
       ;;
     compass_lz4)
-      ensure_executable_file "$LZ4_RUN" "compass_search_w_lz4.run is missing or not executable"
+      ensure_executable_file "$LZ4_RUN" "compass_search_w_lz4_only_tb.run is missing or not executable"
       ;;
-    compass_iaa)
-      ensure_executable_file "$IAA_RUN" "compass_search_w_iaa.run is missing or not executable"
+    compass_iaa|compass_iaa_1|compass_iaa_2|compass_iaa_4|compass_iaa_8)
+      ensure_executable_file "$IAA_RUN" "compass_search_w_iaa_only_tb.run is missing or not executable"
       ;;
     acorn)
       ensure_executable_file "$ACORN_RUN" "acorn_search.run is missing or not executable"
@@ -692,6 +835,62 @@ fi
 ensure_readable_file "$ACORN_INDEX_1PCT" "ACORN 1% index file not found"
 ensure_readable_file "$ACORN_INDEX_10PCT" "ACORN 10% index file not found"
 ensure_readable_file "$PAYLOAD_JSONL" "payload JSONL file not found"
+
+if [[ "$REQUIRE_IAA_PROFILE" -eq 1 && "$SKIP_IAA_CONFIG" -eq 0 ]]; then
+  for iaa_engines in 1 2 4 8; do
+    ensure_readable_file \
+      "$IAA_CONFIG_DIR/configure_iaa_user_${iaa_engines}.sh" \
+      "IAA config script not found for ${iaa_engines} engine(s)"
+  done
+fi
+
+configure_iaa_profile() {
+  local engine_count="$1"
+  if [[ "$SKIP_IAA_CONFIG" -eq 1 ]]; then
+    return
+  fi
+  local cfg_script="$IAA_CONFIG_DIR/configure_iaa_user_${engine_count}.sh"
+  if [[ "$CURRENT_IAA_ENGINE_PROFILE" == "$engine_count" ]]; then
+    return
+  fi
+
+  echo "  [IAA] configure ${engine_count} engine(s): $cfg_script"
+  if ! sudo bash "$cfg_script"; then
+    echo "Error: failed to run IAA config script: $cfg_script" >&2
+    exit 1
+  fi
+  if ! sudo chown -R "$IAA_DEVICE_OWNER" /dev/iax; then
+    echo "Error: failed to change /dev/iax ownership to '$IAA_DEVICE_OWNER'" >&2
+    exit 1
+  fi
+  CURRENT_IAA_ENGINE_PROFILE="$engine_count"
+}
+
+start_sudo_keepalive() {
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    return
+  fi
+  sudo -v
+  (
+    while true; do
+      sudo -n true
+      sleep 50
+    done
+  ) >/dev/null 2>&1 &
+  SUDO_KEEPALIVE_PID=$!
+}
+
+stop_sudo_keepalive() {
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" >/dev/null 2>&1 || true
+    SUDO_KEEPALIVE_PID=""
+  fi
+}
+
+trap stop_sudo_keepalive EXIT
+if [[ "$REQUIRE_IAA_PROFILE" -eq 1 && "$SKIP_IAA_CONFIG" -eq 0 ]]; then
+  start_sudo_keepalive
+fi
 
 NORM_FILTER_1PCT="$(normalize_range_expr "$FILTER_EXPR_1PCT")"
 NORM_FILTER_10PCT="$(normalize_range_expr "$FILTER_EXPR_10PCT")"
@@ -724,12 +923,14 @@ else
   MAP1_FIELD=""
   MAP1_BUCKET_LOW=""
   MAP1_BUCKET_HIGH=""
+  MAP1_BUCKET_SIZE=""
   MAP1_SELECTED_BUCKET_COUNT=""
   MAP1_FID_BUCKET_MATCH_COUNT=""
   MAP1_FID_MISSING_COUNT=""
   MAP10_FIELD=""
   MAP10_BUCKET_LOW=""
   MAP10_BUCKET_HIGH=""
+  MAP10_BUCKET_SIZE=""
   MAP10_SELECTED_BUCKET_COUNT=""
   MAP10_FID_BUCKET_MATCH_COUNT=""
   MAP10_FID_MISSING_COUNT=""
@@ -762,6 +963,16 @@ run_single() {
   fi
   local summary_path="$summary_dir/${summary_stem}.summary.txt"
   local log_path="$summary_dir/${summary_stem}.log"
+  local iaa_engine_profile=""
+  case "$method" in
+    compass_iaa_1) iaa_engine_profile="1" ;;
+    compass_iaa_2) iaa_engine_profile="2" ;;
+    compass_iaa_4) iaa_engine_profile="4" ;;
+    compass_iaa_8) iaa_engine_profile="8" ;;
+  esac
+  if [[ -n "$iaa_engine_profile" ]]; then
+    configure_iaa_profile "$iaa_engine_profile"
+  fi
 
   local -a cmd
   case "$method" in
@@ -807,6 +1018,7 @@ run_single() {
         --ef "$ef"
         --filter "$filter_expr"
         --fidtb-manifest "$manifest_path"
+        --payload-jsonl "$PAYLOAD_JSONL"
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
       )
@@ -817,7 +1029,7 @@ run_single() {
         cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
       fi
       ;;
-    compass_iaa)
+    compass_iaa|compass_iaa_1|compass_iaa_2|compass_iaa_4|compass_iaa_8)
       cmd=(
         "$IAA_RUN"
         --dataset-type laion
@@ -827,6 +1039,7 @@ run_single() {
         --ef "$ef"
         --filter "$filter_expr"
         --fidtb-manifest "$manifest_path"
+        --payload-jsonl "$PAYLOAD_JSONL"
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
       )
@@ -925,9 +1138,10 @@ run_selectivity() {
   local map_field="$7"
   local map_bucket_low="$8"
   local map_bucket_high="$9"
-  local map_bucket_count="${10}"
-  local map_fid_match="${11}"
-  local map_fid_missing="${12}"
+  local map_bucket_size="${10}"
+  local map_bucket_count="${11}"
+  local map_fid_match="${12}"
+  local map_fid_missing="${13}"
 
   local -n ef_values_ref="$ef_values_name"
 
@@ -935,7 +1149,7 @@ run_selectivity() {
   local method=""
   for ef in "${ef_values_ref[@]}"; do
     for method in "${METHODS[@]}"; do
-      echo "[RANGE_EXPECT] sel=${selectivity_pct}% method=${method} ef=${ef} field=${map_field} buckets=${map_bucket_low}..${map_bucket_high} count=${map_bucket_count} fid_matches=${map_fid_match} fid_missing=${map_fid_missing}"
+      echo "[RANGE_EXPECT] sel=${selectivity_pct}% method=${method} ef=${ef} field=${map_field} buckets=${map_bucket_low}..${map_bucket_high} bucket_size=${map_bucket_size} count=${map_bucket_count} fid_matches=${map_fid_match} fid_missing=${map_fid_missing}"
       if [[ "$method" == "post_filter_hnsw" ]]; then
         local postfilter_max_candidates=""
         for postfilter_max_candidates in "${POSTFILTER_MAX_VALUES[@]}"; do
@@ -984,7 +1198,17 @@ echo "  filter input (1%): $FILTER_EXPR_1PCT"
 echo "  filter normalized (1%): $NORM_FILTER_1PCT"
 echo "  filter input (10%): $FILTER_EXPR_10PCT"
 echo "  filter normalized (10%): $NORM_FILTER_10PCT"
+echo "  methods: ${METHODS[*]}"
+if [[ "$REQUIRE_IAA_PROFILE" -eq 1 ]]; then
+  echo "  iaa engine profiles: ${IAA_ENGINE_VALUES[*]}"
+  echo "  skip iaa config: $SKIP_IAA_CONFIG"
+fi
+if [[ "$REQUIRE_IAA_PROFILE" -eq 1 && "$SKIP_IAA_CONFIG" -eq 0 ]]; then
+  echo "  iaa config dir: $IAA_CONFIG_DIR"
+  echo "  iaa device owner: $IAA_DEVICE_OWNER"
+fi
 echo "  out-dir: $OUT_DIR"
+echo "  clean out-dir: $CLEAN_OUT_DIR"
 
 run_selectivity \
   "1" \
@@ -996,6 +1220,7 @@ run_selectivity \
   "$MAP1_FIELD" \
   "$MAP1_BUCKET_LOW" \
   "$MAP1_BUCKET_HIGH" \
+  "$MAP1_BUCKET_SIZE" \
   "$MAP1_SELECTED_BUCKET_COUNT" \
   "$MAP1_FID_BUCKET_MATCH_COUNT" \
   "$MAP1_FID_MISSING_COUNT"
@@ -1010,6 +1235,7 @@ run_selectivity \
   "$MAP10_FIELD" \
   "$MAP10_BUCKET_LOW" \
   "$MAP10_BUCKET_HIGH" \
+  "$MAP10_BUCKET_SIZE" \
   "$MAP10_SELECTED_BUCKET_COUNT" \
   "$MAP10_FID_BUCKET_MATCH_COUNT" \
   "$MAP10_FID_MISSING_COUNT"
