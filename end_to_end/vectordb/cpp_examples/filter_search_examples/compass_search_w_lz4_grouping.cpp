@@ -1040,6 +1040,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
     const QueryT* query_data,
     size_t k,
     size_t ef,
+    size_t break_threshold_count,
     const SequentialEqRuntime& runtime,
     SequentialEqQueryCache* cache,
     SequentialEqSearchWorkspace* workspace,
@@ -1125,7 +1126,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         bool need_fid = false;
     };
 
-    constexpr size_t kFidSubmitBatchThreshold = 8;
     std::vector<FrontierCandidate> frontier_candidates;
     frontier_candidates.reserve(index.maxM0_);
     std::vector<FrontierCandidate> temp_result_buffer;
@@ -1151,7 +1151,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
     };
 
     auto submit_pending_fid_blocks = [&]() -> bool {
-        if (pending_fid_blocks_to_submit.size() < kFidSubmitBatchThreshold) {
+        if (pending_fid_blocks_to_submit.empty()) {
             return false;
         }
         for (size_t fid_block_id : pending_fid_blocks_to_submit) {
@@ -1198,6 +1198,10 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
     while (true) {
         // Stage 0: retry buffered result candidates whose FID may now be ready.
         retry_temp_buffer_once();
+
+        if (top_candidates.size() >= break_threshold_count) {
+            break;
+        }
 
         if (candidate_set.empty()) {
             // Stage 6a: no frontier left.
@@ -1276,7 +1280,10 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             frontier_candidates.push_back(entry);
         }
 
-        // Stage 2: compute distance for grouped TB-passed neighbors.
+        // Stage 2: submit grouped FID decompression for this expansion.
+        submit_pending_fid_blocks();
+
+        // Stage 3: compute distance for grouped TB-passed neighbors.
         for (FrontierCandidate& entry : frontier_candidates) {
             entry.dist = index.fstdistfunc_(
                 query_data,
@@ -1284,7 +1291,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 index.dist_func_param_);
         }
 
-        // Stage 3: traversal/result split.
+        // Stage 4: traversal/result split.
         // Keep traversal quality by pushing TB-passed candidates immediately to candidate_set.
         // For final result insertion, require FID ready+match; otherwise keep in temporary buffer.
         for (const FrontierCandidate& entry : frontier_candidates) {
@@ -1314,9 +1321,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
 
             temp_result_buffer.push_back(entry);
         }
-
-        // Stage 4: synchronous grouped FID decompression when a batch is ready.
-        submit_pending_fid_blocks();
 
         // Stage 5: re-check temporary buffer after newly decompressed FID blocks.
         retry_temp_buffer_once();
@@ -1369,6 +1373,10 @@ RunStats run_search_typed(
     const SequentialEqRuntime* sequential_runtime) {
     const size_t resolved_ef = resolve_ef(args);
     const double effective_break_factor = resolve_effective_break_factor(args, resolved_ef);
+    size_t break_threshold_count = static_cast<size_t>(
+        std::ceil(static_cast<double>(args.k) * effective_break_factor));
+    break_threshold_count = std::max<size_t>(static_cast<size_t>(args.k), break_threshold_count);
+    break_threshold_count = std::min<size_t>(resolved_ef, break_threshold_count);
 
     SpaceT space(static_cast<size_t>(dim));
     hnswlib::HierarchicalNSW<DistT> index(&space, args.graph_path);
@@ -1465,6 +1473,7 @@ RunStats run_search_typed(
                 qptr,
                 static_cast<size_t>(args.k),
                 resolved_ef,
+                break_threshold_count,
                 *sequential_runtime,
                 &query_cache,
                 &query_workspace,

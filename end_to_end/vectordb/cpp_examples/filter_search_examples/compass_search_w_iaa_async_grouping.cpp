@@ -1174,6 +1174,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
     const QueryT* query_data,
     size_t k,
     size_t ef,
+    size_t break_threshold_count,
     const AsyncEqRuntime& runtime,
     AsyncJobRing* ring,
     AsyncEqQueryCache* cache,
@@ -1261,7 +1262,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         bool deleted = false;
         bool need_fid = false;
     };
-    constexpr size_t kFidSubmitBatchThreshold = 8;
     std::vector<hnswlib::tableint> neighbor_ids;
     neighbor_ids.reserve(index.maxM0_);
     std::vector<FrontierCandidate> frontier_candidates;
@@ -1280,7 +1280,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
     };
 
     auto submit_pending_fid_blocks = [&]() {
-        if (pending_fid_blocks_to_submit.size() < kFidSubmitBatchThreshold) {
+        if (pending_fid_blocks_to_submit.empty()) {
             return;
         }
         for (size_t fid_block_id : pending_fid_blocks_to_submit) {
@@ -1347,6 +1347,10 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         // whose FID may have become ready since the last expansion.
         poll_ready_jobs();
         retry_temp_buffer_once();
+
+        if (top_candidates.size() >= break_threshold_count) {
+            break;
+        }
 
         if (candidate_set.empty()) {
             // Stage 6a: frontier is empty.
@@ -1448,7 +1452,10 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             frontier_candidates.push_back(entry);
         }
 
-        // Stage 2: compute distances for all TB-passed neighbors.
+        // Stage 2: submit FID jobs for this expansion (non-blocking).
+        submit_pending_fid_blocks();
+
+        // Stage 3: compute distances for all TB-passed neighbors.
         for (FrontierCandidate& entry : frontier_candidates) {
             entry.dist = index.fstdistfunc_(
                 query_data,
@@ -1456,7 +1463,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                 index.dist_func_param_);
         }
 
-        // Stage 3: traversal/update split.
+        // Stage 4: traversal/update split.
         // 1) Push eligible TB-passed nodes to candidate_set immediately (keeps recall close to baseline).
         // 2) For final results: if FID is ready, evaluate now; otherwise push to temporary buffer.
         for (const FrontierCandidate& entry : frontier_candidates) {
@@ -1493,10 +1500,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             temp_result_buffer.push_back(entry);
             ++call_stats->deferred_candidates_enqueued;
         }
-
-        // Stage 4: submit newly discovered FID blocks in batches (threshold = 8).
-        // This reduces software-side submit overhead.
-        submit_pending_fid_blocks();
 
         // Stage 5: non-blocking completion check for the jobs submitted this/previous rounds.
         poll_ready_jobs();
@@ -1554,6 +1557,10 @@ RunStats run_search_typed(
     const AsyncEqRuntime* async_runtime) {
     const size_t resolved_ef = resolve_ef(args);
     const double effective_break_factor = resolve_effective_break_factor(args, resolved_ef);
+    size_t break_threshold_count = static_cast<size_t>(
+        std::ceil(static_cast<double>(args.k) * effective_break_factor));
+    break_threshold_count = std::max<size_t>(static_cast<size_t>(args.k), break_threshold_count);
+    break_threshold_count = std::min<size_t>(resolved_ef, break_threshold_count);
 
     SpaceT space(static_cast<size_t>(dim));
     hnswlib::HierarchicalNSW<DistT> index(&space, args.graph_path);
@@ -1652,6 +1659,7 @@ RunStats run_search_typed(
             warmup_qptr,
             static_cast<size_t>(args.k),
             resolved_ef,
+            break_threshold_count,
             *async_runtime,
             shared_ring.get(),
             &query_async_cache,
@@ -1674,6 +1682,7 @@ RunStats run_search_typed(
             qptr,
             static_cast<size_t>(args.k),
             resolved_ef,
+            break_threshold_count,
             *async_runtime,
             shared_ring.get(),
             &query_async_cache,

@@ -99,7 +99,7 @@ EF_LIST="32,64,96,128,160,200"
 EF_LIST_1PCT=""
 EF_LIST_10PCT=""
 EF_LIST_SET_BY_USER=0
-NUM_QUERIES=20
+NUM_QUERIES=10
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 POSTFILTER_MAX_CANDIDATES=3000
 POSTFILTER_MAX_CANDIDATES_SET_BY_USER=0
@@ -304,8 +304,8 @@ set_dataset_defaults() {
       LZ4_DATASET_TYPE="sift"
       IAA_DATASET_TYPE="sift1m"
       if [[ "$EF_LIST_SET_BY_USER" -eq 0 && -z "$EF_LIST_1PCT" && -z "$EF_LIST_10PCT" ]]; then
-        EF_LIST_1PCT="1, 2, 4, 8, 16, 32, 64,96,128,160,200"
-        EF_LIST_10PCT="32, 64, 128, 200,256,300,400, 512,640,800"
+        EF_LIST_1PCT="128,160,200"
+        EF_LIST_10PCT="512,640,800"
       fi
       : "${GRAPH_PATH:=/storage/jykang5/compass_graphs/sift_m128_efc200.bin}"
       : "${QUERY_PATH:=/storage/jykang5/compass_base_query/sift1m_query.fvecs}"
@@ -783,10 +783,10 @@ run_selectivity() {
 
   local methods=(
     "post_filter_hnsw"
-    # "in_search_filter_hnsw"
-    # "acorn"
-    # "compass_lz4"
-    # "compass_iaa"
+    "in_search_filter_hnsw"
+    "acorn"
+    "compass_lz4"
+    "compass_iaa"
   )
 
   for ef in "${ef_values_ref[@]}"; do
