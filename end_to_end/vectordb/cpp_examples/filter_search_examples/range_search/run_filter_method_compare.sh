@@ -410,13 +410,13 @@ parse_iaa_engine_profiles() {
 # Methods to run.
 # Comment out entries here for quick manual method selection.
 METHODS=(
-  # "post_filter_hnsw"
-  # "in_search_filter_hnsw"
-  # "acorn"
+  "post_filter_hnsw"
+  "in_search_filter_hnsw"
+  "acorn"
   "compass_lz4"
-  # "compass_iaa_1"
-  # "compass_iaa_2"
-  # "compass_iaa_4"
+  "compass_iaa_1"
+  "compass_iaa_2"
+  "compass_iaa_4"
   "compass_iaa_8"
 )
 
@@ -450,7 +450,7 @@ EF_LIST="64,96,128,160,200"
 EF_LIST_1PCT=""
 EF_LIST_10PCT=""
 EF_LIST_SET_BY_USER=0
-NUM_QUERIES=20
+NUM_QUERIES=10
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 CLEAN_OUT_DIR=1
 POSTFILTER_MAX_CANDIDATES=3000

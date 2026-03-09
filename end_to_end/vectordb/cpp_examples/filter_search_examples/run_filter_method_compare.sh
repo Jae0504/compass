@@ -101,7 +101,7 @@ EF_LIST="32,64,96,128,160,200"
 EF_LIST_1PCT=""
 EF_LIST_10PCT=""
 EF_LIST_SET_BY_USER=0
-NUM_QUERIES=10
+NUM_QUERIES=200
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 POSTFILTER_MAX_CANDIDATES=3000
 POSTFILTER_MAX_CANDIDATES_SET_BY_USER=0
@@ -857,9 +857,9 @@ run_selectivity() {
   local -n ef_values_ref="$ef_values_name"
 
   local methods=(
-    # "post_filter_hnsw"
-    # "in_search_filter_hnsw"
-    # "acorn"
+    "post_filter_hnsw"
+    "in_search_filter_hnsw"
+    "acorn"
     "compass_lz4"
     "compass_iaa_1"
     "compass_iaa_2"
