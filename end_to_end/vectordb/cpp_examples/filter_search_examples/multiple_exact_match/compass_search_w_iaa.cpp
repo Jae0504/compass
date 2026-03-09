@@ -4,6 +4,7 @@
 #include "../filter_expr.h"
 #include "../io_utils.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <deque>
@@ -45,7 +46,7 @@ struct Args {
     size_t fid_block_size_bytes = compass_iaa_filter::kDefaultFidBlockSizeBytes;
     size_t tb_block_size_bytes = compass_iaa_filter::kDefaultTbBlockSizeBytes;
 
-    // Backward-compatible optional flags. Not used in the IAA FID/TB path.
+    // Metadata source for ENNS ground-truth filtering.
     std::string payload_jsonl;
     std::string metadata_csv;
     std::string id_column = "id";
@@ -92,6 +93,22 @@ struct RunStats {
     uint64_t tb_cache_hits = 0;
     uint64_t fid_bytes_decompressed = 0;
     uint64_t tb_bytes_decompressed = 0;
+    uint64_t fid_ready_candidates = 0;
+    uint64_t deferred_retry_rounds = 0;
+    uint64_t fid_jobs_submitted = 0;
+    uint64_t tb_jobs_submitted = 0;
+    uint64_t job_poll_calls = 0;
+    uint64_t job_poll_ready = 0;
+    uint64_t job_wait_calls = 0;
+    uint64_t deferred_max_pending = 0;
+    uint64_t tb_prefetch_wait_ns = 0;
+    uint64_t frontier_empty_wait_ns = 0;
+    uint64_t early_stop_wait_ns = 0;
+    uint64_t deferred_drain_wait_ns = 0;
+    uint64_t tb_submit_time_ns = 0;
+    uint64_t tb_wait_time_ns = 0;
+    uint64_t fid_submit_time_ns = 0;
+    uint64_t fid_wait_time_ns = 0;
 
     size_t returned_results = 0;
     size_t selectivity_count = 0;
@@ -110,6 +127,22 @@ struct SearchCallStats {
     uint64_t filter_eval_calls = 0;
     uint64_t filter_eval_time_ns = 0;
     compass_iaa_filter::QueryDecompressionMetrics decomp;
+    uint64_t fid_ready_candidates = 0;
+    uint64_t deferred_retry_rounds = 0;
+    uint64_t fid_jobs_submitted = 0;
+    uint64_t tb_jobs_submitted = 0;
+    uint64_t job_poll_calls = 0;
+    uint64_t job_poll_ready = 0;
+    uint64_t job_wait_calls = 0;
+    uint64_t deferred_max_pending = 0;
+    uint64_t tb_prefetch_wait_ns = 0;
+    uint64_t frontier_empty_wait_ns = 0;
+    uint64_t early_stop_wait_ns = 0;
+    uint64_t deferred_drain_wait_ns = 0;
+    uint64_t tb_submit_time_ns = 0;
+    uint64_t tb_wait_time_ns = 0;
+    uint64_t fid_submit_time_ns = 0;
+    uint64_t fid_wait_time_ns = 0;
 };
 
 void usage(const char* argv0) {
@@ -233,6 +266,14 @@ Args parse_args(int argc, char** argv) {
         throw std::runtime_error("--query must end with .fvecs or .bvecs");
     }
 
+    const bool is_sift_family =
+        (args.dataset_type == "sift" || args.dataset_type == "sift1m" || args.dataset_type == "sift1b");
+    if (is_sift_family) {
+        ensure_readable_file(args.metadata_csv, "--metadata-csv");
+    } else {
+        ensure_readable_file(args.payload_jsonl, "--payload-jsonl");
+    }
+
     if (args.ef <= 0) {
         args.ef = std::max(100, args.k);
     }
@@ -290,12 +331,15 @@ struct AsyncMultiEqRuntime {
 struct FidScanBlock {
     std::vector<uint8_t> matches;
     uint32_t input_elements = 0;
+    uint32_t produced_bytes = 0;
     bool byte_per_element = false;
 };
 
 struct LeafQueryCache {
-    std::unordered_map<size_t, std::vector<uint8_t>> tb_blocks;
-    std::unordered_map<size_t, FidScanBlock> fid_blocks;
+    std::vector<std::vector<uint8_t>> tb_blocks;
+    std::vector<uint8_t> tb_state;
+    std::vector<FidScanBlock> fid_blocks;
+    std::vector<uint8_t> fid_state;
 };
 
 struct AsyncMultiEqQueryCache {
@@ -465,23 +509,13 @@ AsyncMultiEqRuntime build_async_multi_eq_runtime(
                 "TB element count mismatch while building async runtime for field '" + attr.key + "'");
         }
 
-        std::vector<uint8_t> tb_bucket_bits((manifest.n_elements + 7) / 8, 0);
-        const size_t bucket_byte = static_cast<size_t>(target_bucket) / 8;
-        const uint8_t bucket_mask = static_cast<uint8_t>(1u << (target_bucket % 8));
-        for (size_t node_id = 0; node_id < manifest.n_elements; ++node_id) {
-            const size_t offset = node_id * compass_iaa_filter::kTbBytesPerNode + bucket_byte;
-            if ((tb_raw[offset] & bucket_mask) != 0) {
-                tb_bucket_bits[node_id / 8] |= static_cast<uint8_t>(1u << (node_id % 8));
-            }
-        }
-
         leaf.target_bucket = static_cast<uint8_t>(target_bucket);
         leaf.fid_storage = compass_iaa_filter::detail::compress_to_iaa_blocks(
             fid_raw,
             args.fid_block_size_bytes,
             compressor.get());
         leaf.tb_storage = compass_iaa_filter::detail::compress_to_iaa_blocks(
-            tb_bucket_bits,
+            tb_raw,
             args.tb_block_size_bytes,
             compressor.get());
         return leaf;
@@ -511,8 +545,13 @@ AsyncMultiEqRuntime build_async_multi_eq_runtime(
 
 class AsyncJobRing {
 public:
-    AsyncJobRing(size_t queue_size = 128, size_t wait_batch = 64)
-        : queue_size_(queue_size), wait_batch_(wait_batch) {
+    AsyncJobRing(
+        size_t queue_size = 128,
+        size_t wait_batch = 64,
+        size_t slot_output_capacity = 0)
+        : queue_size_(queue_size),
+          wait_batch_(wait_batch),
+          slot_output_capacity_(slot_output_capacity) {
         if (queue_size_ == 0 || wait_batch_ == 0 || wait_batch_ > queue_size_) {
             throw std::runtime_error("Invalid AsyncJobRing configuration");
         }
@@ -530,6 +569,9 @@ public:
             status = qpl_init_job(qpl_path_hardware, slots_[i].job);
             if (status != QPL_STS_OK) {
                 throw std::runtime_error("AsyncJobRing: qpl_init_job failed");
+            }
+            if (slot_output_capacity_ > 0) {
+                slots_[i].output.resize(slot_output_capacity_);
             }
             free_slots_.push_back(i);
         }
@@ -551,7 +593,13 @@ public:
         free_slots_.pop_front();
 
         Slot& slot = slots_[slot_id];
-        slot.output.assign(output_capacity, 0);
+        if (slot.output.size() < output_capacity) {
+            if (slot_output_capacity_ > 0) {
+                throw std::runtime_error(
+                    "AsyncJobRing preallocated output buffer is smaller than requested output");
+            }
+            slot.output.resize(output_capacity);
+        }
 
         setup_fn(slot.job, slot.output);
         const qpl_status submit_status = qpl_submit_job(slot.job);
@@ -572,6 +620,37 @@ public:
 
     void flush() {
         wait_oldest(pending_slots_.size());
+    }
+
+    void wait_one() {
+        wait_oldest(1);
+    }
+
+    bool has_pending() const {
+        return !pending_slots_.empty();
+    }
+
+    size_t poll_ready_jobs() {
+        size_t completed = 0;
+        const size_t pending_count = pending_slots_.size();
+        for (size_t i = 0; i < pending_count; ++i) {
+            const size_t slot_id = pending_slots_.front();
+            pending_slots_.pop_front();
+            Slot& slot = slots_[slot_id];
+
+            const qpl_status status = qpl_check_job(slot.job);
+            if (status == QPL_STS_OK) {
+                complete_slot(slot_id, std::chrono::steady_clock::now());
+                ++completed;
+            } else if (status == QPL_STS_BEING_PROCESSED) {
+                pending_slots_.push_back(slot_id);
+            } else {
+                throw std::runtime_error(
+                    "AsyncJobRing: qpl_check_job failed with status " +
+                    std::to_string(static_cast<int>(status)));
+            }
+        }
+        return completed;
     }
 
 private:
@@ -601,32 +680,97 @@ private:
             Slot& slot = slots_[slot_id];
 
             const qpl_status wait_status = qpl_wait_job(slot.job);
-            const auto done_time = std::chrono::steady_clock::now();
             if (wait_status != QPL_STS_OK) {
                 throw std::runtime_error(
                     "AsyncJobRing: qpl_wait_job failed with status " +
                     std::to_string(static_cast<int>(wait_status)));
             }
-
-            const uint64_t elapsed_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(done_time - slot.submit_time).count());
-            if (slot.complete) {
-                slot.complete(slot.job, slot.output, elapsed_ns);
-            }
-            slot.complete = nullptr;
-            slot.output.clear();
-            free_slots_.push_back(slot_id);
+            complete_slot(slot_id, std::chrono::steady_clock::now());
         }
+    }
+
+    void complete_slot(size_t slot_id, const std::chrono::steady_clock::time_point& done_time) {
+        Slot& slot = slots_[slot_id];
+        const uint64_t elapsed_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(done_time - slot.submit_time).count());
+        if (slot.complete) {
+            slot.complete(slot.job, slot.output, elapsed_ns);
+        }
+        slot.complete = nullptr;
+        free_slots_.push_back(slot_id);
     }
 
     size_t queue_size_ = 128;
     size_t wait_batch_ = 64;
+    size_t slot_output_capacity_ = 0;
     std::vector<Slot> slots_;
     std::deque<size_t> free_slots_;
     std::deque<size_t> pending_slots_;
 };
 
-void submit_tb_prefetch_jobs(
+constexpr uint8_t kBlockNotRequested = 0;
+constexpr uint8_t kBlockInflight = 1;
+constexpr uint8_t kBlockReady = 2;
+
+AsyncMultiEqQueryCache make_preallocated_query_cache(const AsyncMultiEqRuntime& runtime) {
+    AsyncMultiEqQueryCache cache;
+    cache.leaves.resize(runtime.leaves.size());
+    for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
+        const MultiEqLeafRuntime& leaf = runtime.leaves[leaf_idx];
+        LeafQueryCache& leaf_cache = cache.leaves[leaf_idx];
+        if (leaf.impossible) {
+            continue;
+        }
+
+        const size_t tb_blocks = leaf.tb_storage.block_count();
+        leaf_cache.tb_blocks.resize(tb_blocks);
+        leaf_cache.tb_state.assign(tb_blocks, kBlockNotRequested);
+        for (size_t block_id = 0; block_id < tb_blocks; ++block_id) {
+            leaf_cache.tb_blocks[block_id].assign(leaf.tb_storage.raw_block_sizes[block_id], 0);
+        }
+
+        const size_t fid_blocks = leaf.fid_storage.block_count();
+        leaf_cache.fid_blocks.resize(fid_blocks);
+        leaf_cache.fid_state.assign(fid_blocks, kBlockNotRequested);
+        for (size_t block_id = 0; block_id < fid_blocks; ++block_id) {
+            FidScanBlock& block = leaf_cache.fid_blocks[block_id];
+            block.input_elements = leaf.fid_storage.raw_block_sizes[block_id];
+            block.matches.assign(block.input_elements, 0);
+            block.produced_bytes = 0;
+            block.byte_per_element = false;
+        }
+    }
+    return cache;
+}
+
+size_t max_ring_output_capacity(const AsyncMultiEqRuntime& runtime) {
+    size_t max_capacity = 0;
+    for (const MultiEqLeafRuntime& leaf : runtime.leaves) {
+        for (uint32_t raw_len : leaf.tb_storage.raw_block_sizes) {
+            max_capacity = std::max(max_capacity, static_cast<size_t>(raw_len));
+        }
+        for (uint32_t raw_len : leaf.fid_storage.raw_block_sizes) {
+            max_capacity = std::max(max_capacity, static_cast<size_t>(raw_len));
+        }
+    }
+    return max_capacity;
+}
+
+void reset_preallocated_query_cache(AsyncMultiEqQueryCache* cache) {
+    if (cache == nullptr) {
+        throw std::runtime_error("reset_preallocated_query_cache received null cache");
+    }
+    for (LeafQueryCache& leaf_cache : cache->leaves) {
+        std::fill(leaf_cache.tb_state.begin(), leaf_cache.tb_state.end(), kBlockNotRequested);
+        std::fill(leaf_cache.fid_state.begin(), leaf_cache.fid_state.end(), kBlockNotRequested);
+        for (FidScanBlock& block : leaf_cache.fid_blocks) {
+            block.produced_bytes = 0;
+            block.byte_per_element = false;
+        }
+    }
+}
+
+uint64_t submit_tb_prefetch_jobs(
     AsyncJobRing* ring,
     const AsyncMultiEqRuntime& runtime,
     AsyncMultiEqQueryCache* cache,
@@ -634,28 +778,42 @@ void submit_tb_prefetch_jobs(
     if (ring == nullptr || cache == nullptr) {
         throw std::runtime_error("TB prefetch received null pointer");
     }
+    uint64_t submitted_jobs = 0;
     for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
         const MultiEqLeafRuntime& leaf = runtime.leaves[leaf_idx];
         if (leaf.impossible) {
             continue;
         }
         LeafQueryCache& leaf_cache = cache->leaves[leaf_idx];
+        if (leaf_cache.tb_blocks.size() != leaf.tb_storage.block_count() ||
+            leaf_cache.tb_state.size() != leaf.tb_storage.block_count()) {
+            throw std::runtime_error("TB query cache is not preallocated for all blocks");
+        }
+
         for (size_t block_id = 0; block_id < leaf.tb_storage.block_count(); ++block_id) {
-            if (leaf_cache.tb_blocks.find(block_id) != leaf_cache.tb_blocks.end()) {
-                continue;
-            }
-            const uint32_t raw_len = leaf.tb_storage.raw_block_sizes[block_id];
-            if (raw_len == 0) {
-                leaf_cache.tb_blocks.emplace(block_id, std::vector<uint8_t>());
+            uint8_t& state = leaf_cache.tb_state[block_id];
+            if (state != kBlockNotRequested) {
                 continue;
             }
 
+            const uint32_t raw_len = leaf.tb_storage.raw_block_sizes[block_id];
+            if (raw_len == 0) {
+                state = kBlockReady;
+                continue;
+            }
+            if (leaf_cache.tb_blocks[block_id].size() < static_cast<size_t>(raw_len)) {
+                throw std::runtime_error("TB preallocated block is smaller than raw block size");
+            }
+
+            state = kBlockInflight;
             ring->submit(
                 static_cast<size_t>(raw_len),
                 [&, leaf_idx, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out) {
                     job->op = qpl_op_extract;
-                    job->next_in_ptr = const_cast<uint8_t*>(runtime.leaves[leaf_idx].tb_storage.compressed_blocks[block_id].data());
-                    job->available_in = static_cast<uint32_t>(runtime.leaves[leaf_idx].tb_storage.compressed_blocks[block_id].size());
+                    job->next_in_ptr = const_cast<uint8_t*>(
+                        runtime.leaves[leaf_idx].tb_storage.compressed_blocks[block_id].data());
+                    job->available_in = static_cast<uint32_t>(
+                        runtime.leaves[leaf_idx].tb_storage.compressed_blocks[block_id].size());
                     job->next_out_ptr = out.data();
                     job->available_out = raw_len;
                     job->src1_bit_width = 8;
@@ -665,28 +823,44 @@ void submit_tb_prefetch_jobs(
                     job->num_input_elements = raw_len;
                     job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_DECOMPRESS_ENABLE;
                 },
-                [cache, metrics, leaf_idx, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out, uint64_t elapsed_ns) {
-                    out.resize(static_cast<size_t>(job->total_out));
-                    cache->leaves[leaf_idx].tb_blocks[block_id] = out;
+                [cache, metrics, leaf_idx, block_id, raw_len](
+                    qpl_job* job,
+                    std::vector<uint8_t>& out,
+                    uint64_t elapsed_ns) {
+                    LeafQueryCache& complete_cache = cache->leaves[leaf_idx];
+                    std::vector<uint8_t>& dst = complete_cache.tb_blocks[block_id];
+                    const size_t produced = static_cast<size_t>(job->total_out);
+                    if (produced != static_cast<size_t>(raw_len) || produced > dst.size()) {
+                        throw std::runtime_error("Unexpected TB extract output size from IAA");
+                    }
+                    std::copy(out.begin(), out.begin() + produced, dst.begin());
+                    complete_cache.tb_state[block_id] = kBlockReady;
+
                     if (metrics != nullptr) {
                         metrics->iaa_decompress_time_ns += elapsed_ns;
                         ++metrics->tb_blocks_decompressed;
                         metrics->tb_bytes_decompressed += static_cast<uint64_t>(raw_len);
                     }
                 });
+            ++submitted_jobs;
         }
     }
+    return submitted_jobs;
 }
 
-void submit_fid_scan_jobs(
+uint64_t submit_fid_scan_jobs(
     AsyncJobRing* ring,
     const AsyncMultiEqRuntime& runtime,
-    const std::vector<std::unordered_set<size_t>>& blocks_by_leaf,
+    const std::vector<std::vector<size_t>>& blocks_by_leaf,
     AsyncMultiEqQueryCache* cache,
     compass_iaa_filter::QueryDecompressionMetrics* metrics) {
     if (ring == nullptr || cache == nullptr) {
         throw std::runtime_error("FID async scan received null pointer");
     }
+    if (blocks_by_leaf.size() != runtime.leaves.size()) {
+        throw std::runtime_error("FID async scan block list does not match leaf count");
+    }
+    uint64_t submitted_jobs = 0;
 
     for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
         const MultiEqLeafRuntime& leaf = runtime.leaves[leaf_idx];
@@ -694,26 +868,41 @@ void submit_fid_scan_jobs(
             continue;
         }
         LeafQueryCache& leaf_cache = cache->leaves[leaf_idx];
+        if (leaf_cache.fid_blocks.size() != leaf.fid_storage.block_count() ||
+            leaf_cache.fid_state.size() != leaf.fid_storage.block_count()) {
+            throw std::runtime_error("FID query cache is not preallocated for all blocks");
+        }
+
         for (size_t block_id : blocks_by_leaf[leaf_idx]) {
             if (block_id >= leaf.fid_storage.block_count()) {
                 continue;
             }
-            if (leaf_cache.fid_blocks.find(block_id) != leaf_cache.fid_blocks.end()) {
+            uint8_t& state = leaf_cache.fid_state[block_id];
+            if (state != kBlockNotRequested) {
                 continue;
             }
 
             const uint32_t raw_len = leaf.fid_storage.raw_block_sizes[block_id];
+            FidScanBlock& preallocated = leaf_cache.fid_blocks[block_id];
+            if (preallocated.matches.size() < static_cast<size_t>(raw_len)) {
+                throw std::runtime_error("FID preallocated block is smaller than raw block size");
+            }
             if (raw_len == 0) {
-                leaf_cache.fid_blocks.emplace(block_id, FidScanBlock{});
+                preallocated.produced_bytes = 0;
+                preallocated.byte_per_element = false;
+                state = kBlockReady;
                 continue;
             }
 
+            state = kBlockInflight;
             ring->submit(
                 static_cast<size_t>(raw_len),
                 [&, leaf_idx, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out) {
                     job->op = qpl_op_scan_eq;
-                    job->next_in_ptr = const_cast<uint8_t*>(runtime.leaves[leaf_idx].fid_storage.compressed_blocks[block_id].data());
-                    job->available_in = static_cast<uint32_t>(runtime.leaves[leaf_idx].fid_storage.compressed_blocks[block_id].size());
+                    job->next_in_ptr = const_cast<uint8_t*>(
+                        runtime.leaves[leaf_idx].fid_storage.compressed_blocks[block_id].data());
+                    job->available_in = static_cast<uint32_t>(
+                        runtime.leaves[leaf_idx].fid_storage.compressed_blocks[block_id].size());
                     job->next_out_ptr = out.data();
                     job->available_out = raw_len;
                     job->src1_bit_width = 8;
@@ -722,21 +911,43 @@ void submit_fid_scan_jobs(
                     job->num_input_elements = raw_len;
                     job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_DECOMPRESS_ENABLE;
                 },
-                [cache, metrics, leaf_idx, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out, uint64_t elapsed_ns) {
-                    out.resize(static_cast<size_t>(job->total_out));
-                    FidScanBlock block;
-                    block.matches = out;
+                [cache, metrics, leaf_idx, block_id, raw_len](
+                    qpl_job* job,
+                    std::vector<uint8_t>& out,
+                    uint64_t elapsed_ns) {
+                    LeafQueryCache& complete_cache = cache->leaves[leaf_idx];
+                    FidScanBlock& block = complete_cache.fid_blocks[block_id];
+                    const size_t produced = static_cast<size_t>(job->total_out);
+                    if (produced > block.matches.size()) {
+                        throw std::runtime_error("IAA FID scan output exceeded preallocated buffer");
+                    }
+                    std::copy(
+                        out.begin(),
+                        out.begin() + produced,
+                        block.matches.begin());
                     block.input_elements = raw_len;
-                    block.byte_per_element = (job->total_out >= raw_len);
-                    cache->leaves[leaf_idx].fid_blocks[block_id] = std::move(block);
+                    block.produced_bytes = static_cast<uint32_t>(produced);
+
+                    const size_t bitpacked_bytes = (static_cast<size_t>(raw_len) + 7u) / 8u;
+                    if (produced >= static_cast<size_t>(raw_len)) {
+                        block.byte_per_element = true;
+                    } else if (produced >= bitpacked_bytes) {
+                        block.byte_per_element = false;
+                    } else {
+                        throw std::runtime_error("IAA FID scan produced fewer bytes than bit-packed minimum");
+                    }
+
+                    complete_cache.fid_state[block_id] = kBlockReady;
                     if (metrics != nullptr) {
                         metrics->iaa_decompress_time_ns += elapsed_ns;
                         ++metrics->fid_blocks_decompressed;
                         metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
                     }
                 });
+            ++submitted_jobs;
         }
     }
+    return submitted_jobs;
 }
 
 bool tb_match_node(
@@ -747,19 +958,23 @@ bool tb_match_node(
     if (cache == nullptr || leaf.tb_storage.block_size == 0) {
         return false;
     }
-    const size_t byte_offset = node_id / 8;
+    const size_t bucket_byte = static_cast<size_t>(leaf.target_bucket) / 8;
+    const uint8_t bucket_mask = static_cast<uint8_t>(1u << (leaf.target_bucket % 8));
+    const size_t byte_offset =
+        node_id * compass_iaa_filter::kTbBytesPerNode + bucket_byte;
     const size_t block_id = byte_offset / leaf.tb_storage.block_size;
     const size_t in_block = byte_offset % leaf.tb_storage.block_size;
-
-    auto it = cache->tb_blocks.find(block_id);
-    if (it == cache->tb_blocks.end() || in_block >= it->second.size()) {
+    if (block_id >= cache->tb_blocks.size() ||
+        block_id >= cache->tb_state.size() ||
+        cache->tb_state[block_id] != kBlockReady ||
+        in_block >= cache->tb_blocks[block_id].size()) {
         return false;
     }
     if (metrics != nullptr) {
         ++metrics->tb_cache_hits;
     }
-    const uint8_t byte = it->second[in_block];
-    return ((byte >> (node_id % 8)) & 1u) != 0;
+    const uint8_t byte = cache->tb_blocks[block_id][in_block];
+    return (byte & bucket_mask) != 0;
 }
 
 bool fid_match_node(
@@ -773,99 +988,130 @@ bool fid_match_node(
 
     const size_t block_id = node_id / leaf.fid_storage.block_size;
     const size_t in_block = node_id % leaf.fid_storage.block_size;
-    auto it = cache->fid_blocks.find(block_id);
-    if (it == cache->fid_blocks.end()) {
+    if (block_id >= cache->fid_blocks.size() ||
+        block_id >= cache->fid_state.size() ||
+        cache->fid_state[block_id] != kBlockReady) {
         return false;
     }
     if (metrics != nullptr) {
         ++metrics->fid_cache_hits;
     }
 
-    const FidScanBlock& block = it->second;
+    const FidScanBlock& block = cache->fid_blocks[block_id];
     if (block.byte_per_element) {
-        return in_block < block.matches.size() && block.matches[in_block] != 0;
+        return in_block < static_cast<size_t>(block.produced_bytes) && block.matches[in_block] != 0;
     }
 
     const size_t byte_idx = in_block / 8;
-    if (byte_idx >= block.matches.size()) {
+    if (byte_idx >= static_cast<size_t>(block.produced_bytes)) {
         return false;
     }
     return ((block.matches[byte_idx] >> (in_block % 8)) & 1u) != 0;
 }
 
-bool evaluate_multi_eq_node(
-    const MultiEqNodeRuntime* node,
-    bool traversal_mode,
+bool traversal_leaf_match(
+    const MultiEqLeafRuntime& leaf,
+    LeafQueryCache* cache,
+    size_t candidate_id,
+    compass_iaa_filter::QueryDecompressionMetrics* metrics) {
+    if (leaf.impossible) {
+        return false;
+    }
+    // TB-only traversal gate: no FID fallback during frontier expansion.
+    return tb_match_node(leaf, cache, candidate_id, metrics);
+}
+
+bool result_leaf_match(
+    const MultiEqLeafRuntime& leaf,
+    LeafQueryCache* cache,
+    size_t candidate_id,
+    compass_iaa_filter::QueryDecompressionMetrics* metrics) {
+    if (leaf.impossible) {
+        return false;
+    }
+    return fid_match_node(leaf, cache, candidate_id, metrics);
+}
+
+bool result_leaf_ready(
+    const MultiEqLeafRuntime& leaf,
+    const LeafQueryCache* cache,
+    size_t candidate_id) {
+    if (leaf.impossible) {
+        return true;
+    }
+    if (cache == nullptr || leaf.fid_storage.block_size == 0) {
+        return true;
+    }
+    const size_t block_id = candidate_id / leaf.fid_storage.block_size;
+    if (block_id >= cache->fid_state.size()) {
+        return true;
+    }
+    return cache->fid_state[block_id] == kBlockReady;
+}
+
+struct TwoLeafResultDecision {
+    bool decided = false;
+    bool allowed = false;
+};
+
+TwoLeafResultDecision evaluate_result_two_leaf_nonblocking(
     size_t candidate_id,
     const AsyncMultiEqRuntime& runtime,
     AsyncMultiEqQueryCache* cache,
     compass_iaa_filter::QueryDecompressionMetrics* metrics) {
-    if (node == nullptr) {
-        return false;
-    }
-    if (node->kind == MultiEqNodeRuntime::Kind::Logical) {
-        if (traversal_mode) {
-            return evaluate_multi_eq_node(
-                       node->left.get(),
-                       traversal_mode,
-                       candidate_id,
-                       runtime,
-                       cache,
-                       metrics) ||
-                   evaluate_multi_eq_node(
-                       node->right.get(),
-                       traversal_mode,
-                       candidate_id,
-                       runtime,
-                       cache,
-                       metrics);
-        }
-        if (node->logical_op == filter_expr::LogicalOp::And) {
-            return evaluate_multi_eq_node(
-                       node->left.get(),
-                       traversal_mode,
-                       candidate_id,
-                       runtime,
-                       cache,
-                       metrics) &&
-                   evaluate_multi_eq_node(
-                       node->right.get(),
-                       traversal_mode,
-                       candidate_id,
-                       runtime,
-                       cache,
-                       metrics);
-        }
-        return evaluate_multi_eq_node(
-                   node->left.get(),
-                   traversal_mode,
-                   candidate_id,
-                   runtime,
-                   cache,
-                   metrics) ||
-               evaluate_multi_eq_node(
-                   node->right.get(),
-                   traversal_mode,
-                   candidate_id,
-                   runtime,
-                   cache,
-                   metrics);
+    if (cache == nullptr || runtime.leaves.size() != 2 || cache->leaves.size() != runtime.leaves.size()) {
+        return TwoLeafResultDecision{};
     }
 
-    const size_t leaf_idx = node->leaf_index;
-    const MultiEqLeafRuntime& leaf = runtime.leaves[leaf_idx];
-    if (leaf.impossible) {
-        return false;
+    if (runtime.logical_op == filter_expr::LogicalOp::And) {
+        const bool left_ready = result_leaf_ready(runtime.leaves[0], &cache->leaves[0], candidate_id);
+        const bool left = result_leaf_match(
+            runtime.leaves[0],
+            &cache->leaves[0],
+            candidate_id,
+            metrics);
+        if (left_ready && !left) {
+            return TwoLeafResultDecision{true, false};
+        }
+
+        const bool right_ready = result_leaf_ready(runtime.leaves[1], &cache->leaves[1], candidate_id);
+        const bool right = result_leaf_match(
+            runtime.leaves[1],
+            &cache->leaves[1],
+            candidate_id,
+            metrics);
+        if (right_ready && !right) {
+            return TwoLeafResultDecision{true, false};
+        }
+        if (!left_ready || !right_ready) {
+            return TwoLeafResultDecision{false, false};
+        }
+        return TwoLeafResultDecision{true, left && right};
     }
 
-    bool fid = fid_match_node(leaf, &cache->leaves[leaf_idx], candidate_id, metrics);
-    if (!traversal_mode) {
-        return fid;
+    const bool left_ready = result_leaf_ready(runtime.leaves[0], &cache->leaves[0], candidate_id);
+    const bool left = result_leaf_match(
+        runtime.leaves[0],
+        &cache->leaves[0],
+        candidate_id,
+        metrics);
+    if (left_ready && left) {
+        return TwoLeafResultDecision{true, true};
     }
-    if (fid) {
-        return true;
+
+    const bool right_ready = result_leaf_ready(runtime.leaves[1], &cache->leaves[1], candidate_id);
+    const bool right = result_leaf_match(
+        runtime.leaves[1],
+        &cache->leaves[1],
+        candidate_id,
+        metrics);
+    if (right_ready && right) {
+        return TwoLeafResultDecision{true, true};
     }
-    return tb_match_node(leaf, &cache->leaves[leaf_idx], candidate_id, metrics);
+    if (!left_ready || !right_ready) {
+        return TwoLeafResultDecision{false, false};
+    }
+    return TwoLeafResultDecision{true, false};
 }
 
 template <typename DistT, typename QueryT>
@@ -1016,14 +1262,35 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
     size_t k,
     size_t ef,
     const AsyncMultiEqRuntime& runtime,
+    AsyncMultiEqQueryCache* cache,
+    AsyncJobRing* ring,
     SearchCallStats* call_stats) {
     std::vector<std::pair<DistT, hnswlib::labeltype>> result;
     if (index.cur_element_count == 0) {
         return result;
     }
+    if (cache == nullptr || ring == nullptr) {
+        throw std::runtime_error("Async multi-eq search received null cache/ring");
+    }
+    if (runtime.leaves.size() != 2 || cache->leaves.size() != runtime.leaves.size()) {
+        throw std::runtime_error("Async multi-eq search expects two preallocated leaves");
+    }
 
     if (runtime.n_elements != index.cur_element_count) {
         throw std::runtime_error("Async runtime element count does not match index");
+    }
+    for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
+        const MultiEqLeafRuntime& leaf = runtime.leaves[leaf_idx];
+        if (leaf.impossible) {
+            continue;
+        }
+        const LeafQueryCache& leaf_cache = cache->leaves[leaf_idx];
+        if (leaf_cache.tb_blocks.size() != leaf.tb_storage.block_count() ||
+            leaf_cache.tb_state.size() != leaf.tb_storage.block_count() ||
+            leaf_cache.fid_blocks.size() != leaf.fid_storage.block_count() ||
+            leaf_cache.fid_state.size() != leaf.fid_storage.block_count()) {
+            throw std::runtime_error("Async multi-eq query cache must be fully preallocated");
+        }
     }
 
     SearchCallStats local_stats;
@@ -1038,15 +1305,17 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
 
     DistT curdist = index.fstdistfunc_(query_data, index.getDataByInternalId(curr_obj), index.dist_func_param_);
 
-    AsyncMultiEqQueryCache cache;
-    cache.leaves.resize(runtime.leaves.size());
-    for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
-        cache.leaves[leaf_idx].tb_blocks.reserve(runtime.leaves[leaf_idx].tb_storage.block_count());
-    }
+    // Stage 0: warm up per-query TB cache for both leaves.
+    // TB is used as a permissive traversal prefilter before exact result gating.
+    ring->flush();
+    const auto tb_submit_t0 = std::chrono::steady_clock::now();
+    call_stats->tb_jobs_submitted +=
+        submit_tb_prefetch_jobs(ring, runtime, cache, &call_stats->decomp);
+    const auto tb_submit_t1 = std::chrono::steady_clock::now();
+    call_stats->tb_submit_time_ns += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(tb_submit_t1 - tb_submit_t0).count());
 
-    AsyncJobRing ring(128, 64);
-    submit_tb_prefetch_jobs(&ring, runtime, &cache, &call_stats->decomp);
-
+    // Stage 1: upper-layer greedy descent (standard HNSW, no base-layer filtering yet).
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
         while (changed) {
@@ -1070,11 +1339,15 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
             }
         }
     }
-    ring.flush();
-
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
     const hnswlib::vl_type tag = vl->curV;
+
+    struct FrontierCandidate {
+        hnswlib::tableint candidate_id = 0;
+        DistT dist{};
+        bool deleted = false;
+    };
 
     CandidateQueue<DistT> top_candidates;
     CandidateQueue<DistT> candidate_set;
@@ -1085,11 +1358,190 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
 
     visited[curr_obj] = tag;
     DistT lower_bound = std::numeric_limits<DistT>::max();
+    std::vector<hnswlib::tableint> neighbor_ids;
+    neighbor_ids.reserve(index.maxM0_);
+    std::vector<FrontierCandidate> frontier_candidates;
+    frontier_candidates.reserve(index.maxM0_);
+    std::vector<FrontierCandidate> temp_result_buffer;
+    temp_result_buffer.reserve(index.maxM0_ * 2);
+    std::vector<FrontierCandidate> next_temp_result_buffer;
+    next_temp_result_buffer.reserve(index.maxM0_ * 2);
+    std::vector<std::vector<size_t>> blocks_by_leaf(runtime.leaves.size());
+    std::vector<std::vector<uint8_t>> pending_fid_block_marks(runtime.leaves.size());
+    for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
+        pending_fid_block_marks[leaf_idx].assign(cache->leaves[leaf_idx].fid_state.size(), 0);
+    }
 
-    while (!candidate_set.empty()) {
+    auto poll_ready_jobs = [&]() -> uint64_t {
+        if (!ring->has_pending()) {
+            return 0;
+        }
+        ++call_stats->job_poll_calls;
+        const uint64_t completed = static_cast<uint64_t>(ring->poll_ready_jobs());
+        call_stats->job_poll_ready += completed;
+        return completed;
+    };
+
+    auto wait_one_job = [&]() {
+        ++call_stats->job_wait_calls;
+        ring->wait_one();
+    };
+
+    auto wait_for_tb_leaf_block = [&](size_t leaf_idx, size_t node_id) {
+        const MultiEqLeafRuntime& leaf = runtime.leaves[leaf_idx];
+        if (leaf.impossible || leaf.tb_storage.block_size == 0) {
+            return;
+        }
+        LeafQueryCache& leaf_cache = cache->leaves[leaf_idx];
+        if (leaf_cache.tb_state.empty()) {
+            return;
+        }
+
+        const size_t bucket_byte = static_cast<size_t>(leaf.target_bucket) / 8;
+        const size_t byte_offset = node_id * compass_iaa_filter::kTbBytesPerNode + bucket_byte;
+        const size_t block_id = byte_offset / leaf.tb_storage.block_size;
+        if (block_id >= leaf_cache.tb_state.size()) {
+            return;
+        }
+
+        while (leaf_cache.tb_state[block_id] == kBlockInflight) {
+            if (!ring->has_pending()) {
+                throw std::runtime_error(
+                    "TB block is inflight but async ring has no pending jobs");
+            }
+            const auto wait_t0 = std::chrono::steady_clock::now();
+            wait_one_job();
+            const auto wait_t1 = std::chrono::steady_clock::now();
+            call_stats->tb_prefetch_wait_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(wait_t1 - wait_t0).count());
+            call_stats->tb_wait_time_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(wait_t1 - wait_t0).count());
+        }
+    };
+
+    auto traversal_leaf_match_on_demand = [&](size_t leaf_idx, size_t node_id) -> bool {
+        wait_for_tb_leaf_block(leaf_idx, node_id);
+        return traversal_leaf_match(
+            runtime.leaves[leaf_idx],
+            &cache->leaves[leaf_idx],
+            node_id,
+            &call_stats->decomp);
+    };
+
+    auto push_result_candidate_if_allowed = [&](const FrontierCandidate& entry) {
+        if (entry.deleted) {
+            return;
+        }
+        top_candidates.emplace(entry.dist, entry.candidate_id);
+        while (top_candidates.size() > ef) {
+            top_candidates.pop();
+        }
+        if (!top_candidates.empty()) {
+            lower_bound = top_candidates.top().first;
+        }
+    };
+
+    auto evaluate_result_entry = [&](const FrontierCandidate& entry) -> TwoLeafResultDecision {
+        if (entry.deleted) {
+            return TwoLeafResultDecision{true, false};
+        }
+        const auto r0 = std::chrono::steady_clock::now();
+        const TwoLeafResultDecision decision = evaluate_result_two_leaf_nonblocking(
+            static_cast<size_t>(entry.candidate_id),
+            runtime,
+            cache,
+            &call_stats->decomp);
+        const auto r1 = std::chrono::steady_clock::now();
+        ++call_stats->filter_eval_calls;
+        call_stats->filter_eval_time_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(r1 - r0).count());
+        return decision;
+    };
+
+    auto retry_temp_buffer_once = [&]() {
+        if (temp_result_buffer.empty()) {
+            return;
+        }
+        ++call_stats->deferred_retry_rounds;
+        next_temp_result_buffer.clear();
+        for (const FrontierCandidate& entry : temp_result_buffer) {
+            const TwoLeafResultDecision decision = evaluate_result_entry(entry);
+            if (!decision.decided) {
+                next_temp_result_buffer.push_back(entry);
+                continue;
+            }
+            if (!entry.deleted) {
+                ++call_stats->fid_ready_candidates;
+            }
+            if (decision.allowed) {
+                push_result_candidate_if_allowed(entry);
+            }
+        }
+        temp_result_buffer.swap(next_temp_result_buffer);
+    };
+
+    // Stage 2: base-layer best-first expansion with async per-leaf FID scan scheduling.
+    while (true) {
+        // Stage 2a: progress async jobs and retry deferred result checks.
+        const uint64_t ready_jobs = poll_ready_jobs();
+        if (!temp_result_buffer.empty() &&
+            (ready_jobs > 0 || !ring->has_pending())) {
+            retry_temp_buffer_once();
+        }
+
+        if (candidate_set.empty()) {
+            if (temp_result_buffer.empty()) {
+                if (!ring->has_pending()) {
+                    break;
+                }
+                const auto wait_t0 = std::chrono::steady_clock::now();
+                wait_one_job();
+                const auto wait_t1 = std::chrono::steady_clock::now();
+                call_stats->frontier_empty_wait_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(wait_t1 - wait_t0).count());
+                call_stats->fid_wait_time_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(wait_t1 - wait_t0).count());
+                continue;
+            }
+            if (ring->has_pending()) {
+                const auto wait_t0 = std::chrono::steady_clock::now();
+                wait_one_job();
+                const auto wait_t1 = std::chrono::steady_clock::now();
+                call_stats->frontier_empty_wait_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(wait_t1 - wait_t0).count());
+                call_stats->fid_wait_time_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(wait_t1 - wait_t0).count());
+                continue;
+            }
+            retry_temp_buffer_once();
+            if (!temp_result_buffer.empty()) {
+                throw std::runtime_error(
+                    "Deferred multi-exact result entries remain without pending async jobs");
+            }
+            break;
+        }
+
         const Pair<DistT> current = candidate_set.top();
         const DistT candidate_dist = -current.first;
         if (candidate_dist > lower_bound && top_candidates.size() >= ef) {
+            if (temp_result_buffer.empty() && !ring->has_pending()) {
+                break;
+            }
+            if (ring->has_pending()) {
+                const auto wait_t0 = std::chrono::steady_clock::now();
+                wait_one_job();
+                const auto wait_t1 = std::chrono::steady_clock::now();
+                call_stats->early_stop_wait_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(wait_t1 - wait_t0).count());
+                call_stats->fid_wait_time_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(wait_t1 - wait_t0).count());
+                continue;
+            }
+            retry_temp_buffer_once();
+            if (!temp_result_buffer.empty()) {
+                throw std::runtime_error(
+                    "Deferred multi-exact result entries remain after early-stop without pending jobs");
+            }
             break;
         }
         candidate_set.pop();
@@ -1098,10 +1550,16 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
         int* data = reinterpret_cast<int*>(index.get_linklist0(current_node_id));
         const size_t size = index.getListCount(reinterpret_cast<hnswlib::linklistsizeint*>(data));
 
-        std::vector<hnswlib::tableint> neighbor_ids;
-        neighbor_ids.reserve(size);
-        std::vector<std::unordered_set<size_t>> blocks_by_leaf(runtime.leaves.size());
+        neighbor_ids.clear();
+        frontier_candidates.clear();
+        for (std::vector<size_t>& leaf_blocks : blocks_by_leaf) {
+            leaf_blocks.clear();
+        }
+        for (std::vector<uint8_t>& block_marks : pending_fid_block_marks) {
+            std::fill(block_marks.begin(), block_marks.end(), 0);
+        }
 
+        // Stage 2b: gather unvisited neighbors, apply traversal gate, and collect missing FID blocks.
         for (size_t j = 1; j <= size; ++j) {
             const hnswlib::tableint candidate_id = static_cast<hnswlib::tableint>(*(data + j));
             if (candidate_id >= index.cur_element_count) {
@@ -1111,7 +1569,25 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
                 continue;
             }
             visited[candidate_id] = tag;
+
+            const auto t0 = std::chrono::steady_clock::now();
+            const size_t node_id = static_cast<size_t>(candidate_id);
+            const bool traversal_left = traversal_leaf_match_on_demand(0, node_id);
+            const bool traversal_allowed =
+                traversal_left || traversal_leaf_match_on_demand(1, node_id);
+            const auto t1 = std::chrono::steady_clock::now();
+            ++call_stats->filter_eval_calls;
+            call_stats->filter_eval_time_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+            if (!traversal_allowed) {
+                continue;
+            }
+
             neighbor_ids.push_back(candidate_id);
+            FrontierCandidate entry;
+            entry.candidate_id = candidate_id;
+            entry.deleted = index.isMarkedDeleted(candidate_id);
+            frontier_candidates.push_back(entry);
 
             for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
                 const MultiEqLeafRuntime& leaf = runtime.leaves[leaf_idx];
@@ -1119,77 +1595,83 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
                     continue;
                 }
                 const size_t block_id = static_cast<size_t>(candidate_id) / leaf.fid_storage.block_size;
-                if (cache.leaves[leaf_idx].fid_blocks.find(block_id) == cache.leaves[leaf_idx].fid_blocks.end()) {
-                    blocks_by_leaf[leaf_idx].insert(block_id);
+                if (block_id < cache->leaves[leaf_idx].fid_state.size() &&
+                    cache->leaves[leaf_idx].fid_state[block_id] == kBlockNotRequested &&
+                    block_id < pending_fid_block_marks[leaf_idx].size() &&
+                    pending_fid_block_marks[leaf_idx][block_id] == 0) {
+                    pending_fid_block_marks[leaf_idx][block_id] = 1;
+                    blocks_by_leaf[leaf_idx].push_back(block_id);
                 }
             }
         }
 
-        submit_fid_scan_jobs(&ring, runtime, blocks_by_leaf, &cache, &call_stats->decomp);
+        // Stage 3: submit async FID scans for this expansion (non-blocking).
+        const auto fid_submit_t0 = std::chrono::steady_clock::now();
+        call_stats->fid_jobs_submitted +=
+            submit_fid_scan_jobs(ring, runtime, blocks_by_leaf, cache, &call_stats->decomp);
+        const auto fid_submit_t1 = std::chrono::steady_clock::now();
+        call_stats->fid_submit_time_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(fid_submit_t1 - fid_submit_t0).count());
 
-        std::vector<DistT> dists(neighbor_ids.size(), DistT());
-        for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
-            dists[idx] = index.fstdistfunc_(
+        // Stage 4: compute distances for traversal-passed neighbors.
+        for (FrontierCandidate& entry : frontier_candidates) {
+            entry.dist = index.fstdistfunc_(
                 query_data,
-                index.getDataByInternalId(neighbor_ids[idx]),
+                index.getDataByInternalId(entry.candidate_id),
                 index.dist_func_param_);
         }
 
-        ring.flush();
-
-        for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
-            const hnswlib::tableint candidate_id = neighbor_ids[idx];
-            const DistT dist = dists[idx];
-
-            const auto t0 = std::chrono::steady_clock::now();
-            const bool traversal_allowed = evaluate_multi_eq_node(
-                runtime.root.get(),
-                true,
-                static_cast<size_t>(candidate_id),
-                runtime,
-                &cache,
-                &call_stats->decomp);
-            const auto t1 = std::chrono::steady_clock::now();
-            ++call_stats->filter_eval_calls;
-            call_stats->filter_eval_time_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
-
-            if (!traversal_allowed) {
+        // Stage 5: update frontier immediately, defer result checks until FID becomes ready.
+        for (const FrontierCandidate& entry : frontier_candidates) {
+            const bool consider = (top_candidates.size() < ef || lower_bound > entry.dist);
+            if (!consider) {
                 continue;
             }
 
-            if (top_candidates.size() < ef || lower_bound > dist) {
-                candidate_set.emplace(-dist, candidate_id);
-
-                bool result_allowed = false;
-                if (!index.isMarkedDeleted(candidate_id)) {
-                    const auto r0 = std::chrono::steady_clock::now();
-                    result_allowed = evaluate_multi_eq_node(
-                        runtime.root.get(),
-                        false,
-                        static_cast<size_t>(candidate_id),
-                        runtime,
-                        &cache,
-                        &call_stats->decomp);
-                    const auto r1 = std::chrono::steady_clock::now();
-                    ++call_stats->filter_eval_calls;
-                    call_stats->filter_eval_time_ns += static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(r1 - r0).count());
-                }
-                if (!index.isMarkedDeleted(candidate_id) && result_allowed) {
-                    top_candidates.emplace(dist, candidate_id);
-                }
-
-                while (top_candidates.size() > ef) {
-                    top_candidates.pop();
-                }
-                if (!top_candidates.empty()) {
-                    lower_bound = top_candidates.top().first;
-                }
+            candidate_set.emplace(-entry.dist, entry.candidate_id);
+            const TwoLeafResultDecision decision = evaluate_result_entry(entry);
+            if (!decision.decided) {
+                temp_result_buffer.push_back(entry);
+                call_stats->deferred_max_pending =
+                    std::max<uint64_t>(
+                        call_stats->deferred_max_pending,
+                        static_cast<uint64_t>(temp_result_buffer.size()));
+                continue;
             }
+            if (!entry.deleted) {
+                ++call_stats->fid_ready_candidates;
+            }
+            if (decision.allowed) {
+                push_result_candidate_if_allowed(entry);
+            }
+        }
+
+        // Stage 6: non-blocking completion check and deferred-result retry.
+        const uint64_t ready_jobs_after = poll_ready_jobs();
+        if (!temp_result_buffer.empty() &&
+            (ready_jobs_after > 0 || !ring->has_pending())) {
+            retry_temp_buffer_once();
         }
     }
 
+    // Drain any tail async completions needed for deferred entries.
+    while (!temp_result_buffer.empty() && ring->has_pending()) {
+        const auto wait_t0 = std::chrono::steady_clock::now();
+        wait_one_job();
+        const auto wait_t1 = std::chrono::steady_clock::now();
+        call_stats->deferred_drain_wait_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(wait_t1 - wait_t0).count());
+        call_stats->fid_wait_time_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(wait_t1 - wait_t0).count());
+        retry_temp_buffer_once();
+    }
+    retry_temp_buffer_once();
+    if (!temp_result_buffer.empty()) {
+        throw std::runtime_error(
+            "Deferred multi-exact result entries remain after async drain");
+    }
+
+    // Stage 6: trim to top-k and emit results in ascending distance order.
     while (top_candidates.size() > k) {
         top_candidates.pop();
     }
@@ -1227,6 +1709,25 @@ std::priority_queue<std::pair<DistT, hnswlib::labeltype>> build_enns_heap(
     return heap;
 }
 
+bool metadata_matches_filter(
+    hnswlib::labeltype label,
+    const MetadataTable& metadata,
+    const filter_expr::Expression& expr) {
+    auto row_it = metadata.rows.find(static_cast<size_t>(label));
+    if (row_it == metadata.rows.end()) {
+        return false;
+    }
+    const auto& row = row_it->second;
+    auto accessor = [&](const std::string& field) -> std::optional<std::string_view> {
+        auto it = row.find(field);
+        if (it == row.end()) {
+            return std::nullopt;
+        }
+        return std::string_view(it->second);
+    };
+    return expr.evaluate(accessor);
+}
+
 template <typename DistT, typename SpaceT, typename QueryT>
 RunStats run_search_typed(
     const Args& args,
@@ -1234,6 +1735,7 @@ RunStats run_search_typed(
     const DenseVectors<QueryT>& queries,
     const compass_iaa_filter::CompassIaaFilterEngine& engine,
     const MetadataTable& metadata,
+    const filter_expr::Expression& expr,
     const AsyncMultiEqRuntime* async_runtime) {
     SpaceT space(static_cast<size_t>(dim));
     hnswlib::HierarchicalNSW<DistT> index(&space, args.graph_path);
@@ -1254,12 +1756,14 @@ RunStats run_search_typed(
     stats.execution_mode = "async_multi_eq";
     const size_t total_elements = index.getCurrentElementCount();
 
-    std::vector<size_t> result_nodes = engine.collect_result_candidates();
     std::vector<FilteredCandidate> filtered_candidates;
-    filtered_candidates.reserve(result_nodes.size());
-    for (size_t node_id : result_nodes) {
-        const hnswlib::tableint iid = static_cast<hnswlib::tableint>(node_id);
-        filtered_candidates.push_back(FilteredCandidate{iid, index.getExternalLabel(iid)});
+    filtered_candidates.reserve(total_elements);
+    for (size_t internal = 0; internal < total_elements; ++internal) {
+        const hnswlib::tableint iid = static_cast<hnswlib::tableint>(internal);
+        const hnswlib::labeltype label = index.getExternalLabel(iid);
+        if (metadata_matches_filter(label, metadata, expr)) {
+            filtered_candidates.push_back(FilteredCandidate{iid, label});
+        }
     }
 
     stats.total_elements = total_elements;
@@ -1311,13 +1815,16 @@ RunStats run_search_typed(
         stats.per_query_metrics.reserve(query_count);
     }
 
+    AsyncMultiEqQueryCache query_cache = make_preallocated_query_cache(*async_runtime);
+    AsyncJobRing async_ring(128, 64, max_ring_output_capacity(*async_runtime));
+
     size_t returned_results = 0;
-    const auto loop_start = std::chrono::steady_clock::now();
 
     for (size_t qid = 0; qid < query_count; ++qid) {
         const QueryT* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
 
         SearchCallStats call_stats;
+        reset_preallocated_query_cache(&query_cache);
 
         const auto search_start = std::chrono::steady_clock::now();
         std::vector<std::pair<DistT, hnswlib::labeltype>> result =
@@ -1327,6 +1834,8 @@ RunStats run_search_typed(
                 static_cast<size_t>(args.k),
                 static_cast<size_t>(args.ef),
                 *async_runtime,
+                &query_cache,
+                &async_ring,
                 &call_stats);
         const auto search_end = std::chrono::steady_clock::now();
 
@@ -1374,6 +1883,7 @@ RunStats run_search_typed(
         stats.filter_eval_time_ns += call_stats.filter_eval_time_ns;
         stats.filter_time_total_ns += call_stats.filter_eval_time_ns;
         stats.search_time_total_ns += query_search_ns;
+        stats.search_loop_time_ns += query_search_ns;
 
         stats.iaa_decompress_time_ns += call_stats.decomp.iaa_decompress_time_ns;
         stats.fid_blocks_decompressed += call_stats.decomp.fid_blocks_decompressed;
@@ -1382,6 +1892,23 @@ RunStats run_search_typed(
         stats.tb_cache_hits += call_stats.decomp.tb_cache_hits;
         stats.fid_bytes_decompressed += call_stats.decomp.fid_bytes_decompressed;
         stats.tb_bytes_decompressed += call_stats.decomp.tb_bytes_decompressed;
+        stats.fid_ready_candidates += call_stats.fid_ready_candidates;
+        stats.deferred_retry_rounds += call_stats.deferred_retry_rounds;
+        stats.fid_jobs_submitted += call_stats.fid_jobs_submitted;
+        stats.tb_jobs_submitted += call_stats.tb_jobs_submitted;
+        stats.job_poll_calls += call_stats.job_poll_calls;
+        stats.job_poll_ready += call_stats.job_poll_ready;
+        stats.job_wait_calls += call_stats.job_wait_calls;
+        stats.deferred_max_pending =
+            std::max(stats.deferred_max_pending, call_stats.deferred_max_pending);
+        stats.tb_prefetch_wait_ns += call_stats.tb_prefetch_wait_ns;
+        stats.frontier_empty_wait_ns += call_stats.frontier_empty_wait_ns;
+        stats.early_stop_wait_ns += call_stats.early_stop_wait_ns;
+        stats.deferred_drain_wait_ns += call_stats.deferred_drain_wait_ns;
+        stats.tb_submit_time_ns += call_stats.tb_submit_time_ns;
+        stats.tb_wait_time_ns += call_stats.tb_wait_time_ns;
+        stats.fid_submit_time_ns += call_stats.fid_submit_time_ns;
+        stats.fid_wait_time_ns += call_stats.fid_wait_time_ns;
 
         returned_results += result.size();
 
@@ -1429,16 +1956,10 @@ RunStats run_search_typed(
         }
     }
 
-    const auto loop_end = std::chrono::steady_clock::now();
-
     stats.query_count = query_count;
-    stats.search_loop_time_ns = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(loop_end - loop_start).count());
     stats.returned_results = returned_results;
     stats.average_recall_at_k =
         (query_count > 0) ? (stats.recall_sum / static_cast<double>(query_count)) : 0.0;
-
-    (void)metadata;
     return stats;
 }
 
@@ -1499,6 +2020,20 @@ std::string build_summary(
     oss << "execution_mode: " << stats.execution_mode << "\n";
     oss << "multi_exact_fields: " << runtime.left_field << "," << runtime.right_field << "\n";
     oss << "multi_exact_operator: " << logical_op_name(runtime.logical_op) << "\n";
+    if (runtime.leaves.size() >= 2) {
+        const std::string left_bucket =
+            runtime.leaves[0].impossible
+                ? std::string("NA")
+                : std::to_string(static_cast<int>(runtime.leaves[0].target_bucket));
+        const std::string right_bucket =
+            runtime.leaves[1].impossible
+                ? std::string("NA")
+                : std::to_string(static_cast<int>(runtime.leaves[1].target_bucket));
+        oss << "multi_exact_bucket_ids: " << left_bucket << "," << right_bucket << "\n";
+        oss << "multi_exact_field_buckets: "
+            << runtime.left_field << ":" << left_bucket << ","
+            << runtime.right_field << ":" << right_bucket << "\n";
+    }
     oss << "traversal_rule: leaf_or\n";
     oss << "result_rule: predicate_op\n";
 
@@ -1536,6 +2071,30 @@ std::string build_summary(
     oss << "tb_cache_hits: " << stats.tb_cache_hits << "\n";
     oss << "fid_bytes_decompressed: " << stats.fid_bytes_decompressed << "\n";
     oss << "tb_bytes_decompressed: " << stats.tb_bytes_decompressed << "\n";
+    oss << "async_tb_jobs_submitted: " << stats.tb_jobs_submitted << "\n";
+    oss << "async_fid_jobs_submitted: " << stats.fid_jobs_submitted << "\n";
+    oss << "async_job_poll_calls: " << stats.job_poll_calls << "\n";
+    oss << "async_job_poll_ready: " << stats.job_poll_ready << "\n";
+    oss << "async_job_wait_calls: " << stats.job_wait_calls << "\n";
+    oss << "async_fid_ready_candidates: " << stats.fid_ready_candidates << "\n";
+    oss << "async_deferred_retry_rounds: " << stats.deferred_retry_rounds << "\n";
+    oss << "async_deferred_max_pending: " << stats.deferred_max_pending << "\n";
+    oss << "async_wait_tb_prefetch_ms: "
+        << (static_cast<double>(stats.tb_prefetch_wait_ns) / 1e6) << "\n";
+    oss << "async_wait_frontier_empty_ms: "
+        << (static_cast<double>(stats.frontier_empty_wait_ns) / 1e6) << "\n";
+    oss << "async_wait_early_stop_ms: "
+        << (static_cast<double>(stats.early_stop_wait_ns) / 1e6) << "\n";
+    oss << "async_wait_deferred_drain_ms: "
+        << (static_cast<double>(stats.deferred_drain_wait_ns) / 1e6) << "\n";
+    oss << "async_time_tb_submit_ms: "
+        << (static_cast<double>(stats.tb_submit_time_ns) / 1e6) << "\n";
+    oss << "async_time_tb_wait_ms: "
+        << (static_cast<double>(stats.tb_wait_time_ns) / 1e6) << "\n";
+    oss << "async_time_fid_submit_ms: "
+        << (static_cast<double>(stats.fid_submit_time_ns) / 1e6) << "\n";
+    oss << "async_time_fid_wait_ms: "
+        << (static_cast<double>(stats.fid_wait_time_ns) / 1e6) << "\n";
 
     if (stats.queries_with_enns_lt_k > 0) {
         oss << "warning: filtering condition is too restrictive for k on "
@@ -1559,14 +2118,18 @@ void write_summary_if_needed(const std::string& summary_text, const std::string&
     ofs << summary_text;
 }
 
-MetadataTable build_manifest_backed_metadata(const compass_iaa_filter::ManifestData& manifest) {
-    MetadataTable table;
-    table.total_labels = manifest.n_elements;
-    table.populated_rows = manifest.n_elements;
-    table.missing_rows = 0;
-    table.invalid_rows = 0;
-    table.dropped_rows = 0;
-    return table;
+MetadataTable load_ground_truth_metadata(
+    const Args& args,
+    const std::unordered_set<std::string>& fields,
+    size_t num_labels) {
+    const bool is_sift_family =
+        (args.dataset_type == "sift" || args.dataset_type == "sift1m" || args.dataset_type == "sift1b");
+    if (is_sift_family) {
+        return filter_search_io::load_csv_metadata(
+            args.metadata_csv, fields, args.id_column, num_labels);
+    }
+    return filter_search_io::load_jsonl_metadata(
+        args.payload_jsonl, fields, num_labels);
 }
 
 }  // namespace
@@ -1615,7 +2178,20 @@ int main(int argc, char** argv) {
             throw std::runtime_error(oss.str());
         }
 
-        MetadataTable metadata = build_manifest_backed_metadata(engine.manifest());
+        MetadataTable metadata = load_ground_truth_metadata(
+            args, fields, index_info.cur_element_count);
+        if (metadata.missing_rows > 0) {
+            std::cerr << "Warning: " << metadata.missing_rows
+                      << " labels do not have metadata for referenced fields\n";
+        }
+        if (metadata.invalid_rows > 0) {
+            std::cerr << "Warning: " << metadata.invalid_rows
+                      << " metadata rows were invalid\n";
+        }
+        if (metadata.dropped_rows > 0) {
+            std::cerr << "Warning: " << metadata.dropped_rows
+                      << " metadata rows were dropped\n";
+        }
 
         RunStats stats;
         if (query_is_fvecs) {
@@ -1626,6 +2202,7 @@ int main(int argc, char** argv) {
                 queries,
                 engine,
                 metadata,
+                expr,
                 &async_runtime);
         } else {
             DenseVectors<uint8_t> queries = filter_search_io::read_bvecs(args.query_path);
@@ -1635,6 +2212,7 @@ int main(int argc, char** argv) {
                 queries,
                 engine,
                 metadata,
+                expr,
                 &async_runtime);
         }
 

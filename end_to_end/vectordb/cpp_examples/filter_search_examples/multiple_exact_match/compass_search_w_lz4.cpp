@@ -51,7 +51,7 @@ struct Args {
     size_t fid_block_size_bytes = kDefaultLz4FidBlockSizeBytes;
     size_t tb_block_size_bytes = kDefaultLz4TbBlockSizeBytes;
 
-    // Backward-compatible optional flags. Not used in the LZ4 FID/TB path.
+    // Metadata source for ENNS ground-truth filtering.
     std::string payload_jsonl;
     std::string metadata_csv;
     std::string id_column = "id";
@@ -102,6 +102,7 @@ struct RunStats {
     uint64_t tb_bytes_decompressed = 0;
     uint64_t fid_tb_mismatch_count = 0;
     uint64_t fid_tb_mismatch_log_capped = 0;
+    uint64_t lz4_tb_decompress_time_ns = 0;
 
     size_t returned_results = 0;
     size_t selectivity_count = 0;
@@ -123,6 +124,7 @@ struct SearchCallStats {
     compass_lz4_filter::QueryDecompressionMetrics decomp;
     uint64_t fid_tb_mismatch_count = 0;
     uint64_t fid_tb_mismatch_log_capped = 0;
+    uint64_t lz4_tb_decompress_time_ns = 0;
 };
 
 void usage(const char* argv0) {
@@ -239,6 +241,14 @@ Args parse_args(int argc, char** argv) {
     const bool query_bvec = filter_search_io::ends_with(args.query_path, ".bvecs");
     if (!query_fvec && !query_bvec) {
         throw std::runtime_error("--query must end with .fvecs or .bvecs");
+    }
+
+    const bool is_sift_family =
+        (args.dataset_type == "sift" || args.dataset_type == "sift1m" || args.dataset_type == "sift1b");
+    if (is_sift_family) {
+        ensure_readable_file(args.metadata_csv, "--metadata-csv");
+    } else {
+        ensure_readable_file(args.payload_jsonl, "--payload-jsonl");
     }
 
     if (args.ef_explicit && args.ef <= 0) {
@@ -810,22 +820,12 @@ SequentialEqRuntime build_sequential_eq_runtime(
                 "TB element count mismatch while building sequential runtime for field '" + attr.key + "'");
         }
 
-        std::vector<uint8_t> tb_bucket_bits((manifest.n_elements + 7) / 8, 0);
-        const size_t bucket_byte = static_cast<size_t>(target_bucket) / 8;
-        const uint8_t bucket_mask = static_cast<uint8_t>(1u << (target_bucket % 8));
-        for (size_t node_id = 0; node_id < manifest.n_elements; ++node_id) {
-            const size_t offset = node_id * compass_lz4_filter::kTbBytesPerNode + bucket_byte;
-            if ((tb_raw[offset] & bucket_mask) != 0) {
-                tb_bucket_bits[node_id / 8] |= static_cast<uint8_t>(1u << (node_id % 8));
-            }
-        }
-
         leaf.target_bucket = target_bucket;
         leaf.fid_storage = compass_lz4_filter::detail::compress_to_lz4_blocks(
             fid_raw,
             args.fid_block_size_bytes);
         leaf.tb_storage = compass_lz4_filter::detail::compress_to_lz4_blocks(
-            tb_bucket_bits,
+            tb_raw,
             args.tb_block_size_bytes);
         leaf.active = true;
         leaf.always_false = false;
@@ -893,17 +893,21 @@ void decompress_lz4_block_into(
         return;
     }
 
+    const auto t0 = std::chrono::steady_clock::now();
     const int ret = LZ4_decompress_safe(
         storage.compressed_blocks[block_id].data(),
         reinterpret_cast<char*>(output->data()),
         static_cast<int>(storage.compressed_blocks[block_id].size()),
         static_cast<int>(raw_len));
+    const auto t1 = std::chrono::steady_clock::now();
 
     if (ret != static_cast<int>(raw_len)) {
         throw std::runtime_error("LZ4 decompression failed at block " + std::to_string(block_id));
     }
 
     if (metrics != nullptr) {
+        metrics->lz4_decompress_time_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
         if (is_fid) {
             ++metrics->fid_blocks_decompressed;
             metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
@@ -980,7 +984,10 @@ bool tb_match_node(
         return false;
     }
 
-    const size_t byte_offset = node_id / 8;
+    const size_t bucket_byte = static_cast<size_t>(leaf.target_bucket) / 8;
+    const uint8_t bucket_mask = static_cast<uint8_t>(1u << (leaf.target_bucket % 8));
+    const size_t byte_offset =
+        node_id * compass_lz4_filter::kTbBytesPerNode + bucket_byte;
     const size_t block_id = byte_offset / leaf.tb_storage.block_size;
     const size_t in_block = byte_offset % leaf.tb_storage.block_size;
     if (block_id >= cache->tb_blocks.size() || block_id >= cache->tb_ready.size() || cache->tb_ready[block_id] == 0) {
@@ -994,7 +1001,7 @@ bool tb_match_node(
         ++metrics->tb_cache_hits;
     }
     const uint8_t byte = cache->tb_blocks[block_id][in_block];
-    return ((byte >> (node_id % 8)) & 1u) != 0;
+    return (byte & bucket_mask) != 0;
 }
 
 bool fid_match_node(
@@ -1241,7 +1248,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
 
     // Decompress TB blocks after upper-layer traversal, before level-0 expansion.
     for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
+        const auto tb_t0 = std::chrono::steady_clock::now();
         prefetch_tb_blocks(runtime.leaves[leaf_idx], &cache->leaves[leaf_idx], &call_stats->decomp);
+        const auto tb_t1 = std::chrono::steady_clock::now();
+        call_stats->lz4_tb_decompress_time_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(tb_t1 - tb_t0).count());
     }
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
@@ -1292,17 +1303,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             if (!leaf.active || leaf.always_false) {
                 return false;
             }
-
-            const bool tb_match = tb_match_node(leaf, &leaf_cache, node_id, &call_stats->decomp);
-            if (tb_match) {
-                return true;
-            }
-
-            if (leaf.fid_storage.block_size != 0) {
-                const size_t fid_block_id = node_id / leaf.fid_storage.block_size;
-                prefetch_fid_block(leaf, fid_block_id, &leaf_cache, &call_stats->decomp);
-            }
-            return fid_match_node(leaf, &leaf_cache, node_id, &call_stats->decomp);
+            // TB-only traversal gate for frontier expansion.
+            return tb_match_node(leaf, &leaf_cache, node_id, &call_stats->decomp);
         };
 
         auto result_leaf_match = [&](size_t leaf_idx, size_t node_id) -> bool {
@@ -1322,8 +1324,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
             const size_t node_id = static_cast<size_t>(candidate_id);
             const bool traversal_left = traversal_leaf_match(0, node_id);
-            const bool traversal_right = traversal_leaf_match(1, node_id);
-            const bool traversal_allowed = traversal_left || traversal_right;
+            const bool traversal_allowed = traversal_left || traversal_leaf_match(1, node_id);
             ++call_stats->filter_eval_calls;
             if (!traversal_allowed) {
                 continue;
@@ -1334,12 +1335,14 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 index.getDataByInternalId(candidate_id),
                 index.dist_func_param_);
 
-            const bool result_left = result_leaf_match(0, node_id);
-            const bool result_right = result_leaf_match(1, node_id);
-            const bool result_allowed_by_predicate =
-                (runtime.logical_op == filter_expr::LogicalOp::And)
-                    ? (result_left && result_right)
-                    : (result_left || result_right);
+            bool result_allowed_by_predicate = false;
+            if (runtime.logical_op == filter_expr::LogicalOp::And) {
+                const bool result_left = result_leaf_match(0, node_id);
+                result_allowed_by_predicate = result_left && result_leaf_match(1, node_id);
+            } else {
+                const bool result_left = result_leaf_match(0, node_id);
+                result_allowed_by_predicate = result_left || result_leaf_match(1, node_id);
+            }
             ++call_stats->filter_eval_calls;
 
             if (top_candidates.size() < ef || lower_bound > dist) {
@@ -1397,6 +1400,25 @@ std::priority_queue<std::pair<DistT, hnswlib::labeltype>> build_enns_heap(
     return heap;
 }
 
+bool metadata_matches_filter(
+    hnswlib::labeltype label,
+    const MetadataTable& metadata,
+    const filter_expr::Expression& expr) {
+    auto row_it = metadata.rows.find(static_cast<size_t>(label));
+    if (row_it == metadata.rows.end()) {
+        return false;
+    }
+    const auto& row = row_it->second;
+    auto accessor = [&](const std::string& field) -> std::optional<std::string_view> {
+        auto it = row.find(field);
+        if (it == row.end()) {
+            return std::nullopt;
+        }
+        return std::string_view(it->second);
+    };
+    return expr.evaluate(accessor);
+}
+
 template <typename DistT, typename SpaceT, typename QueryT>
 RunStats run_search_typed(
     const Args& args,
@@ -1405,6 +1427,7 @@ RunStats run_search_typed(
     const compass_lz4_filter::CompassLz4FilterEngine& traversal_engine,
     const compass_lz4_filter::CompassLz4FilterEngine& result_engine,
     const MetadataTable& metadata,
+    const filter_expr::Expression& expr,
     const SequentialEqRuntime* sequential_runtime) {
     const size_t resolved_ef = resolve_ef(args);
     const double effective_break_factor = resolve_effective_break_factor(args, resolved_ef);
@@ -1432,12 +1455,14 @@ RunStats run_search_typed(
     stats.effective_break_factor = effective_break_factor;
     const size_t total_elements = index.getCurrentElementCount();
 
-    std::vector<size_t> result_nodes = result_engine.collect_result_candidates();
     std::vector<FilteredCandidate> filtered_candidates;
-    filtered_candidates.reserve(result_nodes.size());
-    for (size_t node_id : result_nodes) {
-        const hnswlib::tableint iid = static_cast<hnswlib::tableint>(node_id);
-        filtered_candidates.push_back(FilteredCandidate{iid, index.getExternalLabel(iid)});
+    filtered_candidates.reserve(total_elements);
+    for (size_t internal = 0; internal < total_elements; ++internal) {
+        const hnswlib::tableint iid = static_cast<hnswlib::tableint>(internal);
+        const hnswlib::labeltype label = index.getExternalLabel(iid);
+        if (metadata_matches_filter(label, metadata, expr)) {
+            filtered_candidates.push_back(FilteredCandidate{iid, label});
+        }
     }
 
     stats.total_elements = total_elements;
@@ -1582,6 +1607,7 @@ RunStats run_search_typed(
         stats.tb_bytes_decompressed += call_stats.decomp.tb_bytes_decompressed;
         stats.fid_tb_mismatch_count += call_stats.fid_tb_mismatch_count;
         stats.fid_tb_mismatch_log_capped += call_stats.fid_tb_mismatch_log_capped;
+        stats.lz4_tb_decompress_time_ns += call_stats.lz4_tb_decompress_time_ns;
         stats.search_loop_time_ns += query_search_ns;
 
         returned_results += result.size();
@@ -1637,8 +1663,6 @@ RunStats run_search_typed(
     stats.returned_results = returned_results;
     stats.average_recall_at_k =
         (query_count > 0) ? (stats.recall_sum / static_cast<double>(query_count)) : 0.0;
-
-    (void)metadata;
     return stats;
 }
 
@@ -1651,6 +1675,7 @@ std::string build_summary(
     const MetadataTable& metadata,
     const filter_expr::Expression& expr,
     const RunStats& stats,
+    const SequentialEqRuntime& runtime,
     const CompressionStats& compression_stats,
     const TwoLeafExactSpec& spec) {
     const double loop_ms = static_cast<double>(stats.search_loop_time_ns) / 1e6;
@@ -1671,6 +1696,7 @@ std::string build_summary(
             : 0.0;
 
     const double decomp_ms = static_cast<double>(stats.lz4_decompress_time_ns) / 1e6;
+    const double tb_decomp_ms = static_cast<double>(stats.lz4_tb_decompress_time_ns) / 1e6;
     const double avg_decomp_per_query_ms =
         (stats.query_count > 0)
             ? (decomp_ms / static_cast<double>(stats.query_count))
@@ -1722,6 +1748,12 @@ std::string build_summary(
     oss << "filter: " << expr.source() << "\n";
     oss << "multi_exact_fields: " << spec.left.field << "," << spec.right.field << "\n";
     oss << "multi_exact_operator: " << logical_op_name(spec.logical_op) << "\n";
+    oss << "multi_exact_bucket_ids: "
+        << runtime.leaves[0].target_bucket << ","
+        << runtime.leaves[1].target_bucket << "\n";
+    oss << "multi_exact_field_buckets: "
+        << runtime.left_field << ":" << runtime.leaves[0].target_bucket << ","
+        << runtime.right_field << ":" << runtime.leaves[1].target_bucket << "\n";
     oss << "traversal_rule: leaf_or\n";
     oss << "result_rule: predicate_op\n";
 
@@ -1750,6 +1782,7 @@ std::string build_summary(
     oss << "avg_search_time_per_query_ms: " << avg_search_per_query_ms << "\n";
 
     oss << "lz4_decompress_time_ms: " << decomp_ms << "\n";
+    oss << "lz4_tb_decompress_time_ms: " << tb_decomp_ms << "\n";
     oss << "avg_decompress_time_per_query_ms: " << avg_decomp_per_query_ms << "\n";
     oss << "fid_blocks_decompressed: " << stats.fid_blocks_decompressed << "\n";
     oss << "tb_blocks_decompressed: " << stats.tb_blocks_decompressed << "\n";
@@ -1785,14 +1818,18 @@ void write_summary_if_needed(const std::string& summary_text, const std::string&
     ofs << summary_text;
 }
 
-MetadataTable build_manifest_backed_metadata(const compass_lz4_filter::ManifestData& manifest) {
-    MetadataTable table;
-    table.total_labels = manifest.n_elements;
-    table.populated_rows = manifest.n_elements;
-    table.missing_rows = 0;
-    table.invalid_rows = 0;
-    table.dropped_rows = 0;
-    return table;
+MetadataTable load_ground_truth_metadata(
+    const Args& args,
+    const std::unordered_set<std::string>& fields,
+    size_t num_labels) {
+    const bool is_sift_family =
+        (args.dataset_type == "sift" || args.dataset_type == "sift1m" || args.dataset_type == "sift1b");
+    if (is_sift_family) {
+        return filter_search_io::load_csv_metadata(
+            args.metadata_csv, fields, args.id_column, num_labels);
+    }
+    return filter_search_io::load_jsonl_metadata(
+        args.payload_jsonl, fields, num_labels);
 }
 
 }  // namespace
@@ -1852,7 +1889,20 @@ int main(int argc, char** argv) {
             throw std::runtime_error(oss.str());
         }
 
-        MetadataTable metadata = build_manifest_backed_metadata(result_engine.manifest());
+        MetadataTable metadata = load_ground_truth_metadata(
+            args, fields, index_info.cur_element_count);
+        if (metadata.missing_rows > 0) {
+            std::cerr << "Warning: " << metadata.missing_rows
+                      << " labels do not have metadata for referenced fields\n";
+        }
+        if (metadata.invalid_rows > 0) {
+            std::cerr << "Warning: " << metadata.invalid_rows
+                      << " metadata rows were invalid\n";
+        }
+        if (metadata.dropped_rows > 0) {
+            std::cerr << "Warning: " << metadata.dropped_rows
+                      << " metadata rows were dropped\n";
+        }
 
         RunStats stats;
         if (query_is_fvecs) {
@@ -1864,6 +1914,7 @@ int main(int argc, char** argv) {
                 traversal_engine,
                 result_engine,
                 metadata,
+                expr,
                 sequential_runtime.enabled ? &sequential_runtime : nullptr);
         } else {
             DenseVectors<uint8_t> queries = filter_search_io::read_bvecs(args.query_path);
@@ -1874,6 +1925,7 @@ int main(int argc, char** argv) {
                 traversal_engine,
                 result_engine,
                 metadata,
+                expr,
                 sequential_runtime.enabled ? &sequential_runtime : nullptr);
         }
 
@@ -1886,6 +1938,7 @@ int main(int argc, char** argv) {
             metadata,
             expr,
             stats,
+            sequential_runtime,
             compression_stats,
             multi_exact);
         std::cout << summary;

@@ -207,19 +207,32 @@ parse_ef_list_into_array() {
   printf -v "$out_var_name" '%s ' "${parsed_values[@]}"
 }
 
+# Methods to run.
+# Comment out entries here for quick manual method selection.
+METHODS=(
+  "post_filter_hnsw"
+  "in_search_filter_hnsw"
+  "acorn"
+  "compass_lz4"
+  "compass_iaa_1"
+  "compass_iaa_2"
+  "compass_iaa_4"
+  "compass_iaa_8"
+)
+
 DATASET="hnm"
 K=10
 EF_LIST="64,96,128,160,200"
-EF_LIST_1PCT=""
-EF_LIST_10PCT=""
+EF_LIST_1PCT="32, 48, 64, 96"
+EF_LIST_10PCT="32, 48, 64, 96, 128, 160, 200"
 NUM_QUERIES=20
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 POSTFILTER_MAX_CANDIDATES=3000
 DO_BUILD=1
 DO_PLOT=1
 
-FILTER_EXPR_AND=""
-FILTER_EXPR_OR=""
+FILTER_EXPR_AND="department_name == 'Baby Toys/Acc' AND garment_group_name == 'Accessories'"
+FILTER_EXPR_OR="department_name == 'Blouse' OR garment_group_name == 'Jersey Basic'"
 
 GRAPH_PATH=""
 QUERY_PATH=""
@@ -230,8 +243,8 @@ ACORN_INDEX=""
 ACORN_INDEX_1PCT=""
 ACORN_INDEX_10PCT=""
 PAYLOAD_JSONL=""
-FID_BLOCK_SIZE_BYTES="$((1024 * 64))"
-TB_BLOCK_SIZE_BYTES="$((1024 * 1024))"
+FID_BLOCK_SIZE_BYTES="$((1024 * 8))"
+TB_BLOCK_SIZE_BYTES="$((1024 * 128))"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -403,11 +416,11 @@ fi
 
 : "${GRAPH_PATH:=/storage/jykang5/compass_graphs/hnm_m128_efc200.bin}"
 : "${QUERY_PATH:=/storage/jykang5/compass_base_query/hnm_query.fvecs}"
-: "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/hnm/manifest.json}"
-: "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/hnm/manifest.json}"
-: "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m64_nf100.index}"
-: "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m64_nf10.index}"
-: "${PAYLOAD_JSONL:=/fast-lab-share/benchmarks/VectorDB/FILTER/HnM/payloads.jsonl}"
+: "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/hnm/manifest.json}"
+: "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/hnm/manifest.json}"
+: "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m64_nf256.index}"
+: "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m64_nf256.index}"
+: "${PAYLOAD_JSONL:=/storage/jykang5/payloads/hnm_payloads.jsonl}"
 
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
 LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4.run"
@@ -473,6 +486,22 @@ run_single() {
 
   local -a cmd
   case "$method" in
+    post_filter_hnsw)
+      cmd=(
+        "$HNSW_RUN"
+        --dataset-type hnm
+        --graph "$GRAPH_PATH"
+        --query "$QUERY_PATH"
+        --k "$K"
+        --ef "$ef"
+        --filter "$filter_expr"
+        --search-mode post_filter
+        --postfilter-max-candidates "$POSTFILTER_MAX_CANDIDATES"
+        --payload-jsonl "$PAYLOAD_JSONL"
+        --num-queries "$NUM_QUERIES"
+        --summary-out "$summary_path"
+      )
+      ;;
     in_search_filter_hnsw)
       cmd=(
         "$HNSW_RUN"
@@ -499,13 +528,14 @@ run_single() {
         --ef "$ef"
         --filter "$filter_expr"
         --fidtb-manifest "$manifest_path"
+        --payload-jsonl "$PAYLOAD_JSONL"
         --fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES"
         --tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES"
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
       )
       ;;
-    compass_iaa)
+    compass_iaa|compass_iaa_1|compass_iaa_2|compass_iaa_4|compass_iaa_8)
       cmd=(
         "$IAA_RUN"
         --dataset-type hnm
@@ -515,6 +545,7 @@ run_single() {
         --ef "$ef"
         --filter "$filter_expr"
         --fidtb-manifest "$manifest_path"
+        --payload-jsonl "$PAYLOAD_JSONL"
         --fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES"
         --tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES"
         --num-queries "$NUM_QUERIES"
@@ -550,7 +581,7 @@ run_single() {
   local tb_comp_ratio=""
   local total_comp_ratio=""
   local postfilter_value_out=""
-  if [[ "$method" == "in_search_filter_hnsw" ]]; then
+  if [[ "$method" == "in_search_filter_hnsw" || "$method" == "post_filter_hnsw" ]]; then
     postfilter_value_out="$POSTFILTER_MAX_CANDIDATES"
   fi
 
@@ -608,14 +639,7 @@ run_scenario() {
   local ef_values_name="$6"
   local -n ef_values_ref="$ef_values_name"
 
-  local methods=(
-    "in_search_filter_hnsw"
-    "compass_lz4"
-    "compass_iaa"
-    "acorn"
-  )
-
-  for method in "${methods[@]}"; do
+  for method in "${METHODS[@]}"; do
     for ef in "${ef_values_ref[@]}"; do
       run_single \
         "$method" \
