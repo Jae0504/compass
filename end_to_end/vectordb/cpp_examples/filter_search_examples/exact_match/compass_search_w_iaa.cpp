@@ -1,8 +1,8 @@
-#include "../../hnswlib/filter_search_hnswlib/hnswlib.h"
-#include "../../hnswlib/filter_search_iaa/compass_iaa_filter.h"
+#include "../../../hnswlib/filter_search_hnswlib/hnswlib.h"
+#include "../../../hnswlib/filter_search_iaa/compass_iaa_filter.h"
 
-#include "filter_expr.h"
-#include "io_utils.h"
+#include "../filter_expr.h"
+#include "../io_utils.h"
 
 #include <chrono>
 #include <filesystem>

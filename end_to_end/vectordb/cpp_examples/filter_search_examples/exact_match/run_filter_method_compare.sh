@@ -305,7 +305,7 @@ HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
 LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4_grouping.run"
 IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa_async_grouping.run"
 ACORN_RUN="$SCRIPT_DIR/acorn_search.run"
-PLOT_PY="$SCRIPT_DIR/plot_qps_recall.py"
+PLOT_PY="$SCRIPT_DIR/../plot_qps_recall.py"
 
 HNSW_DATASET_TYPE=""
 LZ4_DATASET_TYPE=""
