@@ -79,6 +79,8 @@ struct QueryMetrics {
     uint64_t tb_cache_hits = 0;
     uint64_t fid_tb_mismatch_count = 0;
     uint64_t fid_tb_mismatch_log_capped = 0;
+    uint64_t tb_predicate_blocks_touched = 0;
+    uint64_t tb_predicate_output_bytes = 0;
 };
 
 struct RunStats {
@@ -100,6 +102,8 @@ struct RunStats {
     uint64_t tb_bytes_decompressed = 0;
     uint64_t fid_tb_mismatch_count = 0;
     uint64_t fid_tb_mismatch_log_capped = 0;
+    uint64_t tb_predicate_blocks_touched = 0;
+    uint64_t tb_predicate_output_bytes = 0;
     uint64_t deferred_candidates_enqueued = 0;
     uint64_t deferred_retry_rounds = 0;
     uint64_t job_poll_calls = 0;
@@ -130,6 +134,8 @@ struct SearchCallStats {
     uint64_t deferred_retry_rounds = 0;
     uint64_t job_poll_calls = 0;
     uint64_t job_poll_ready = 0;
+    uint64_t tb_predicate_blocks_touched = 0;
+    uint64_t tb_predicate_output_bytes = 0;
 };
 
 void usage(const char* argv0) {
@@ -317,6 +323,7 @@ struct AsyncEqRuntime {
     bool empty_result = false;
     std::string field;
     uint8_t target_bucket = 0;
+    size_t tb_bytes_per_bucket = 0;
     size_t n_elements = 0;
     compass_iaa_filter::detail::IaaBlockStorage fid_storage;
     compass_iaa_filter::detail::IaaBlockStorage tb_storage;
@@ -364,6 +371,46 @@ double compression_pct_of_raw(uint64_t raw_bytes, uint64_t compressed_bytes) {
     return (static_cast<double>(compressed_bytes) * 100.0) / static_cast<double>(raw_bytes);
 }
 
+size_t tb_bytes_per_bucket(size_t n_elements) {
+    return (n_elements + 7u) / 8u;
+}
+
+std::vector<uint8_t> reorder_tb_node_major_to_bucket_major(
+    const std::vector<uint8_t>& tb_node_major,
+    size_t n_elements) {
+    const size_t expected_bytes = n_elements * compass_iaa_filter::kTbBytesPerNode;
+    if (tb_node_major.size() != expected_bytes) {
+        throw std::runtime_error("TB raw payload size mismatch while reordering to bucket-major");
+    }
+
+    const size_t bytes_per_bucket = tb_bytes_per_bucket(n_elements);
+    std::vector<uint8_t> tb_bucket_major(
+        bytes_per_bucket * compass_iaa_filter::kMaxBuckets,
+        static_cast<uint8_t>(0));
+
+    for (size_t node_id = 0; node_id < n_elements; ++node_id) {
+        const size_t src_base = node_id * compass_iaa_filter::kTbBytesPerNode;
+        const size_t dst_byte = node_id / 8;
+        const uint8_t dst_bit = static_cast<uint8_t>(1u << (node_id % 8));
+        for (size_t byte_idx = 0; byte_idx < compass_iaa_filter::kTbBytesPerNode; ++byte_idx) {
+            const uint8_t bits = tb_node_major[src_base + byte_idx];
+            if (bits == 0) {
+                continue;
+            }
+            for (size_t bit = 0; bit < 8; ++bit) {
+                if ((bits & static_cast<uint8_t>(1u << bit)) == 0) {
+                    continue;
+                }
+                const size_t bucket = byte_idx * 8 + bit;
+                const size_t out_offset = bucket * bytes_per_bucket + dst_byte;
+                tb_bucket_major[out_offset] |= dst_bit;
+            }
+        }
+    }
+
+    return tb_bucket_major;
+}
+
 struct FidScanBlock {
     std::vector<uint8_t> matches;
     uint32_t input_elements = 0;
@@ -372,8 +419,11 @@ struct FidScanBlock {
 };
 
 struct AsyncEqQueryCache {
-    std::vector<std::vector<uint8_t>> tb_blocks;
-    std::vector<uint8_t> tb_ready;
+    std::vector<uint8_t> tb_query_mask;
+    uint8_t tb_query_mask_ready = 0;
+    uint32_t tb_jobs_pending = 0;
+    uint64_t tb_predicate_blocks_touched = 0;
+    uint64_t tb_predicate_output_bytes = 0;
     std::vector<FidScanBlock> fid_blocks;
     std::vector<uint8_t> fid_ready;
     std::vector<uint8_t> fid_state;
@@ -547,16 +597,8 @@ AsyncEqRuntime build_async_eq_runtime(
         throw std::runtime_error(
             "TB element count mismatch while building async runtime for field '" + attr.key + "'");
     }
-
-    std::vector<uint8_t> tb_bucket_bits((manifest.n_elements + 7) / 8, 0);
-    const size_t bucket_byte = static_cast<size_t>(target_bucket) / 8;
-    const uint8_t bucket_mask = static_cast<uint8_t>(1u << (target_bucket % 8));
-    for (size_t node_id = 0; node_id < manifest.n_elements; ++node_id) {
-        const size_t offset = node_id * compass_iaa_filter::kTbBytesPerNode + bucket_byte;
-        if ((tb_raw[offset] & bucket_mask) != 0) {
-            tb_bucket_bits[node_id / 8] |= static_cast<uint8_t>(1u << (node_id % 8));
-        }
-    }
+    const std::vector<uint8_t> tb_bucket_major =
+        reorder_tb_node_major_to_bucket_major(tb_raw, manifest.n_elements);
 
     std::unique_ptr<compass_iaa_filter::detail::QplJobHandle> compressor =
         compass_iaa_filter::detail::make_hardware_job("async eq runtime compressor");
@@ -565,7 +607,7 @@ AsyncEqRuntime build_async_eq_runtime(
         args.fid_block_size_bytes,
         compressor.get());
     runtime.tb_storage = compass_iaa_filter::detail::compress_to_iaa_blocks(
-        tb_bucket_bits,
+        tb_bucket_major,
         args.tb_block_size_bytes,
         compressor.get());
 
@@ -573,6 +615,7 @@ AsyncEqRuntime build_async_eq_runtime(
     runtime.empty_result = false;
     runtime.field = spec->field;
     runtime.target_bucket = static_cast<uint8_t>(target_bucket);
+    runtime.tb_bytes_per_bucket = tb_bytes_per_bucket(manifest.n_elements);
     runtime.n_elements = manifest.n_elements;
     return runtime;
 }
@@ -587,19 +630,20 @@ size_t max_raw_block_size(const compass_iaa_filter::detail::IaaBlockStorage& sto
 
 size_t required_async_job_output_bytes(const AsyncEqRuntime& runtime) {
     const size_t max_fid = max_raw_block_size(runtime.fid_storage);
-    const size_t max_tb = max_raw_block_size(runtime.tb_storage);
+    const size_t max_tb_segment = std::max<size_t>(
+        1,
+        std::min(max_raw_block_size(runtime.tb_storage), runtime.tb_bytes_per_bucket));
+    const size_t max_tb = max_tb_segment;
     return std::max<size_t>(1, std::max(max_fid, max_tb));
 }
 
 AsyncEqQueryCache make_preallocated_query_cache(const AsyncEqRuntime& runtime) {
     AsyncEqQueryCache cache;
-
-    const size_t tb_blocks = runtime.tb_storage.block_count();
-    cache.tb_blocks.resize(tb_blocks);
-    cache.tb_ready.assign(tb_blocks, 0);
-    for (size_t block_id = 0; block_id < tb_blocks; ++block_id) {
-        cache.tb_blocks[block_id].assign(runtime.tb_storage.raw_block_sizes[block_id], 0);
-    }
+    cache.tb_query_mask.assign(runtime.tb_bytes_per_bucket, 0);
+    cache.tb_query_mask_ready = 0;
+    cache.tb_jobs_pending = 0;
+    cache.tb_predicate_blocks_touched = 0;
+    cache.tb_predicate_output_bytes = 0;
 
     const size_t fid_blocks = runtime.fid_storage.block_count();
     cache.fid_blocks.resize(fid_blocks);
@@ -622,15 +666,18 @@ void reset_preallocated_query_cache(
     if (cache == nullptr) {
         throw std::runtime_error("AsyncEqQueryCache reset received null pointer");
     }
-    if (cache->tb_blocks.size() != runtime.tb_storage.block_count() ||
-        cache->tb_ready.size() != runtime.tb_storage.block_count() ||
+    if (cache->tb_query_mask.size() != runtime.tb_bytes_per_bucket ||
         cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
         cache->fid_ready.size() != runtime.fid_storage.block_count() ||
         cache->fid_state.size() != runtime.fid_storage.block_count()) {
         throw std::runtime_error("AsyncEqQueryCache reset size mismatch");
     }
 
-    std::fill(cache->tb_ready.begin(), cache->tb_ready.end(), static_cast<uint8_t>(0));
+    std::fill(cache->tb_query_mask.begin(), cache->tb_query_mask.end(), static_cast<uint8_t>(0));
+    cache->tb_query_mask_ready = 0;
+    cache->tb_jobs_pending = 0;
+    cache->tb_predicate_blocks_touched = 0;
+    cache->tb_predicate_output_bytes = 0;
     std::fill(cache->fid_ready.begin(), cache->fid_ready.end(), static_cast<uint8_t>(0));
     std::fill(cache->fid_state.begin(), cache->fid_state.end(), kFidStateNotSubmitted);
     for (size_t block_id = 0; block_id < cache->fid_blocks.size(); ++block_id) {
@@ -659,12 +706,9 @@ void prefault_query_cache_buffers(AsyncEqQueryCache* cache) {
         sink ^= vec.back();
     };
 
-    touch_vec(cache->tb_ready);
+    touch_vec(cache->tb_query_mask);
     touch_vec(cache->fid_ready);
     touch_vec(cache->fid_state);
-    for (std::vector<uint8_t>& block : cache->tb_blocks) {
-        touch_vec(block);
-    }
     for (FidScanBlock& block : cache->fid_blocks) {
         touch_vec(block.matches);
     }
@@ -848,45 +892,93 @@ void submit_tb_prefetch_jobs(
     if (ring == nullptr || cache == nullptr) {
         throw std::runtime_error("TB prefetch received null pointer");
     }
-    for (size_t block_id = 0; block_id < runtime.tb_storage.block_count(); ++block_id) {
-        if (block_id >= cache->tb_ready.size() || cache->tb_ready[block_id] != 0) {
-            continue;
+    if (cache->tb_query_mask.size() != runtime.tb_bytes_per_bucket) {
+        throw std::runtime_error("TB query mask size mismatch");
+    }
+
+    std::fill(cache->tb_query_mask.begin(), cache->tb_query_mask.end(), static_cast<uint8_t>(0));
+    cache->tb_query_mask_ready = 0;
+    cache->tb_jobs_pending = 0;
+    cache->tb_predicate_blocks_touched = 0;
+    cache->tb_predicate_output_bytes = 0;
+
+    if (runtime.tb_storage.block_size == 0 || runtime.tb_bytes_per_bucket == 0) {
+        cache->tb_query_mask_ready = 1;
+        return;
+    }
+
+    const size_t bucket_start = static_cast<size_t>(runtime.target_bucket) * runtime.tb_bytes_per_bucket;
+    const size_t bucket_end = bucket_start + runtime.tb_bytes_per_bucket;
+    if (bucket_start >= runtime.tb_storage.raw_size || bucket_end > runtime.tb_storage.raw_size) {
+        throw std::runtime_error("TB bucket range is outside of reordered TB storage");
+    }
+
+    const size_t start_block = bucket_start / runtime.tb_storage.block_size;
+    const size_t end_block = (bucket_end - 1) / runtime.tb_storage.block_size;
+    for (size_t block_id = start_block; block_id <= end_block; ++block_id) {
+        if (block_id >= runtime.tb_storage.block_count()) {
+            throw std::runtime_error("TB block id out of range during extract prefetch");
         }
+
         const uint32_t raw_len = runtime.tb_storage.raw_block_sizes[block_id];
         if (raw_len == 0) {
-            cache->tb_blocks[block_id].clear();
-            cache->tb_ready[block_id] = 1;
             continue;
         }
 
+        const size_t block_base = block_id * runtime.tb_storage.block_size;
+        const size_t segment_start = std::max(bucket_start, block_base);
+        const size_t segment_end = std::min(bucket_end, block_base + static_cast<size_t>(raw_len));
+        if (segment_end <= segment_start) {
+            continue;
+        }
+        const uint32_t local_lo = static_cast<uint32_t>(segment_start - block_base);
+        const uint32_t local_hi = static_cast<uint32_t>(segment_end - block_base - 1);
+        const size_t segment_len = static_cast<size_t>(local_hi - local_lo + 1u);
+        const size_t dst_offset = segment_start - bucket_start;
+
+        ++cache->tb_jobs_pending;
+        ++cache->tb_predicate_blocks_touched;
+        cache->tb_predicate_output_bytes += safe_size_t_to_u64(segment_len);
+
         ring->submit(
-            static_cast<size_t>(raw_len),
-            [&](qpl_job* job, std::vector<uint8_t>& out) {
+            segment_len,
+            [&, block_id, raw_len, local_lo, local_hi](qpl_job* job, std::vector<uint8_t>& out) {
                 job->op = qpl_op_extract;
                 job->next_in_ptr = const_cast<uint8_t*>(runtime.tb_storage.compressed_blocks[block_id].data());
                 job->available_in = static_cast<uint32_t>(runtime.tb_storage.compressed_blocks[block_id].size());
                 job->next_out_ptr = out.data();
-                job->available_out = raw_len;
+                job->available_out = static_cast<uint32_t>(segment_len);
                 job->src1_bit_width = 8;
                 job->out_bit_width = qpl_ow_nom;
-                job->param_low = 0;
-                job->param_high = raw_len - 1;
+                job->param_low = local_lo;
+                job->param_high = local_hi;
                 job->num_input_elements = raw_len;
                 job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_DECOMPRESS_ENABLE;
             },
-            [cache, metrics, block_id, raw_len](qpl_job* job, std::vector<uint8_t>& out) {
+            [cache, metrics, dst_offset, segment_len](qpl_job* job, std::vector<uint8_t>& out) {
                 const size_t produced = static_cast<size_t>(job->total_out);
-                std::vector<uint8_t>& dst = cache->tb_blocks[block_id];
-                if (produced > dst.size()) {
-                    throw std::runtime_error("TB output exceeds preallocated query cache block");
+                if (produced != segment_len || dst_offset + produced > cache->tb_query_mask.size()) {
+                    throw std::runtime_error("Unexpected TB extract output size from IAA");
                 }
-                std::copy_n(out.begin(), produced, dst.begin());
-                cache->tb_ready[block_id] = 1;
+                for (size_t i = 0; i < produced; ++i) {
+                    cache->tb_query_mask[dst_offset + i] |= out[i];
+                }
+                if (cache->tb_jobs_pending == 0) {
+                    throw std::runtime_error("TB extract completion observed with zero pending jobs");
+                }
+                --cache->tb_jobs_pending;
+                if (cache->tb_jobs_pending == 0) {
+                    cache->tb_query_mask_ready = 1;
+                }
                 if (metrics != nullptr) {
                     ++metrics->tb_blocks_decompressed;
-                    metrics->tb_bytes_decompressed += static_cast<uint64_t>(raw_len);
+                    metrics->tb_bytes_decompressed += static_cast<uint64_t>(segment_len);
                 }
             });
+    }
+
+    if (cache->tb_jobs_pending == 0) {
+        cache->tb_query_mask_ready = 1;
     }
 }
 
@@ -961,32 +1053,22 @@ bool tb_match_node(
     AsyncEqQueryCache* cache,
     size_t node_id,
     compass_iaa_filter::QueryDecompressionMetrics* metrics) {
-    if (cache == nullptr || runtime.tb_storage.block_size == 0 || node_id >= runtime.n_elements) {
+    (void)ring;
+    if (cache == nullptr || runtime.tb_bytes_per_bucket == 0 || node_id >= runtime.n_elements) {
         return false;
     }
-    const size_t byte_offset = node_id / 8;
-    const size_t block_id = byte_offset / runtime.tb_storage.block_size;
-    const size_t in_block = byte_offset % runtime.tb_storage.block_size;
-
-    if (block_id >= cache->tb_blocks.size()) {
+    if (cache->tb_query_mask_ready == 0) {
         return false;
     }
-    while (cache->tb_ready[block_id] == 0) {
-        if (ring == nullptr || !ring->has_pending()) {
-            throw std::runtime_error(
-                "TB block is not ready and no pending async jobs exist");
-        }
-        ring->wait_one();
-    }
-    const std::vector<uint8_t>& block = cache->tb_blocks[block_id];
-    if (in_block >= block.size()) {
+    const size_t byte_idx = node_id / 8;
+    const uint8_t bit = static_cast<uint8_t>(1u << (node_id % 8));
+    if (byte_idx >= cache->tb_query_mask.size()) {
         return false;
     }
     if (metrics != nullptr) {
         ++metrics->tb_cache_hits;
     }
-    const uint8_t byte = block[in_block];
-    return ((byte >> (node_id % 8)) & 1u) != 0;
+    return (cache->tb_query_mask[byte_idx] & bit) != 0;
 }
 
 bool fid_match_node(
@@ -1088,17 +1170,13 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     DistT lower_bound = std::numeric_limits<DistT>::max();
 
     auto timed_eval = [&](bool traversal_mode, size_t node_id) -> bool {
-        const auto t0 = std::chrono::steady_clock::now();
         bool allowed = false;
         if (traversal_mode) {
             allowed = engine.allow_traversal(node_id, cache, &call_stats->decomp);
         } else {
             allowed = engine.allow_result(node_id, cache, &call_stats->decomp);
         }
-        const auto t1 = std::chrono::steady_clock::now();
         ++call_stats->filter_eval_calls;
-        call_stats->filter_eval_time_ns += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
         return allowed;
     };
 
@@ -1207,8 +1285,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
 
     DistT curdist = index.fstdistfunc_(query_data, index.getDataByInternalId(curr_obj), index.dist_func_param_);
 
-    if (cache->tb_blocks.size() != runtime.tb_storage.block_count() ||
-        cache->tb_ready.size() != runtime.tb_storage.block_count() ||
+    if (cache->tb_query_mask.size() != runtime.tb_bytes_per_bucket ||
         cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
         cache->fid_ready.size() != runtime.fid_storage.block_count() ||
         cache->fid_state.size() != runtime.fid_storage.block_count()) {
@@ -1216,6 +1293,14 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             "AsyncEqQueryCache must be fully preallocated before search");
     }
     submit_tb_prefetch_jobs(ring, runtime, cache, &call_stats->decomp);
+    while (cache->tb_query_mask_ready == 0) {
+        if (!ring->has_pending()) {
+            throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
+        }
+        ring->wait_one();
+    }
+    call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
+    call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
 
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
@@ -1636,7 +1721,8 @@ RunStats run_search_typed(
         per_query_out
             << "query_id,recall_at_k,enns_size,anns_size,filter_time_ms,search_time_ms,"
             << "lz4_decompress_time_ms,iaa_decompress_time_ms,fid_blocks_decompressed,tb_blocks_decompressed,"
-            << "fid_cache_hits,tb_cache_hits,fid_tb_mismatch_count,fid_tb_mismatch_log_capped\n";
+            << "fid_cache_hits,tb_cache_hits,fid_tb_mismatch_count,fid_tb_mismatch_log_capped,"
+            << "tb_predicate_blocks_touched,tb_predicate_output_bytes\n";
     }
 
     const bool capture_per_query = per_query_out.is_open();
@@ -1746,6 +1832,8 @@ RunStats run_search_typed(
         stats.tb_bytes_decompressed += call_stats.decomp.tb_bytes_decompressed;
         stats.fid_tb_mismatch_count += call_stats.fid_tb_mismatch_count;
         stats.fid_tb_mismatch_log_capped += call_stats.fid_tb_mismatch_log_capped;
+        stats.tb_predicate_blocks_touched += call_stats.tb_predicate_blocks_touched;
+        stats.tb_predicate_output_bytes += call_stats.tb_predicate_output_bytes;
         stats.deferred_candidates_enqueued += call_stats.deferred_candidates_enqueued;
         stats.deferred_retry_rounds += call_stats.deferred_retry_rounds;
         stats.job_poll_calls += call_stats.job_poll_calls;
@@ -1781,6 +1869,8 @@ RunStats run_search_typed(
             m.tb_cache_hits = call_stats.decomp.tb_cache_hits;
             m.fid_tb_mismatch_count = call_stats.fid_tb_mismatch_count;
             m.fid_tb_mismatch_log_capped = call_stats.fid_tb_mismatch_log_capped;
+            m.tb_predicate_blocks_touched = call_stats.tb_predicate_blocks_touched;
+            m.tb_predicate_output_bytes = call_stats.tb_predicate_output_bytes;
             stats.per_query_metrics.push_back(m);
 
             per_query_out
@@ -1797,7 +1887,9 @@ RunStats run_search_typed(
                 << call_stats.decomp.fid_cache_hits << ','
                 << call_stats.decomp.tb_cache_hits << ','
                 << call_stats.fid_tb_mismatch_count << ','
-                << call_stats.fid_tb_mismatch_log_capped
+                << call_stats.fid_tb_mismatch_log_capped << ','
+                << call_stats.tb_predicate_blocks_touched << ','
+                << call_stats.tb_predicate_output_bytes
                 << '\n';
         }
     }
@@ -1924,6 +2016,8 @@ std::string build_summary(
     oss << "tb_cache_hits: " << stats.tb_cache_hits << "\n";
     oss << "fid_bytes_decompressed: " << stats.fid_bytes_decompressed << "\n";
     oss << "tb_bytes_decompressed: " << stats.tb_bytes_decompressed << "\n";
+    oss << "tb_predicate_blocks_touched: " << stats.tb_predicate_blocks_touched << "\n";
+    oss << "tb_predicate_output_bytes: " << stats.tb_predicate_output_bytes << "\n";
     oss << "fid_tb_mismatch_count: " << stats.fid_tb_mismatch_count << "\n";
     oss << "fid_tb_mismatch_log_capped: " << stats.fid_tb_mismatch_log_capped << "\n";
     oss << "debug_deferred_candidates_enqueued: " << stats.deferred_candidates_enqueued << "\n";
