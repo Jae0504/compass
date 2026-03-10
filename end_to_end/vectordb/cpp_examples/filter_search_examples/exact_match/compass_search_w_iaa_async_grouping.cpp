@@ -1293,14 +1293,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             "AsyncEqQueryCache must be fully preallocated before search");
     }
     submit_tb_prefetch_jobs(ring, runtime, cache, &call_stats->decomp);
-    while (cache->tb_query_mask_ready == 0) {
-        if (!ring->has_pending()) {
-            throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
-        }
-        ring->wait_one();
-    }
-    call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
-    call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
 
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
@@ -1325,6 +1317,15 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             }
         }
     }
+
+    while (cache->tb_query_mask_ready == 0) {
+        if (!ring->has_pending()) {
+            throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
+        }
+        ring->wait_one();
+    }
+    call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
+    call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
