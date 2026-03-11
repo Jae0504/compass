@@ -809,6 +809,46 @@ SequentialEqQueryCache make_preallocated_query_cache(const SequentialEqRuntime& 
     return cache;
 }
 
+void reset_preallocated_query_cache(
+    const SequentialEqRuntime& runtime,
+    SequentialEqQueryCache* cache) {
+    if (cache == nullptr) {
+        throw std::runtime_error("SequentialEqQueryCache reset received null pointer");
+    }
+    if (cache->tb_blocks.size() != runtime.tb_storage.block_count() ||
+        cache->tb_ready.size() != runtime.tb_storage.block_count() ||
+        cache->tb_query_mask.size() != runtime.tb_bytes_per_bucket ||
+        cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
+        cache->fid_ready.size() != runtime.fid_storage.block_count()) {
+        throw std::runtime_error("SequentialEqQueryCache reset size mismatch");
+    }
+
+    std::fill(cache->tb_ready.begin(), cache->tb_ready.end(), static_cast<uint8_t>(0));
+    std::fill(cache->tb_query_mask.begin(), cache->tb_query_mask.end(), static_cast<uint8_t>(0));
+    cache->tb_query_mask_ready = 0;
+    cache->tb_predicate_blocks_touched = 0;
+    cache->tb_predicate_output_bytes = 0;
+    std::fill(cache->fid_ready.begin(), cache->fid_ready.end(), static_cast<uint8_t>(0));
+}
+
+void reset_engine_query_cache(
+    size_t attr_count,
+    compass_lz4_filter::QueryBlockCache* cache) {
+    if (cache == nullptr) {
+        throw std::runtime_error("QueryBlockCache reset received null pointer");
+    }
+    if (cache->fid_blocks.size() != attr_count || cache->tb_blocks.size() != attr_count) {
+        cache->reset(attr_count);
+        return;
+    }
+    for (auto& fid_map : cache->fid_blocks) {
+        fid_map.clear();
+    }
+    for (auto& tb_map : cache->tb_blocks) {
+        tb_map.clear();
+    }
+}
+
 void decompress_lz4_block_into(
     const compass_lz4_filter::detail::Lz4BlockStorage& storage,
     size_t block_id,
@@ -1569,17 +1609,28 @@ RunStats run_search_typed(
         stats.per_query_metrics.reserve(query_count);
     }
 
+    SequentialEqQueryCache query_cache;
+    SequentialEqSearchWorkspace query_workspace;
+    compass_lz4_filter::QueryBlockCache engine_query_cache;
+    if (use_sequential_eq) {
+        query_cache = make_preallocated_query_cache(*sequential_runtime);
+        reset_preallocated_query_cache(*sequential_runtime, &query_cache);
+        query_workspace.neighbor_ids.reserve(index.maxM0_);
+    } else {
+        engine_query_cache = compass_lz4_filter::QueryBlockCache(engine.attribute_count());
+        reset_engine_query_cache(engine.attribute_count(), &engine_query_cache);
+    }
+
     size_t returned_results = 0;
 
     for (size_t qid = 0; qid < query_count; ++qid) {
         const QueryT* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
 
         SearchCallStats call_stats;
-        SequentialEqQueryCache query_cache;
-        SequentialEqSearchWorkspace query_workspace;
         if (use_sequential_eq) {
-            query_cache = make_preallocated_query_cache(*sequential_runtime);
-            query_workspace.neighbor_ids.reserve(index.maxM0_);
+            reset_preallocated_query_cache(*sequential_runtime, &query_cache);
+        } else {
+            reset_engine_query_cache(engine.attribute_count(), &engine_query_cache);
         }
 
         const auto search_start = std::chrono::steady_clock::now();
@@ -1596,7 +1647,6 @@ RunStats run_search_typed(
                 &query_workspace,
                 &call_stats);
         } else {
-            compass_lz4_filter::QueryBlockCache engine_query_cache(engine.attribute_count());
             result = search_with_compass_filter<DistT, QueryT>(
                 index,
                 qptr,

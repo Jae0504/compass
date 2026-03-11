@@ -12,10 +12,16 @@ Usage:
     [--ef-list <comma-separated>] \
     [--ef-list-1pct <comma-separated>] \
     [--ef-list-10pct <comma-separated>] \
+    [--in-search-ef-list-1pct <comma-separated>] \
+    [--in-search-ef-list-10pct <comma-separated>] \
     [--num-queries <int>] \
     [--out-dir <path>] \
     [--postfilter-max-candidates <int>] \
     [--postfilter-max-candidates-list <comma-separated>] \
+    [--postfilter-max-candidates-list-1pct <comma-separated>] \
+    [--postfilter-max-candidates-list-10pct <comma-separated>] \
+    [--numa-mem-node <int>] \
+    [--numa-cpu-bind <cpulist>] \
     [--iaa-ab-compare|--no-iaa-ab-compare] \
     [--skip-iaa-config|--no-skip-iaa-config] \
     [--build|--no-build] \
@@ -27,10 +33,16 @@ Core defaults:
   --ef-list                     32,64,96,128,160,200,256,320,400
   --ef-list-1pct               (dataset=sift1m default) 64,96,128,160,200
   --ef-list-10pct              (dataset=sift1m default) 200,256,300,400
+  --in-search-ef-list-1pct     (inherits --ef-list-1pct)
+  --in-search-ef-list-10pct    (inherits --ef-list-10pct)
   --num-queries                 100
   --out-dir                     <this_dir>/out/filter_method_compare
   --postfilter-max-candidates   3000 (in_search_filter_hnsw)
   --postfilter-max-candidates-list 500,1000,1500,2000 (post_filter_hnsw sweep)
+  --postfilter-max-candidates-list-1pct (inherits --postfilter-max-candidates-list)
+  --postfilter-max-candidates-list-10pct (inherits --postfilter-max-candidates-list)
+  --numa-mem-node                0
+  --numa-cpu-bind                8
   --iaa-ab-compare              disabled (when enabled: run only async_8 vs grouping_8)
   --skip-iaa-config             disabled
   --fid-block-size-bytes        8192*8 (65536)
@@ -98,29 +110,49 @@ ensure_executable_file() {
     exit 1
   fi
 }
+# EF_LIST="32,64,96,128,160,200"
+# EF_LIST_1PCT="112, 128, 144, 160, 176, 192, 224, 256"
+# EF_LIST_10PCT="1000, 1200, 1600, 1800, 2200, 2600, 3200, 4000"
+# EF_LIST_SET_BY_USER=0
+# IN_SEARCH_EF_LIST_1PCT="4"
+# IN_SEARCH_EF_LIST_10PCT="24"
+# ACORN_EF_LIST_1PCT="24,28,40,56,640,1280,1600,1920"
+# ACORN_EF_LIST_10PCT="12,16,24,28,32"
+# NUM_QUERIES=100
+# OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
+# POSTFILTER_MAX_CANDIDATES=3000
+# POSTFILTER_MAX_CANDIDATES_SET_BY_USER=0
+# POSTFILTER_MAX_CANDIDATES_LIST="1500,1600,1700,1800,2000"
+# POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=0
+# POSTFILTER_MAX_CANDIDATES_LIST_1PCT="1900,2100,2400,2800,3200"
+# POSTFILTER_MAX_CANDIDATES_LIST_10PCT="100,200,300,400,500"
 
 DATASET="sift1m"
 K=10
 EF_LIST="32,64,96,128,160,200"
-EF_LIST_1PCT=""
-EF_LIST_10PCT=""
+EF_LIST_1PCT="112, 128, 144, 160, 176, 192, 224, 256"
+EF_LIST_10PCT="1000, 1200, 1600, 1800, 2200, 2600, 3200, 4000"
 EF_LIST_SET_BY_USER=0
-ACORN_EF_LIST_1PCT="24,32,48,64"
-ACORN_EF_LIST_10PCT="16,24,32,48,64"
-NUM_QUERIES=10
+IN_SEARCH_EF_LIST_1PCT="4"
+IN_SEARCH_EF_LIST_10PCT="24"
+ACORN_EF_LIST_1PCT="24,28,40,56,640"
+ACORN_EF_LIST_10PCT="12,16,24,28,32"
+NUM_QUERIES=100
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 POSTFILTER_MAX_CANDIDATES=3000
 POSTFILTER_MAX_CANDIDATES_SET_BY_USER=0
-POSTFILTER_MAX_CANDIDATES_LIST="500,1000,1500,2000"
+POSTFILTER_MAX_CANDIDATES_LIST="1500,1600,1700,1800,2000"
 POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=0
+POSTFILTER_MAX_CANDIDATES_LIST_1PCT="1900,2100,2400,2800,3200"
+POSTFILTER_MAX_CANDIDATES_LIST_10PCT="500,700,1200,2000,4000"
 DO_BUILD=1
 DO_PLOT=1
 IAA_AB_COMPARE=0
 SKIP_IAA_CONFIG=0
 FILTER_EXPR='synthetic_id_bucket == 255'
 FILTER_EXPR_SET_BY_USER=0
-FILTER_EXPR_1PCT=""
-FILTER_EXPR_10PCT=""
+FILTER_EXPR_1PCT="synthetic_id_bucket == 99"
+FILTER_EXPR_10PCT="synthetic_id_bucket == 9"
 
 GRAPH_PATH=""
 QUERY_PATH=""
@@ -133,7 +165,9 @@ IAA_CONFIG_DIR="/home/jykang5/compass/scripts/iaa"
 IAA_DEVICE_OWNER="jykang5"
 FID_BLOCK_SIZE_BYTES="$((1024*128))"
 TB_BLOCK_SIZE_BYTES="$((1024*128))"
-CPU_PIN_CORE="0"
+CPU_PIN_CORE="8"
+NUMA_MEM_NODE="0"
+NUMA_CPU_BIND="8"
 CURRENT_IAA_ENGINE_PROFILE=""
 SUDO_KEEPALIVE_PID=""
 
@@ -173,6 +207,14 @@ while [[ $# -gt 0 ]]; do
       EF_LIST_10PCT="$2"
       shift 2
       ;;
+    --in-search-ef-list-1pct)
+      IN_SEARCH_EF_LIST_1PCT="$2"
+      shift 2
+      ;;
+    --in-search-ef-list-10pct)
+      IN_SEARCH_EF_LIST_10PCT="$2"
+      shift 2
+      ;;
     --num-queries)
       NUM_QUERIES="$2"
       shift 2
@@ -189,6 +231,14 @@ while [[ $# -gt 0 ]]; do
     --postfilter-max-candidates-list)
       POSTFILTER_MAX_CANDIDATES_LIST="$2"
       POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=1
+      shift 2
+      ;;
+    --postfilter-max-candidates-list-1pct)
+      POSTFILTER_MAX_CANDIDATES_LIST_1PCT="$2"
+      shift 2
+      ;;
+    --postfilter-max-candidates-list-10pct)
+      POSTFILTER_MAX_CANDIDATES_LIST_10PCT="$2"
       shift 2
       ;;
     --iaa-ab-compare)
@@ -264,6 +314,14 @@ while [[ $# -gt 0 ]]; do
       PAYLOAD_JSONL="$2"
       shift 2
       ;;
+    --numa-mem-node)
+      NUMA_MEM_NODE="$2"
+      shift 2
+      ;;
+    --numa-cpu-bind)
+      NUMA_CPU_BIND="$2"
+      shift 2
+      ;;
     --iaa-config-dir)
       IAA_CONFIG_DIR="$2"
       shift 2
@@ -313,6 +371,12 @@ fi
 if [[ "$POSTFILTER_MAX_CANDIDATES_SET_BY_USER" -eq 1 && "$POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER" -eq 0 ]]; then
   POSTFILTER_MAX_CANDIDATES_LIST="$POSTFILTER_MAX_CANDIDATES"
 fi
+if [[ -z "$POSTFILTER_MAX_CANDIDATES_LIST_1PCT" ]]; then
+  POSTFILTER_MAX_CANDIDATES_LIST_1PCT="$POSTFILTER_MAX_CANDIDATES_LIST"
+fi
+if [[ -z "$POSTFILTER_MAX_CANDIDATES_LIST_10PCT" ]]; then
+  POSTFILTER_MAX_CANDIDATES_LIST_10PCT="$POSTFILTER_MAX_CANDIDATES_LIST"
+fi
 if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
   if ! [[ "$FID_BLOCK_SIZE_BYTES" =~ ^[0-9]+$ ]] || [[ "$FID_BLOCK_SIZE_BYTES" -le 0 ]]; then
     echo "Error: --fid-block-size-bytes must be a positive integer" >&2
@@ -324,6 +388,10 @@ if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
     echo "Error: --tb-block-size-bytes must be a positive integer" >&2
     exit 1
   fi
+fi
+if ! [[ "$NUMA_MEM_NODE" =~ ^[0-9]+$ ]]; then
+  echo "Error: --numa-mem-node must be a non-negative integer" >&2
+  exit 1
 fi
 
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
@@ -547,18 +615,26 @@ parse_positive_int_list_into_array() {
 
 EFFECTIVE_EF_LIST_1PCT="${EF_LIST_1PCT:-$EF_LIST}"
 EFFECTIVE_EF_LIST_10PCT="${EF_LIST_10PCT:-$EF_LIST}"
+EFFECTIVE_IN_SEARCH_EF_LIST_1PCT="${IN_SEARCH_EF_LIST_1PCT:-$EFFECTIVE_EF_LIST_1PCT}"
+EFFECTIVE_IN_SEARCH_EF_LIST_10PCT="${IN_SEARCH_EF_LIST_10PCT:-$EFFECTIVE_EF_LIST_10PCT}"
 
 parse_ef_list_into_array "$EFFECTIVE_EF_LIST_1PCT" "--ef-list-1pct" EF_VALUES_1PCT
 parse_ef_list_into_array "$EFFECTIVE_EF_LIST_10PCT" "--ef-list-10pct" EF_VALUES_10PCT
+parse_ef_list_into_array "$EFFECTIVE_IN_SEARCH_EF_LIST_1PCT" "--in-search-ef-list-1pct" IN_SEARCH_EF_VALUES_1PCT
+parse_ef_list_into_array "$EFFECTIVE_IN_SEARCH_EF_LIST_10PCT" "--in-search-ef-list-10pct" IN_SEARCH_EF_VALUES_10PCT
 parse_ef_list_into_array "$ACORN_EF_LIST_1PCT" "--acorn-ef-list-1pct" ACORN_EF_VALUES_1PCT
 parse_ef_list_into_array "$ACORN_EF_LIST_10PCT" "--acorn-ef-list-10pct" ACORN_EF_VALUES_10PCT
 parse_positive_int_list_into_array \
-  "$POSTFILTER_MAX_CANDIDATES_LIST" \
-  "--postfilter-max-candidates-list" \
-  POSTFILTER_MAX_VALUES
-for max_candidates in "${POSTFILTER_MAX_VALUES[@]}"; do
+  "$POSTFILTER_MAX_CANDIDATES_LIST_1PCT" \
+  "--postfilter-max-candidates-list-1pct" \
+  POSTFILTER_MAX_VALUES_1PCT
+parse_positive_int_list_into_array \
+  "$POSTFILTER_MAX_CANDIDATES_LIST_10PCT" \
+  "--postfilter-max-candidates-list-10pct" \
+  POSTFILTER_MAX_VALUES_10PCT
+for max_candidates in "${POSTFILTER_MAX_VALUES_1PCT[@]}" "${POSTFILTER_MAX_VALUES_10PCT[@]}"; do
   if [[ "$max_candidates" -lt "$K" ]]; then
-    echo "Error: every --postfilter-max-candidates-list value must be >= --k (found: $max_candidates)" >&2
+    echo "Error: every postfilter max-candidates list value must be >= --k (found: $max_candidates)" >&2
     exit 1
   fi
 done
@@ -882,7 +958,14 @@ run_single() {
   fi
 
   local -a run_cmd
-  if [[ -n "$CPU_PIN_CORE" ]]; then
+  if command -v numactl >/dev/null 2>&1; then
+    run_cmd=(
+      numactl
+      --membind="$NUMA_MEM_NODE"
+      --physcpubind="$NUMA_CPU_BIND"
+      "${cmd[@]}"
+    )
+  elif [[ -n "$CPU_PIN_CORE" ]]; then
     run_cmd=(taskset -c "$CPU_PIN_CORE" "${cmd[@]}")
   else
     run_cmd=("${cmd[@]}")
@@ -942,6 +1025,12 @@ run_selectivity() {
   local filter_expr="$6"
   local ef_values_name="$7"
   local -n ef_values_ref="$ef_values_name"
+  local -a postfilter_values=()
+  if [[ "$selectivity_pct" == "1" ]]; then
+    postfilter_values=("${POSTFILTER_MAX_VALUES_1PCT[@]}")
+  else
+    postfilter_values=("${POSTFILTER_MAX_VALUES_10PCT[@]}")
+  fi
 
   local methods=()
   if [[ "$IAA_AB_COMPARE" -eq 1 ]]; then
@@ -955,16 +1044,22 @@ run_selectivity() {
       "in_search_filter_hnsw"
       "acorn"
       "compass_lz4"
-      "compass_iaa_1"
-      "compass_iaa_2"
-      "compass_iaa_4"
+      # "compass_iaa_1"
+      # "compass_iaa_2"
+      # "compass_iaa_4"
       "compass_iaa_8"
     )
   fi
 
   for method in "${methods[@]}"; do
     local -a method_ef_values=("${ef_values_ref[@]}")
-    if [[ "$method" == "acorn" ]]; then
+    if [[ "$method" == "in_search_filter_hnsw" ]]; then
+      if [[ "$selectivity_pct" == "1" ]]; then
+        method_ef_values=("${IN_SEARCH_EF_VALUES_1PCT[@]}")
+      else
+        method_ef_values=("${IN_SEARCH_EF_VALUES_10PCT[@]}")
+      fi
+    elif [[ "$method" == "acorn" ]]; then
       if [[ "$selectivity_pct" == "1" ]]; then
         method_ef_values=("${ACORN_EF_VALUES_1PCT[@]}")
       else
@@ -974,7 +1069,7 @@ run_selectivity() {
 
     if [[ "$method" == "post_filter_hnsw" ]]; then
       for ef in "${method_ef_values[@]}"; do
-        for postfilter_max_candidates in "${POSTFILTER_MAX_VALUES[@]}"; do
+        for postfilter_max_candidates in "${postfilter_values[@]}"; do
           run_single \
             "$method" \
             "$selectivity_pct" \
@@ -1120,9 +1215,12 @@ echo "    10% -> $ACORN_INDEX_10PCT"
 echo "  k: $K"
 echo "  ef list (1%): ${EF_VALUES_1PCT[*]}"
 echo "  ef list (10%): ${EF_VALUES_10PCT[*]}"
+echo "  in_search ef list (1%): ${IN_SEARCH_EF_VALUES_1PCT[*]}"
+echo "  in_search ef list (10%): ${IN_SEARCH_EF_VALUES_10PCT[*]}"
 echo "  acorn ef list (1%): ${ACORN_EF_VALUES_1PCT[*]}"
 echo "  acorn ef list (10%): ${ACORN_EF_VALUES_10PCT[*]}"
-echo "  postfilter max-candidates list: ${POSTFILTER_MAX_VALUES[*]}"
+echo "  postfilter max-candidates list (1%): ${POSTFILTER_MAX_VALUES_1PCT[*]}"
+echo "  postfilter max-candidates list (10%): ${POSTFILTER_MAX_VALUES_10PCT[*]}"
 echo "  in_search_filter_hnsw postfilter-max-candidates: $POSTFILTER_MAX_CANDIDATES"
 echo "  iaa-ab-compare: $IAA_AB_COMPARE"
 if [[ "$IAA_AB_COMPARE" -eq 1 ]]; then
@@ -1134,7 +1232,9 @@ echo "  filter (10%): $EFFECTIVE_FILTER_EXPR_10PCT"
 echo "  iaa config dir: $IAA_CONFIG_DIR"
 echo "  iaa device owner: $IAA_DEVICE_OWNER"
 echo "  skip-iaa-config: $SKIP_IAA_CONFIG"
-echo "  cpu pin core: $CPU_PIN_CORE"
+echo "  numa membind node: $NUMA_MEM_NODE"
+echo "  numa cpu bind: $NUMA_CPU_BIND"
+echo "  cpu pin core (fallback): $CPU_PIN_CORE"
 echo "  out-dir: $OUT_DIR"
 
 run_selectivity "1" "$MANIFEST_1PCT" "$META_1PCT" "$ACORN_INDEX_1PCT" "$RESULTS_1PCT" "$EFFECTIVE_FILTER_EXPR_1PCT" EF_VALUES_1PCT

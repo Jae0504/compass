@@ -35,7 +35,6 @@ namespace {
 
 constexpr bool kMeasureInSearchStats = false;
 
-
 struct Args {
     std::string dataset_type;
     std::string graph_path;
@@ -1175,9 +1174,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     auto timed_eval = [&](bool traversal_mode, size_t node_id) -> bool {
         bool allowed = false;
         if (traversal_mode) {
-            allowed = engine.allow_traversal(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            allowed = engine.allow_traversal(
+                node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         } else {
-            allowed = engine.allow_result(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            allowed = engine.allow_result(
+                node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         }
         if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
         return allowed;
@@ -1321,15 +1322,6 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         }
     }
 
-    while (cache->tb_query_mask_ready == 0) {
-        if (!ring->has_pending()) {
-            throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
-        }
-        ring->wait_one();
-    }
-    if (kMeasureInSearchStats) call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
-    if (kMeasureInSearchStats) call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
-
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
     const hnswlib::vl_type tag = vl->curV;
@@ -1364,8 +1356,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
     next_temp_result_buffer.reserve(index.maxM0_ * 4);
 
     auto poll_ready_jobs = [&]() {
+        const size_t ready = ring->poll_ready_jobs();
         if (kMeasureInSearchStats) ++call_stats->job_poll_calls;
-        if (kMeasureInSearchStats) call_stats->job_poll_ready += static_cast<uint64_t>(ring->poll_ready_jobs());
+        if (kMeasureInSearchStats) call_stats->job_poll_ready += static_cast<uint64_t>(ready);
     };
 
     auto submit_pending_fid_blocks = [&]() {
@@ -1377,7 +1370,12 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                 continue;
             }
             pending_fid_block_marks[fid_block_id] = static_cast<uint8_t>(0);
-            submit_fid_scan_job(ring, runtime, fid_block_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            submit_fid_scan_job(
+                ring,
+                runtime,
+                fid_block_id,
+                cache,
+                (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         }
         pending_fid_blocks_to_submit.clear();
     };
@@ -1428,6 +1426,15 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         }
         temp_result_buffer.swap(next_temp_result_buffer);
     };
+
+    while (cache->tb_query_mask_ready == 0) {
+        if (!ring->has_pending()) {
+            throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
+        }
+        ring->wait_one();
+    }
+    if (kMeasureInSearchStats) call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
+    if (kMeasureInSearchStats) call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
 
     // Base-layer traversal loop with staged non-blocking FID handling.
     while (true) {
