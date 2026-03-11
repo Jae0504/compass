@@ -33,8 +33,10 @@ Core defaults:
   --clean-out-dir               enabled (keeps only current run files under out-dir)
   --postfilter-max-candidates   3000 (in_search_filter_hnsw)
   --postfilter-max-candidates-list 500,1000,1500,2000,2500 (post_filter_hnsw sweep)
-  --fid-block-size-bytes        65536
-  --tb-block-size-bytes         1048576
+  --fid-block-size-bytes-1pct   32768
+  --tb-block-size-bytes-1pct    65536
+  --fid-block-size-bytes-10pct  32768
+  --tb-block-size-bytes-10pct   16384
   --manifest                    /storage/jykang5/fid_tb/laion/manifest.json
   --iaa-engine-profiles         1,2,4,8
   --skip-iaa-config             disabled
@@ -59,6 +61,10 @@ Advanced overrides:
   --skip-iaa-config
   --iaa-config-dir <path>
   --iaa-device-owner <user>
+  --fid-block-size-bytes-1pct <int>
+  --tb-block-size-bytes-1pct <int>
+  --fid-block-size-bytes-10pct <int>
+  --tb-block-size-bytes-10pct <int>
   --fid-block-size-bytes <int>
   --tb-block-size-bytes <int>
 
@@ -410,10 +416,10 @@ parse_iaa_engine_profiles() {
 # Methods to run.
 # Comment out entries here for quick manual method selection.
 METHODS=(
-  "post_filter_hnsw"
-  "in_search_filter_hnsw"
-  "acorn"
-  "compass_lz4"
+  # "post_filter_hnsw"
+  # "in_search_filter_hnsw"
+  # "acorn"
+  # "compass_lz4"
   "compass_iaa_1"
   "compass_iaa_2"
   "compass_iaa_4"
@@ -447,10 +453,12 @@ method_requires_iaa_profile() {
 DATASET="laion"
 K=10
 EF_LIST="64,96,128,160,200"
-EF_LIST_1PCT=""
-EF_LIST_10PCT=""
+EF_LIST_1PCT="96,128,160,200,256"
+EF_LIST_10PCT="256,288,320,384,512"
 EF_LIST_SET_BY_USER=0
-NUM_QUERIES=10
+ACORN_EF_LIST_1PCT="24,32,48,64"
+ACORN_EF_LIST_10PCT="8,16,24,48,64"
+NUM_QUERIES=20
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 CLEAN_OUT_DIR=1
 POSTFILTER_MAX_CANDIDATES=3000
@@ -460,8 +468,14 @@ POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=0
 DO_BUILD=1
 DO_PLOT=1
 
-FILTER_EXPR_1PCT='958 <= original_width <= 965'
-FILTER_EXPR_10PCT='598 <= original_width <= 769'
+FILTER_EXPR_1PCT='1550 <= original_width <= 2445'
+FILTER_EXPR_10PCT='800 <= original_width <= 1743'
+# FILTER_EXPR_1PCT='958 <= original_width <= 965'
+# FILTER_EXPR_10PCT='598 <= original_width <= 769'
+# FILTER_EXPR_1PCT='1602 <= original_width <= 16300'
+# # 231 buckets
+# FILTER_EXPR_10PCT='800 <= original_width <= 1806'
+# # 14 buckets
 
 GRAPH_PATH="/storage/jykang5/compass_graphs/laion_m128_efc200.bin"
 QUERY_PATH="/storage/jykang5/compass_base_query/laion_query.fvecs"
@@ -472,12 +486,15 @@ ACORN_INDEX=""
 ACORN_INDEX_1PCT=""
 ACORN_INDEX_10PCT=""
 PAYLOAD_JSONL="/storage/jykang5/payloads/laion_payloads.jsonl"
-FID_BLOCK_SIZE_BYTES="$((1024*16))"
-TB_BLOCK_SIZE_BYTES="$((1024*16))"
+FID_BLOCK_SIZE_BYTES_1PCT="$((1024*128))"
+TB_BLOCK_SIZE_BYTES_1PCT="$((1024*128))"
+FID_BLOCK_SIZE_BYTES_10PCT="$((1024*128))"
+TB_BLOCK_SIZE_BYTES_10PCT="$((1024*128))"
 IAA_ENGINE_PROFILES="1,2,4,8"
 SKIP_IAA_CONFIG=0
 IAA_CONFIG_DIR="/home/jykang5/compass/scripts/iaa"
 IAA_DEVICE_OWNER="jykang5"
+CPU_PIN_CORE="0"
 CURRENT_IAA_ENGINE_PROFILE=""
 SUDO_KEEPALIVE_PID=""
 IAA_ENGINE_VALUES=()
@@ -611,12 +628,38 @@ while [[ $# -gt 0 ]]; do
       IAA_DEVICE_OWNER="$2"
       shift 2
       ;;
+    --cpu-pin-core)
+      CPU_PIN_CORE="$2"
+      shift 2
+      ;;
+    --no-cpu-pin)
+      CPU_PIN_CORE=""
+      shift
+      ;;
     --fid-block-size-bytes)
-      FID_BLOCK_SIZE_BYTES="$2"
+      FID_BLOCK_SIZE_BYTES_1PCT="$2"
+      FID_BLOCK_SIZE_BYTES_10PCT="$2"
       shift 2
       ;;
     --tb-block-size-bytes)
-      TB_BLOCK_SIZE_BYTES="$2"
+      TB_BLOCK_SIZE_BYTES_1PCT="$2"
+      TB_BLOCK_SIZE_BYTES_10PCT="$2"
+      shift 2
+      ;;
+    --fid-block-size-bytes-1pct)
+      FID_BLOCK_SIZE_BYTES_1PCT="$2"
+      shift 2
+      ;;
+    --tb-block-size-bytes-1pct)
+      TB_BLOCK_SIZE_BYTES_1PCT="$2"
+      shift 2
+      ;;
+    --fid-block-size-bytes-10pct)
+      FID_BLOCK_SIZE_BYTES_10PCT="$2"
+      shift 2
+      ;;
+    --tb-block-size-bytes-10pct)
+      TB_BLOCK_SIZE_BYTES_10PCT="$2"
       shift 2
       ;;
     --help|-h)
@@ -654,12 +697,20 @@ fi
 if [[ "$POSTFILTER_MAX_CANDIDATES_SET_BY_USER" -eq 1 && "$POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER" -eq 0 ]]; then
   POSTFILTER_MAX_CANDIDATES_LIST="$POSTFILTER_MAX_CANDIDATES"
 fi
-if ! [[ "$FID_BLOCK_SIZE_BYTES" =~ ^[0-9]+$ ]] || [[ "$FID_BLOCK_SIZE_BYTES" -le 0 ]]; then
-  echo "Error: --fid-block-size-bytes must be a positive integer" >&2
+if ! [[ "$FID_BLOCK_SIZE_BYTES_1PCT" =~ ^[0-9]+$ ]] || [[ "$FID_BLOCK_SIZE_BYTES_1PCT" -le 0 ]]; then
+  echo "Error: --fid-block-size-bytes-1pct must be a positive integer" >&2
   exit 1
 fi
-if ! [[ "$TB_BLOCK_SIZE_BYTES" =~ ^[0-9]+$ ]] || [[ "$TB_BLOCK_SIZE_BYTES" -le 0 ]]; then
-  echo "Error: --tb-block-size-bytes must be a positive integer" >&2
+if ! [[ "$TB_BLOCK_SIZE_BYTES_1PCT" =~ ^[0-9]+$ ]] || [[ "$TB_BLOCK_SIZE_BYTES_1PCT" -le 0 ]]; then
+  echo "Error: --tb-block-size-bytes-1pct must be a positive integer" >&2
+  exit 1
+fi
+if ! [[ "$FID_BLOCK_SIZE_BYTES_10PCT" =~ ^[0-9]+$ ]] || [[ "$FID_BLOCK_SIZE_BYTES_10PCT" -le 0 ]]; then
+  echo "Error: --fid-block-size-bytes-10pct must be a positive integer" >&2
+  exit 1
+fi
+if ! [[ "$TB_BLOCK_SIZE_BYTES_10PCT" =~ ^[0-9]+$ ]] || [[ "$TB_BLOCK_SIZE_BYTES_10PCT" -le 0 ]]; then
+  echo "Error: --tb-block-size-bytes-10pct must be a positive integer" >&2
   exit 1
 fi
 if [[ "$SKIP_IAA_CONFIG" -ne 0 && "$SKIP_IAA_CONFIG" -ne 1 ]]; then
@@ -755,6 +806,8 @@ fi
 
 parse_positive_int_list "$EF_LIST_1PCT" EF_VALUES_1PCT "--ef-list-1pct"
 parse_positive_int_list "$EF_LIST_10PCT" EF_VALUES_10PCT "--ef-list-10pct"
+parse_positive_int_list "$ACORN_EF_LIST_1PCT" ACORN_EF_VALUES_1PCT "--acorn-ef-list-1pct"
+parse_positive_int_list "$ACORN_EF_LIST_10PCT" ACORN_EF_VALUES_10PCT "--acorn-ef-list-10pct"
 parse_positive_int_list "$POSTFILTER_MAX_CANDIDATES_LIST" POSTFILTER_MAX_VALUES "--postfilter-max-candidates-list"
 
 for max_candidates in "${POSTFILTER_MAX_VALUES[@]}"; do
@@ -963,6 +1016,18 @@ run_single() {
   fi
   local summary_path="$summary_dir/${summary_stem}.summary.txt"
   local log_path="$summary_dir/${summary_stem}.log"
+  local fid_block_size_bytes=""
+  local tb_block_size_bytes=""
+  if [[ "$selectivity_pct" == "1" ]]; then
+    fid_block_size_bytes="$FID_BLOCK_SIZE_BYTES_1PCT"
+    tb_block_size_bytes="$TB_BLOCK_SIZE_BYTES_1PCT"
+  elif [[ "$selectivity_pct" == "10" ]]; then
+    fid_block_size_bytes="$FID_BLOCK_SIZE_BYTES_10PCT"
+    tb_block_size_bytes="$TB_BLOCK_SIZE_BYTES_10PCT"
+  else
+    fid_block_size_bytes="$FID_BLOCK_SIZE_BYTES_1PCT"
+    tb_block_size_bytes="$TB_BLOCK_SIZE_BYTES_1PCT"
+  fi
   local iaa_engine_profile=""
   case "$method" in
     compass_iaa_1) iaa_engine_profile="1" ;;
@@ -1022,11 +1087,11 @@ run_single() {
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
       )
-      if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
-        cmd+=(--fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES")
+      if [[ -n "$fid_block_size_bytes" ]]; then
+        cmd+=(--fid-block-size-bytes "$fid_block_size_bytes")
       fi
-      if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
-        cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
+      if [[ -n "$tb_block_size_bytes" ]]; then
+        cmd+=(--tb-block-size-bytes "$tb_block_size_bytes")
       fi
       ;;
     compass_iaa|compass_iaa_1|compass_iaa_2|compass_iaa_4|compass_iaa_8)
@@ -1043,11 +1108,11 @@ run_single() {
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
       )
-      if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
-        cmd+=(--fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES")
+      if [[ -n "$fid_block_size_bytes" ]]; then
+        cmd+=(--fid-block-size-bytes "$fid_block_size_bytes")
       fi
-      if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
-        cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
+      if [[ -n "$tb_block_size_bytes" ]]; then
+        cmd+=(--tb-block-size-bytes "$tb_block_size_bytes")
       fi
       ;;
     acorn)
@@ -1083,7 +1148,14 @@ run_single() {
     postfilter_value_out="$postfilter_max_candidates"
   fi
 
-  if "${cmd[@]}" > "$log_path" 2>&1; then
+  local -a run_cmd
+  if [[ -n "$CPU_PIN_CORE" ]]; then
+    run_cmd=(taskset -c "$CPU_PIN_CORE" "${cmd[@]}")
+  else
+    run_cmd=("${cmd[@]}")
+  fi
+
+  if "${run_cmd[@]}" > "$log_path" 2>&1; then
     queries_executed="$(extract_summary_value "queries_executed" "$summary_path" || true)"
     recall="$(extract_summary_value "average_recall_at_k" "$summary_path" || true)"
     qps="$(extract_summary_value "qps" "$summary_path" || true)"
@@ -1145,10 +1217,18 @@ run_selectivity() {
 
   local -n ef_values_ref="$ef_values_name"
 
-  local ef=""
   local method=""
-  for ef in "${ef_values_ref[@]}"; do
-    for method in "${METHODS[@]}"; do
+  local ef=""
+  for method in "${METHODS[@]}"; do
+    local -a method_ef_values=("${ef_values_ref[@]}")
+    if [[ "$method" == "acorn" ]]; then
+      if [[ "$selectivity_pct" == "1" ]]; then
+        method_ef_values=("${ACORN_EF_VALUES_1PCT[@]}")
+      else
+        method_ef_values=("${ACORN_EF_VALUES_10PCT[@]}")
+      fi
+    fi
+    for ef in "${method_ef_values[@]}"; do
       echo "[RANGE_EXPECT] sel=${selectivity_pct}% method=${method} ef=${ef} field=${map_field} buckets=${map_bucket_low}..${map_bucket_high} bucket_size=${map_bucket_size} count=${map_bucket_count} fid_matches=${map_fid_match} fid_missing=${map_fid_missing}"
       if [[ "$method" == "post_filter_hnsw" ]]; then
         local postfilter_max_candidates=""
@@ -1191,6 +1271,8 @@ echo "    10% -> $ACORN_INDEX_10PCT"
 echo "  k: $K"
 echo "  ef list (1%): ${EF_VALUES_1PCT[*]}"
 echo "  ef list (10%): ${EF_VALUES_10PCT[*]}"
+echo "  acorn ef list (1%): ${ACORN_EF_VALUES_1PCT[*]}"
+echo "  acorn ef list (10%): ${ACORN_EF_VALUES_10PCT[*]}"
 echo "  postfilter max-candidates list: ${POSTFILTER_MAX_VALUES[*]}"
 echo "  in_search_filter_hnsw postfilter-max-candidates: $POSTFILTER_MAX_CANDIDATES"
 echo "  num-queries: $NUM_QUERIES"
@@ -1198,6 +1280,8 @@ echo "  filter input (1%): $FILTER_EXPR_1PCT"
 echo "  filter normalized (1%): $NORM_FILTER_1PCT"
 echo "  filter input (10%): $FILTER_EXPR_10PCT"
 echo "  filter normalized (10%): $NORM_FILTER_10PCT"
+echo "  fid/tb block size (1%): $FID_BLOCK_SIZE_BYTES_1PCT / $TB_BLOCK_SIZE_BYTES_1PCT"
+echo "  fid/tb block size (10%): $FID_BLOCK_SIZE_BYTES_10PCT / $TB_BLOCK_SIZE_BYTES_10PCT"
 echo "  methods: ${METHODS[*]}"
 if [[ "$REQUIRE_IAA_PROFILE" -eq 1 ]]; then
   echo "  iaa engine profiles: ${IAA_ENGINE_VALUES[*]}"
@@ -1209,6 +1293,11 @@ if [[ "$REQUIRE_IAA_PROFILE" -eq 1 && "$SKIP_IAA_CONFIG" -eq 0 ]]; then
 fi
 echo "  out-dir: $OUT_DIR"
 echo "  clean out-dir: $CLEAN_OUT_DIR"
+if [[ -n "$CPU_PIN_CORE" ]]; then
+  echo "  cpu pin core: $CPU_PIN_CORE"
+else
+  echo "  cpu pin core: disabled"
+fi
 
 run_selectivity \
   "1" \

@@ -16,6 +16,8 @@ Usage:
     [--out-dir <path>] \
     [--postfilter-max-candidates <int>] \
     [--postfilter-max-candidates-list <comma-separated>] \
+    [--iaa-ab-compare|--no-iaa-ab-compare] \
+    [--skip-iaa-config|--no-skip-iaa-config] \
     [--build|--no-build] \
     [--plot|--no-plot]
 
@@ -29,6 +31,8 @@ Core defaults:
   --out-dir                     <this_dir>/out/filter_method_compare
   --postfilter-max-candidates   3000 (in_search_filter_hnsw)
   --postfilter-max-candidates-list 500,1000,1500,2000 (post_filter_hnsw sweep)
+  --iaa-ab-compare              disabled (when enabled: run only async_8 vs grouping_8)
+  --skip-iaa-config             disabled
   --fid-block-size-bytes        8192*8 (65536)
   --tb-block-size-bytes         8192*128 (1048576)
   --build                       enabled
@@ -101,6 +105,8 @@ EF_LIST="32,64,96,128,160,200"
 EF_LIST_1PCT=""
 EF_LIST_10PCT=""
 EF_LIST_SET_BY_USER=0
+ACORN_EF_LIST_1PCT="24,32,48,64"
+ACORN_EF_LIST_10PCT="16,24,32,48,64"
 NUM_QUERIES=10
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 POSTFILTER_MAX_CANDIDATES=3000
@@ -109,6 +115,8 @@ POSTFILTER_MAX_CANDIDATES_LIST="500,1000,1500,2000"
 POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=0
 DO_BUILD=1
 DO_PLOT=1
+IAA_AB_COMPARE=0
+SKIP_IAA_CONFIG=0
 FILTER_EXPR='synthetic_id_bucket == 255'
 FILTER_EXPR_SET_BY_USER=0
 FILTER_EXPR_1PCT=""
@@ -125,6 +133,7 @@ IAA_CONFIG_DIR="/home/jykang5/compass/scripts/iaa"
 IAA_DEVICE_OWNER="jykang5"
 FID_BLOCK_SIZE_BYTES="$((1024*128))"
 TB_BLOCK_SIZE_BYTES="$((1024*128))"
+CPU_PIN_CORE="0"
 CURRENT_IAA_ENGINE_PROFILE=""
 SUDO_KEEPALIVE_PID=""
 
@@ -181,6 +190,22 @@ while [[ $# -gt 0 ]]; do
       POSTFILTER_MAX_CANDIDATES_LIST="$2"
       POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=1
       shift 2
+      ;;
+    --iaa-ab-compare)
+      IAA_AB_COMPARE=1
+      shift
+      ;;
+    --no-iaa-ab-compare)
+      IAA_AB_COMPARE=0
+      shift
+      ;;
+    --skip-iaa-config)
+      SKIP_IAA_CONFIG=1
+      shift
+      ;;
+    --no-skip-iaa-config)
+      SKIP_IAA_CONFIG=0
+      shift
       ;;
     --build)
       DO_BUILD=1
@@ -303,7 +328,8 @@ fi
 
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
 LZ4_RUN="$SCRIPT_DIR/compass_search_w_lz4_grouping.run"
-IAA_RUN="$SCRIPT_DIR/compass_search_w_iaa_async_grouping.run"
+IAA_GROUPING_RUN="$SCRIPT_DIR/compass_search_w_iaa_async_grouping.run"
+IAA_ASYNC_RUN="$SCRIPT_DIR/compass_search_w_iaa_async.run"
 ACORN_RUN="$SCRIPT_DIR/acorn_search.run"
 PLOT_PY="$SCRIPT_DIR/../plot_qps_recall.py"
 
@@ -380,7 +406,10 @@ fi
 
 ensure_executable_file "$HNSW_RUN" "hnswlib_filter_search.run is missing or not executable"
 ensure_executable_file "$LZ4_RUN" "compass_search_w_lz4_grouping.run is missing or not executable"
-ensure_executable_file "$IAA_RUN" "compass_search_w_iaa_async_grouping.run is missing or not executable"
+ensure_executable_file "$IAA_GROUPING_RUN" "compass_search_w_iaa_async_grouping.run is missing or not executable"
+if [[ "$IAA_AB_COMPARE" -eq 1 ]]; then
+  ensure_executable_file "$IAA_ASYNC_RUN" "compass_search_w_iaa_async.run is missing or not executable"
+fi
 ensure_executable_file "$ACORN_RUN" "acorn_search.run is missing or not executable"
 ensure_readable_file "$GRAPH_PATH" "graph file not found"
 ensure_readable_file "$QUERY_PATH" "query file not found"
@@ -391,14 +420,19 @@ ensure_readable_file "$ACORN_INDEX_10PCT" "ACORN 10% index file not found"
 if [[ "$HNSW_DATASET_TYPE" != "sift" ]]; then
   ensure_readable_file "$PAYLOAD_JSONL" "payload JSONL is required for non-sift hnsw baseline"
 fi
-for iaa_engines in 1 2 4 8; do
-  ensure_readable_file \
-    "$IAA_CONFIG_DIR/configure_iaa_user_${iaa_engines}.sh" \
-    "IAA config script not found for ${iaa_engines} engine(s)"
-done
+if [[ "$SKIP_IAA_CONFIG" -eq 0 ]]; then
+  for iaa_engines in 1 2 4 8; do
+    ensure_readable_file \
+      "$IAA_CONFIG_DIR/configure_iaa_user_${iaa_engines}.sh" \
+      "IAA config script not found for ${iaa_engines} engine(s)"
+  done
+fi
 
 configure_iaa_profile() {
   local engine_count="$1"
+  if [[ "$SKIP_IAA_CONFIG" -eq 1 ]]; then
+    return
+  fi
   local cfg_script="$IAA_CONFIG_DIR/configure_iaa_user_${engine_count}.sh"
   if [[ "$CURRENT_IAA_ENGINE_PROFILE" == "$engine_count" ]]; then
     return
@@ -441,7 +475,9 @@ stop_sudo_keepalive() {
 
 trap stop_sudo_keepalive EXIT
 
-start_sudo_keepalive
+if [[ "$SKIP_IAA_CONFIG" -eq 0 ]]; then
+  start_sudo_keepalive
+fi
 
 parse_ef_list_into_array() {
   local ef_list="$1"
@@ -514,6 +550,8 @@ EFFECTIVE_EF_LIST_10PCT="${EF_LIST_10PCT:-$EF_LIST}"
 
 parse_ef_list_into_array "$EFFECTIVE_EF_LIST_1PCT" "--ef-list-1pct" EF_VALUES_1PCT
 parse_ef_list_into_array "$EFFECTIVE_EF_LIST_10PCT" "--ef-list-10pct" EF_VALUES_10PCT
+parse_ef_list_into_array "$ACORN_EF_LIST_1PCT" "--acorn-ef-list-1pct" ACORN_EF_VALUES_1PCT
+parse_ef_list_into_array "$ACORN_EF_LIST_10PCT" "--acorn-ef-list-10pct" ACORN_EF_VALUES_10PCT
 parse_positive_int_list_into_array \
   "$POSTFILTER_MAX_CANDIDATES_LIST" \
   "--postfilter-max-candidates-list" \
@@ -677,6 +715,8 @@ run_single() {
     compass_iaa_2) iaa_engine_profile="2" ;;
     compass_iaa_4) iaa_engine_profile="4" ;;
     compass_iaa_8) iaa_engine_profile="8" ;;
+    compass_iaa_async_8) iaa_engine_profile="8" ;;
+    compass_iaa_grouping_8) iaa_engine_profile="8" ;;
   esac
   if [[ -n "$iaa_engine_profile" ]]; then
     configure_iaa_profile "$iaa_engine_profile"
@@ -746,7 +786,47 @@ run_single() {
       ;;
     compass_iaa|compass_iaa_1|compass_iaa_2|compass_iaa_4|compass_iaa_8)
       cmd=(
-        "$IAA_RUN"
+        "$IAA_GROUPING_RUN"
+        --dataset-type "$IAA_DATASET_TYPE"
+        --graph "$GRAPH_PATH"
+        --query "$QUERY_PATH"
+        --k "$K"
+        --ef "$ef"
+        --filter "$filter_expr"
+        --fidtb-manifest "$manifest_path"
+        --num-queries "$NUM_QUERIES"
+        --summary-out "$summary_path"
+      )
+      if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES")
+      fi
+      if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
+      fi
+      ;;
+    compass_iaa_async_8)
+      cmd=(
+        "$IAA_ASYNC_RUN"
+        --dataset-type "$IAA_DATASET_TYPE"
+        --graph "$GRAPH_PATH"
+        --query "$QUERY_PATH"
+        --k "$K"
+        --ef "$ef"
+        --filter "$filter_expr"
+        --fidtb-manifest "$manifest_path"
+        --num-queries "$NUM_QUERIES"
+        --summary-out "$summary_path"
+      )
+      if [[ -n "$FID_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--fid-block-size-bytes "$FID_BLOCK_SIZE_BYTES")
+      fi
+      if [[ -n "$TB_BLOCK_SIZE_BYTES" ]]; then
+        cmd+=(--tb-block-size-bytes "$TB_BLOCK_SIZE_BYTES")
+      fi
+      ;;
+    compass_iaa_grouping_8)
+      cmd=(
+        "$IAA_GROUPING_RUN"
         --dataset-type "$IAA_DATASET_TYPE"
         --graph "$GRAPH_PATH"
         --query "$QUERY_PATH"
@@ -801,7 +881,14 @@ run_single() {
     postfilter_value_out="$postfilter_max_candidates"
   fi
 
-  if "${cmd[@]}" > "$log_path" 2>&1; then
+  local -a run_cmd
+  if [[ -n "$CPU_PIN_CORE" ]]; then
+    run_cmd=(taskset -c "$CPU_PIN_CORE" "${cmd[@]}")
+  else
+    run_cmd=("${cmd[@]}")
+  fi
+
+  if "${run_cmd[@]}" > "$log_path" 2>&1; then
     queries_executed="$(extract_summary_value "queries_executed" "$summary_path" || true)"
     recall="$(extract_summary_value "average_recall_at_k" "$summary_path" || true)"
     qps="$(extract_summary_value "qps" "$summary_path" || true)"
@@ -856,20 +943,37 @@ run_selectivity() {
   local ef_values_name="$7"
   local -n ef_values_ref="$ef_values_name"
 
-  local methods=(
-    "post_filter_hnsw"
-    "in_search_filter_hnsw"
-    "acorn"
-    "compass_lz4"
-    "compass_iaa_1"
-    "compass_iaa_2"
-    "compass_iaa_4"
-    "compass_iaa_8"
-  )
+  local methods=()
+  if [[ "$IAA_AB_COMPARE" -eq 1 ]]; then
+    methods=(
+      "compass_iaa_async_8"
+      "compass_iaa_grouping_8"
+    )
+  else
+    methods=(
+      "post_filter_hnsw"
+      "in_search_filter_hnsw"
+      "acorn"
+      "compass_lz4"
+      "compass_iaa_1"
+      "compass_iaa_2"
+      "compass_iaa_4"
+      "compass_iaa_8"
+    )
+  fi
 
   for method in "${methods[@]}"; do
+    local -a method_ef_values=("${ef_values_ref[@]}")
+    if [[ "$method" == "acorn" ]]; then
+      if [[ "$selectivity_pct" == "1" ]]; then
+        method_ef_values=("${ACORN_EF_VALUES_1PCT[@]}")
+      else
+        method_ef_values=("${ACORN_EF_VALUES_10PCT[@]}")
+      fi
+    fi
+
     if [[ "$method" == "post_filter_hnsw" ]]; then
-      for ef in "${ef_values_ref[@]}"; do
+      for ef in "${method_ef_values[@]}"; do
         for postfilter_max_candidates in "${POSTFILTER_MAX_VALUES[@]}"; do
           run_single \
             "$method" \
@@ -886,7 +990,7 @@ run_selectivity() {
       continue
     fi
 
-    for ef in "${ef_values_ref[@]}"; do
+    for ef in "${method_ef_values[@]}"; do
       run_single \
         "$method" \
         "$selectivity_pct" \
@@ -899,6 +1003,108 @@ run_selectivity() {
         "$POSTFILTER_MAX_CANDIDATES"
     done
   done
+}
+
+build_iaa_ab_delta_report() {
+  local merged_csv="$1"
+  local out_csv="$2"
+  local out_summary="$3"
+
+  python3 - "$merged_csv" "$out_csv" "$out_summary" <<'PY'
+import csv
+import statistics
+import sys
+
+merged_csv, out_csv, out_summary = sys.argv[1], sys.argv[2], sys.argv[3]
+
+ASYNC_METHOD = "compass_iaa_async_8"
+GROUPING_METHOD = "compass_iaa_grouping_8"
+
+paired = {}
+with open(merged_csv, "r", encoding="utf-8") as f:
+    reader = csv.DictReader(f)
+    for row in reader:
+        method = row.get("method", "")
+        if method not in (ASYNC_METHOD, GROUPING_METHOD):
+            continue
+        if row.get("status", "") != "OK":
+            continue
+        try:
+            sel = row["selectivity_pct"]
+            ef = int(float(row["ef"]))
+            qps = float(row["qps"])
+            recall = float(row["recall"])
+        except Exception:
+            continue
+        key = (sel, ef)
+        if key not in paired:
+            paired[key] = {"dataset": row.get("dataset", ""), ASYNC_METHOD: None, GROUPING_METHOD: None}
+        paired[key][method] = {"qps": qps, "recall": recall}
+
+rows_out = []
+for (sel, ef), info in sorted(paired.items(), key=lambda kv: (int(kv[0][0]), kv[0][1])):
+    a = info.get(ASYNC_METHOD)
+    g = info.get(GROUPING_METHOD)
+    if a is None or g is None:
+        continue
+    delta_abs = g["qps"] - a["qps"]
+    delta_pct = (delta_abs / a["qps"] * 100.0) if a["qps"] != 0 else 0.0
+    recall_delta = g["recall"] - a["recall"]
+    rows_out.append({
+        "dataset": info.get("dataset", ""),
+        "selectivity_pct": sel,
+        "ef": ef,
+        "qps_async": a["qps"],
+        "qps_grouping": g["qps"],
+        "delta_abs": delta_abs,
+        "delta_pct": delta_pct,
+        "recall_async": a["recall"],
+        "recall_grouping": g["recall"],
+        "recall_delta": recall_delta,
+    })
+
+fieldnames = [
+    "dataset",
+    "selectivity_pct",
+    "ef",
+    "qps_async",
+    "qps_grouping",
+    "delta_abs",
+    "delta_pct",
+    "recall_async",
+    "recall_grouping",
+    "recall_delta",
+]
+with open(out_csv, "w", newline="", encoding="utf-8") as f:
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows_out:
+        writer.writerow(r)
+
+sel_to_deltas = {}
+for r in rows_out:
+    sel_to_deltas.setdefault(r["selectivity_pct"], []).append(r)
+
+lines = []
+lines.append("IAA grouping delta summary")
+lines.append(f"rows_compared: {len(rows_out)}")
+for sel in sorted(sel_to_deltas.keys(), key=lambda x: int(x)):
+    rows = sel_to_deltas[sel]
+    qps_deltas = [r["delta_abs"] for r in rows]
+    pct_deltas = [r["delta_pct"] for r in rows]
+    best = max(rows, key=lambda r: r["delta_abs"])
+    worst = min(rows, key=lambda r: r["delta_abs"])
+    lines.append(f"selectivity_{sel}pct_rows: {len(rows)}")
+    lines.append(f"selectivity_{sel}pct_delta_abs_mean: {statistics.fmean(qps_deltas):.6f}")
+    lines.append(f"selectivity_{sel}pct_delta_abs_median: {statistics.median(qps_deltas):.6f}")
+    lines.append(f"selectivity_{sel}pct_delta_pct_mean: {statistics.fmean(pct_deltas):.6f}")
+    lines.append(f"selectivity_{sel}pct_delta_pct_median: {statistics.median(pct_deltas):.6f}")
+    lines.append(f"selectivity_{sel}pct_best_ef: {best['ef']} (delta_abs={best['delta_abs']:.6f}, delta_pct={best['delta_pct']:.6f})")
+    lines.append(f"selectivity_{sel}pct_worst_ef: {worst['ef']} (delta_abs={worst['delta_abs']:.6f}, delta_pct={worst['delta_pct']:.6f})")
+
+with open(out_summary, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+PY
 }
 
 echo "Running filter benchmark comparison"
@@ -914,13 +1120,21 @@ echo "    10% -> $ACORN_INDEX_10PCT"
 echo "  k: $K"
 echo "  ef list (1%): ${EF_VALUES_1PCT[*]}"
 echo "  ef list (10%): ${EF_VALUES_10PCT[*]}"
+echo "  acorn ef list (1%): ${ACORN_EF_VALUES_1PCT[*]}"
+echo "  acorn ef list (10%): ${ACORN_EF_VALUES_10PCT[*]}"
 echo "  postfilter max-candidates list: ${POSTFILTER_MAX_VALUES[*]}"
 echo "  in_search_filter_hnsw postfilter-max-candidates: $POSTFILTER_MAX_CANDIDATES"
+echo "  iaa-ab-compare: $IAA_AB_COMPARE"
+if [[ "$IAA_AB_COMPARE" -eq 1 ]]; then
+  echo "  iaa methods (A/B): compass_iaa_async_8 vs compass_iaa_grouping_8"
+fi
 echo "  num-queries: $NUM_QUERIES"
 echo "  filter (1%): $EFFECTIVE_FILTER_EXPR_1PCT"
 echo "  filter (10%): $EFFECTIVE_FILTER_EXPR_10PCT"
 echo "  iaa config dir: $IAA_CONFIG_DIR"
 echo "  iaa device owner: $IAA_DEVICE_OWNER"
+echo "  skip-iaa-config: $SKIP_IAA_CONFIG"
+echo "  cpu pin core: $CPU_PIN_CORE"
 echo "  out-dir: $OUT_DIR"
 
 run_selectivity "1" "$MANIFEST_1PCT" "$META_1PCT" "$ACORN_INDEX_1PCT" "$RESULTS_1PCT" "$EFFECTIVE_FILTER_EXPR_1PCT" EF_VALUES_1PCT
@@ -929,10 +1143,20 @@ run_selectivity "10" "$MANIFEST_10PCT" "$META_10PCT" "$ACORN_INDEX_10PCT" "$RESU
 cat "$RESULTS_1PCT" > "$RESULTS_MERGED"
 tail -n +2 "$RESULTS_10PCT" >> "$RESULTS_MERGED"
 
+if [[ "$IAA_AB_COMPARE" -eq 1 ]]; then
+  IAA_AB_DELTA_CSV="$OUT_DIR/iaa_grouping_delta.csv"
+  IAA_AB_DELTA_SUMMARY="$OUT_DIR/iaa_grouping_delta_summary.txt"
+  build_iaa_ab_delta_report "$RESULTS_MERGED" "$IAA_AB_DELTA_CSV" "$IAA_AB_DELTA_SUMMARY"
+fi
+
 echo "Done benchmarking"
 echo "  $RESULTS_1PCT"
 echo "  $RESULTS_10PCT"
 echo "  $RESULTS_MERGED"
+if [[ "$IAA_AB_COMPARE" -eq 1 ]]; then
+  echo "  $IAA_AB_DELTA_CSV"
+  echo "  $IAA_AB_DELTA_SUMMARY"
+fi
 
 if [[ "$DO_PLOT" -eq 1 ]]; then
   ensure_readable_file "$PLOT_PY" "plot script not found"

@@ -34,6 +34,9 @@ using filter_search_io::MetadataTable;
 using filter_search_io::VecFileInfo;
 
 namespace {
+
+constexpr bool kMeasureInSearchStats = false;
+
 constexpr size_t kDefaultLz4FidBlockSizeBytes = 8192 * 8;
 constexpr size_t kDefaultLz4TbBlockSizeBytes = 8192 * 128;
 
@@ -1620,11 +1623,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     auto timed_eval = [&](bool traversal_mode, size_t node_id) -> bool {
         bool allowed = false;
         if (traversal_mode) {
-            allowed = engine.allow_traversal(node_id, cache, &call_stats->decomp);
+            allowed = engine.allow_traversal(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         } else {
-            allowed = engine.allow_result(node_id, cache, &call_stats->decomp);
+            allowed = engine.allow_result(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         }
-        ++call_stats->filter_eval_calls;
+        if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
         return allowed;
     };
 
@@ -1762,9 +1765,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
     }
 
     // Decompress TB blocks after upper-layer traversal, before level-0 expansion.
-    prefetch_tb_blocks(runtime, cache, &call_stats->decomp);
-    call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
-    call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
+    prefetch_tb_blocks(runtime, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+    if (kMeasureInSearchStats) call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
+    if (kMeasureInSearchStats) call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
@@ -1823,8 +1826,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 continue;
             }
             pending_fid_block_marks[fid_block_id] = static_cast<uint8_t>(0);
-            prefetch_fid_block(runtime, fid_block_id, cache, &call_stats->decomp);
-            ++call_stats->fid_blocks_submitted;
+            prefetch_fid_block(runtime, fid_block_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            if (kMeasureInSearchStats) ++call_stats->fid_blocks_submitted;
         }
         pending_fid_blocks_to_submit.clear();
         return true;
@@ -1834,16 +1837,16 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         if (temp_result_buffer.empty()) {
             return;
         }
-        ++call_stats->deferred_retry_rounds;
+        if (kMeasureInSearchStats) ++call_stats->deferred_retry_rounds;
         next_temp_result_buffer.clear();
         for (const FrontierCandidate& entry : temp_result_buffer) {
             if (!entry.need_fid) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 push_result_candidate_if_allowed(entry);
                 continue;
             }
             if (entry.fid_block_id >= cache->fid_ready.size()) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 continue;
             }
             if (cache->fid_ready[entry.fid_block_id] == 0) {
@@ -1851,9 +1854,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 continue;
             }
             const bool fid_match =
-                fid_match_node(runtime, cache, static_cast<size_t>(entry.candidate_id), &call_stats->decomp);
-            ++call_stats->filter_eval_calls;
-            ++call_stats->fid_ready_candidates;
+                fid_match_node(runtime, cache, static_cast<size_t>(entry.candidate_id), (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
+            if (kMeasureInSearchStats) ++call_stats->fid_ready_candidates;
             if (fid_match) {
                 push_result_candidate_if_allowed(entry);
             }
@@ -1924,13 +1927,13 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         frontier_candidates.clear();
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
-            const bool tb_match = tb_match_node(runtime, cache, static_cast<size_t>(candidate_id), &call_stats->decomp);
-            ++call_stats->filter_eval_calls;
+            const bool tb_match = tb_match_node(runtime, cache, static_cast<size_t>(candidate_id), (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
             if (!tb_match) {
-                ++call_stats->neighbors_tb_rejected;
+                if (kMeasureInSearchStats) ++call_stats->neighbors_tb_rejected;
                 continue;
             }
-            ++call_stats->neighbors_tb_passed;
+            if (kMeasureInSearchStats) ++call_stats->neighbors_tb_passed;
 
             FrontierCandidate entry;
             entry.candidate_id = candidate_id;
@@ -1968,23 +1971,23 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
         for (const FrontierCandidate& entry : frontier_candidates) {
             const bool consider = (top_candidates.size() < ef || lower_bound > entry.dist);
             if (!consider) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 continue;
             }
 
             candidate_set.emplace(-entry.dist, entry.candidate_id);
 
             if (!entry.need_fid) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 push_result_candidate_if_allowed(entry);
                 continue;
             }
 
             if (entry.fid_block_id < cache->fid_ready.size() && cache->fid_ready[entry.fid_block_id] != 0) {
                 const bool fid_match =
-                    fid_match_node(runtime, cache, static_cast<size_t>(entry.candidate_id), &call_stats->decomp);
-                ++call_stats->filter_eval_calls;
-                ++call_stats->fid_ready_candidates;
+                    fid_match_node(runtime, cache, static_cast<size_t>(entry.candidate_id), (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->fid_ready_candidates;
                 if (fid_match) {
                     push_result_candidate_if_allowed(entry);
                 }
@@ -1992,7 +1995,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             }
 
             temp_result_buffer.push_back(entry);
-            ++call_stats->deferred_candidates_enqueued;
+            if (kMeasureInSearchStats) ++call_stats->deferred_candidates_enqueued;
         }
 
         // Stage 5: re-check temporary buffer after newly decompressed FID blocks.

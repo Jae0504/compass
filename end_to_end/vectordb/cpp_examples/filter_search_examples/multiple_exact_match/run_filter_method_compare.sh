@@ -225,6 +225,8 @@ K=10
 EF_LIST="64,96,128,160,200"
 EF_LIST_1PCT="32, 48, 64, 96"
 EF_LIST_10PCT="32, 48, 64, 96, 128, 160, 200"
+ACORN_EF_LIST_1PCT="24,32,48,64"
+ACORN_EF_LIST_10PCT="8,16,24,64"
 NUM_QUERIES=20
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 POSTFILTER_MAX_CANDIDATES=3000
@@ -245,6 +247,7 @@ ACORN_INDEX_10PCT=""
 PAYLOAD_JSONL=""
 FID_BLOCK_SIZE_BYTES="$((1024 * 8))"
 TB_BLOCK_SIZE_BYTES="$((1024 * 128))"
+CPU_PIN_CORE="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -460,8 +463,12 @@ fi
 
 parse_ef_list_into_array "$EF_LIST_1PCT" "ef-list-1pct" EF_VALUES_1PCT_STR
 parse_ef_list_into_array "$EF_LIST_10PCT" "ef-list-10pct" EF_VALUES_10PCT_STR
+parse_ef_list_into_array "$ACORN_EF_LIST_1PCT" "acorn-ef-list-1pct" ACORN_EF_VALUES_1PCT_STR
+parse_ef_list_into_array "$ACORN_EF_LIST_10PCT" "acorn-ef-list-10pct" ACORN_EF_VALUES_10PCT_STR
 IFS=' ' read -r -a EF_VALUES_1PCT <<< "$EF_VALUES_1PCT_STR"
 IFS=' ' read -r -a EF_VALUES_10PCT <<< "$EF_VALUES_10PCT_STR"
+IFS=' ' read -r -a ACORN_EF_VALUES_1PCT <<< "$ACORN_EF_VALUES_1PCT_STR"
+IFS=' ' read -r -a ACORN_EF_VALUES_10PCT <<< "$ACORN_EF_VALUES_10PCT_STR"
 
 RESULTS_1PCT="$OUT_DIR/results_1pct.csv"
 RESULTS_10PCT="$OUT_DIR/results_10pct.csv"
@@ -585,7 +592,14 @@ run_single() {
     postfilter_value_out="$POSTFILTER_MAX_CANDIDATES"
   fi
 
-  if "${cmd[@]}" > "$log_path" 2>&1; then
+  local -a run_cmd
+  if [[ -n "$CPU_PIN_CORE" ]]; then
+    run_cmd=(taskset -c "$CPU_PIN_CORE" "${cmd[@]}")
+  else
+    run_cmd=("${cmd[@]}")
+  fi
+
+  if "${run_cmd[@]}" > "$log_path" 2>&1; then
     queries_executed="$(extract_summary_value "queries_executed" "$summary_path" || true)"
     recall="$(extract_summary_value "average_recall_at_k" "$summary_path" || true)"
     qps="$(extract_summary_value "qps" "$summary_path" || true)"
@@ -640,7 +654,15 @@ run_scenario() {
   local -n ef_values_ref="$ef_values_name"
 
   for method in "${METHODS[@]}"; do
-    for ef in "${ef_values_ref[@]}"; do
+    local -a method_ef_values=("${ef_values_ref[@]}")
+    if [[ "$method" == "acorn" ]]; then
+      if [[ "$selectivity_pct" == "1" ]]; then
+        method_ef_values=("${ACORN_EF_VALUES_1PCT[@]}")
+      else
+        method_ef_values=("${ACORN_EF_VALUES_10PCT[@]}")
+      fi
+    fi
+    for ef in "${method_ef_values[@]}"; do
       run_single \
         "$method" \
         "$selectivity_pct" \
@@ -667,10 +689,13 @@ echo "  payload-jsonl: $PAYLOAD_JSONL"
 echo "  k: $K"
 echo "  ef list (1%): ${EF_VALUES_1PCT[*]}"
 echo "  ef list (10%): ${EF_VALUES_10PCT[*]}"
+echo "  acorn ef list (1%): ${ACORN_EF_VALUES_1PCT[*]}"
+echo "  acorn ef list (10%): ${ACORN_EF_VALUES_10PCT[*]}"
 echo "  postfilter-max-candidates: $POSTFILTER_MAX_CANDIDATES"
 echo "  num-queries: $NUM_QUERIES"
 echo "  filter (1%, AND): $FILTER_EXPR_AND"
 echo "  filter (10%, OR): $FILTER_EXPR_OR"
+echo "  cpu pin core: $CPU_PIN_CORE"
 echo "  out-dir: $OUT_DIR"
 
 run_scenario "1" "$MANIFEST_1PCT" "$ACORN_INDEX_1PCT" "$RESULTS_1PCT" "$FILTER_EXPR_AND" EF_VALUES_1PCT

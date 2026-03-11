@@ -33,6 +33,9 @@ using filter_search_io::VecFileInfo;
 
 namespace {
 
+constexpr bool kMeasureInSearchStats = false;
+
+
 struct Args {
     std::string dataset_type;
     std::string graph_path;
@@ -1286,11 +1289,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     auto timed_eval = [&](bool traversal_mode, size_t node_id) -> bool {
         bool allowed = false;
         if (traversal_mode) {
-            allowed = engine.allow_traversal(node_id, cache, &call_stats->decomp);
+            allowed = engine.allow_traversal(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         } else {
-            allowed = engine.allow_result(node_id, cache, &call_stats->decomp);
+            allowed = engine.allow_result(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         }
-        ++call_stats->filter_eval_calls;
+        if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
         return allowed;
     };
 
@@ -1413,9 +1416,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
     // TB is used as a permissive traversal prefilter before exact result gating.
     ring->flush();
     const auto tb_submit_start = std::chrono::steady_clock::now();
-    call_stats->tb_jobs_submitted +=
-        submit_tb_prefetch_jobs(ring, runtime, cache, &call_stats->decomp);
-    call_stats->tb_submit_time_ns += static_cast<uint64_t>(
+    if (kMeasureInSearchStats) call_stats->tb_jobs_submitted += submit_tb_prefetch_jobs(ring, runtime, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+    if (kMeasureInSearchStats) call_stats->tb_submit_time_ns += static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - tb_submit_start).count());
 
@@ -1454,17 +1456,17 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
             if (!ring->has_pending()) {
                 throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
             }
-            ++call_stats->job_wait_calls;
+            if (kMeasureInSearchStats) ++call_stats->job_wait_calls;
             const auto wait_start = std::chrono::steady_clock::now();
             ring->wait_one();
             const uint64_t wait_ns = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - wait_start).count());
-            call_stats->tb_prefetch_wait_ns += wait_ns;
-            call_stats->tb_wait_time_ns += wait_ns;
+            if (kMeasureInSearchStats) call_stats->tb_prefetch_wait_ns += wait_ns;
+            if (kMeasureInSearchStats) call_stats->tb_wait_time_ns += wait_ns;
         }
-        call_stats->tb_predicate_blocks_touched += leaf_cache.tb_predicate_blocks_touched;
-        call_stats->tb_predicate_output_bytes += leaf_cache.tb_predicate_output_bytes;
+        if (kMeasureInSearchStats) call_stats->tb_predicate_blocks_touched += leaf_cache.tb_predicate_blocks_touched;
+        if (kMeasureInSearchStats) call_stats->tb_predicate_output_bytes += leaf_cache.tb_predicate_output_bytes;
     }
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
@@ -1504,14 +1506,14 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
         if (!ring->has_pending()) {
             return 0;
         }
-        ++call_stats->job_poll_calls;
+        if (kMeasureInSearchStats) ++call_stats->job_poll_calls;
         const uint64_t completed = static_cast<uint64_t>(ring->poll_ready_jobs());
-        call_stats->job_poll_ready += completed;
+        if (kMeasureInSearchStats) call_stats->job_poll_ready += completed;
         return completed;
     };
 
     auto wait_one_job = [&]() {
-        ++call_stats->job_wait_calls;
+        if (kMeasureInSearchStats) ++call_stats->job_wait_calls;
         ring->wait_one();
     };
 
@@ -1536,8 +1538,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
             static_cast<size_t>(entry.candidate_id),
             runtime,
             cache,
-            &call_stats->decomp);
-        ++call_stats->filter_eval_calls;
+            (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+        if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
         return decision;
     };
 
@@ -1545,7 +1547,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
         if (temp_result_buffer.empty()) {
             return;
         }
-        ++call_stats->deferred_retry_rounds;
+        if (kMeasureInSearchStats) ++call_stats->deferred_retry_rounds;
         next_temp_result_buffer.clear();
         for (const FrontierCandidate& entry : temp_result_buffer) {
             const TwoLeafResultDecision decision = evaluate_result_entry(entry);
@@ -1554,7 +1556,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
                 continue;
             }
             if (!entry.deleted) {
-                ++call_stats->fid_ready_candidates;
+                if (kMeasureInSearchStats) ++call_stats->fid_ready_candidates;
             }
             if (decision.allowed) {
                 push_result_candidate_if_allowed(entry);
@@ -1640,15 +1642,15 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
                 runtime.leaves[0],
                 &cache->leaves[0],
                 node_id,
-                &call_stats->decomp);
+                (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
             const bool traversal_allowed =
                 traversal_left ||
                 traversal_leaf_match(
                     runtime.leaves[1],
                     &cache->leaves[1],
                     node_id,
-                    &call_stats->decomp);
-            ++call_stats->filter_eval_calls;
+                    (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
             if (!traversal_allowed) {
                 continue;
             }
@@ -1676,8 +1678,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
         }
 
         // Stage 3: submit async FID scans for this expansion (non-blocking).
-        call_stats->fid_jobs_submitted +=
-            submit_fid_scan_jobs(ring, runtime, blocks_by_leaf, cache, &call_stats->decomp);
+        if (kMeasureInSearchStats) call_stats->fid_jobs_submitted += submit_fid_scan_jobs(ring, runtime, blocks_by_leaf, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
 
         // Stage 4: compute distances for traversal-passed neighbors.
         for (FrontierCandidate& entry : frontier_candidates) {
@@ -1698,14 +1699,16 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
             const TwoLeafResultDecision decision = evaluate_result_entry(entry);
             if (!decision.decided) {
                 temp_result_buffer.push_back(entry);
-                call_stats->deferred_max_pending =
-                    std::max<uint64_t>(
-                        call_stats->deferred_max_pending,
-                        static_cast<uint64_t>(temp_result_buffer.size()));
+                if (kMeasureInSearchStats) {
+                    call_stats->deferred_max_pending =
+                        std::max<uint64_t>(
+                            call_stats->deferred_max_pending,
+                            static_cast<uint64_t>(temp_result_buffer.size()));
+                }
                 continue;
             }
             if (!entry.deleted) {
-                ++call_stats->fid_ready_candidates;
+                if (kMeasureInSearchStats) ++call_stats->fid_ready_candidates;
             }
             if (decision.allowed) {
                 push_result_candidate_if_allowed(entry);

@@ -33,6 +33,9 @@ using filter_search_io::VecFileInfo;
 
 namespace {
 
+constexpr bool kMeasureInSearchStats = false;
+
+
 struct Args {
     std::string dataset_type;
     std::string graph_path;
@@ -1172,11 +1175,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     auto timed_eval = [&](bool traversal_mode, size_t node_id) -> bool {
         bool allowed = false;
         if (traversal_mode) {
-            allowed = engine.allow_traversal(node_id, cache, &call_stats->decomp);
+            allowed = engine.allow_traversal(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         } else {
-            allowed = engine.allow_result(node_id, cache, &call_stats->decomp);
+            allowed = engine.allow_result(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         }
-        ++call_stats->filter_eval_calls;
+        if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
         return allowed;
     };
 
@@ -1292,7 +1295,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         throw std::runtime_error(
             "AsyncEqQueryCache must be fully preallocated before search");
     }
-    submit_tb_prefetch_jobs(ring, runtime, cache, &call_stats->decomp);
+    submit_tb_prefetch_jobs(ring, runtime, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
 
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
@@ -1324,8 +1327,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         }
         ring->wait_one();
     }
-    call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
-    call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
+    if (kMeasureInSearchStats) call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
+    if (kMeasureInSearchStats) call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
@@ -1361,8 +1364,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
     next_temp_result_buffer.reserve(index.maxM0_ * 4);
 
     auto poll_ready_jobs = [&]() {
-        ++call_stats->job_poll_calls;
-        call_stats->job_poll_ready += static_cast<uint64_t>(ring->poll_ready_jobs());
+        if (kMeasureInSearchStats) ++call_stats->job_poll_calls;
+        if (kMeasureInSearchStats) call_stats->job_poll_ready += static_cast<uint64_t>(ring->poll_ready_jobs());
     };
 
     auto submit_pending_fid_blocks = [&]() {
@@ -1374,7 +1377,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                 continue;
             }
             pending_fid_block_marks[fid_block_id] = static_cast<uint8_t>(0);
-            submit_fid_scan_job(ring, runtime, fid_block_id, cache, &call_stats->decomp);
+            submit_fid_scan_job(ring, runtime, fid_block_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         }
         pending_fid_blocks_to_submit.clear();
     };
@@ -1396,16 +1399,16 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         if (temp_result_buffer.empty()) {
             return;
         }
-        ++call_stats->deferred_retry_rounds;
+        if (kMeasureInSearchStats) ++call_stats->deferred_retry_rounds;
         next_temp_result_buffer.clear();
         for (const FrontierCandidate& entry : temp_result_buffer) {
             if (!entry.need_fid) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 push_result_candidate_if_allowed(entry);
                 continue;
             }
             if (entry.fid_block_id >= cache->fid_state.size()) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 continue;
             }
             if (cache->fid_state[entry.fid_block_id] != kFidStateReady) {
@@ -1417,8 +1420,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                 ring,
                 cache,
                 static_cast<size_t>(entry.candidate_id),
-                &call_stats->decomp);
-            ++call_stats->filter_eval_calls;
+                (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
             if (fid_match) {
                 push_result_candidate_if_allowed(entry);
             }
@@ -1515,9 +1518,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                 ring,
                 cache,
                 static_cast<size_t>(candidate_id),
-                &call_stats->decomp);
+                (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
             if (!tb_match) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 continue;
             }
 
@@ -1555,7 +1558,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         for (const FrontierCandidate& entry : frontier_candidates) {
             const bool consider = (top_candidates.size() < ef || lower_bound > entry.dist);
             if (!consider) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 continue;
             }
 
@@ -1563,7 +1566,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             candidate_set.emplace(-entry.dist, entry.candidate_id);
 
             if (!entry.need_fid) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 push_result_candidate_if_allowed(entry);
                 continue;
             }
@@ -1575,8 +1578,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                     ring,
                     cache,
                     static_cast<size_t>(entry.candidate_id),
-                    &call_stats->decomp);
-                ++call_stats->filter_eval_calls;
+                    (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 if (fid_match) {
                     push_result_candidate_if_allowed(entry);
                 }
@@ -1584,7 +1587,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             }
 
             temp_result_buffer.push_back(entry);
-            ++call_stats->deferred_candidates_enqueued;
+            if (kMeasureInSearchStats) ++call_stats->deferred_candidates_enqueued;
         }
 
         // Stage 5: non-blocking completion check for the jobs submitted this/previous rounds.

@@ -32,6 +32,9 @@ using filter_search_io::MetadataTable;
 using filter_search_io::VecFileInfo;
 
 namespace {
+
+constexpr bool kMeasureInSearchStats = false;
+
 constexpr size_t kDefaultLz4FidBlockSizeBytes = 8192 * 8;
 constexpr size_t kDefaultLz4TbBlockSizeBytes = 8192 * 128;
 
@@ -1184,11 +1187,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     auto timed_eval = [&](bool traversal_mode, size_t node_id) -> bool {
         bool allowed = false;
         if (traversal_mode) {
-            allowed = traversal_engine.allow_traversal(node_id, cache, &call_stats->decomp);
+            allowed = traversal_engine.allow_traversal(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         } else {
-            allowed = result_engine.allow_result(node_id, cache, &call_stats->decomp);
+            allowed = result_engine.allow_result(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         }
-        ++call_stats->filter_eval_calls;
+        if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
         return allowed;
     };
 
@@ -1337,9 +1340,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
 
     // Decompress TB blocks after upper-layer traversal, before level-0 expansion.
     for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
-        prefetch_tb_blocks(runtime.leaves[leaf_idx], &cache->leaves[leaf_idx], &call_stats->decomp);
-        call_stats->tb_predicate_blocks_touched += cache->leaves[leaf_idx].tb_predicate_blocks_touched;
-        call_stats->tb_predicate_output_bytes += cache->leaves[leaf_idx].tb_predicate_output_bytes;
+        prefetch_tb_blocks(runtime.leaves[leaf_idx], &cache->leaves[leaf_idx], (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+        if (kMeasureInSearchStats) call_stats->tb_predicate_blocks_touched += cache->leaves[leaf_idx].tb_predicate_blocks_touched;
+        if (kMeasureInSearchStats) call_stats->tb_predicate_output_bytes += cache->leaves[leaf_idx].tb_predicate_output_bytes;
     }
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
@@ -1391,7 +1394,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 return false;
             }
             // TB-only traversal gate for frontier expansion.
-            return tb_match_node(leaf, &leaf_cache, node_id, &call_stats->decomp);
+            return tb_match_node(leaf, &leaf_cache, node_id, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         };
 
         auto result_leaf_match = [&](size_t leaf_idx, size_t node_id) -> bool {
@@ -1402,9 +1405,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             }
             if (leaf.fid_storage.block_size != 0) {
                 const size_t fid_block_id = node_id / leaf.fid_storage.block_size;
-                prefetch_fid_block(leaf, fid_block_id, &leaf_cache, &call_stats->decomp);
+                prefetch_fid_block(leaf, fid_block_id, &leaf_cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
             }
-            return fid_match_node(leaf, &leaf_cache, node_id, &call_stats->decomp);
+            return fid_match_node(leaf, &leaf_cache, node_id, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         };
 
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
@@ -1412,7 +1415,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             const size_t node_id = static_cast<size_t>(candidate_id);
             const bool traversal_left = traversal_leaf_match(0, node_id);
             const bool traversal_allowed = traversal_left || traversal_leaf_match(1, node_id);
-            ++call_stats->filter_eval_calls;
+            if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
             if (!traversal_allowed) {
                 continue;
             }
@@ -1430,7 +1433,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                 const bool result_left = result_leaf_match(0, node_id);
                 result_allowed_by_predicate = result_left || result_leaf_match(1, node_id);
             }
-            ++call_stats->filter_eval_calls;
+            if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
 
             if (top_candidates.size() < ef || lower_bound > dist) {
                 candidate_set.emplace(-dist, candidate_id);

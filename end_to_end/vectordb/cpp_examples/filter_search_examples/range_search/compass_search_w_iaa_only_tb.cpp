@@ -36,6 +36,9 @@ using filter_search_io::VecFileInfo;
 
 namespace {
 
+constexpr bool kMeasureInSearchStats = false;
+
+
 struct Args {
     std::string dataset_type;
     std::string graph_path;
@@ -103,6 +106,9 @@ struct RunStats {
     uint64_t tb_bytes_decompressed = 0;
     uint64_t tb_predicate_blocks_touched = 0;
     uint64_t tb_predicate_output_bytes = 0;
+    uint64_t tb_submit_ns = 0;
+    uint64_t tb_wait_ns = 0;
+    uint64_t tb_wait_calls = 0;
     uint64_t neighbors_tb_passed = 0;
     uint64_t neighbors_tb_rejected = 0;
     uint64_t fid_ready_candidates = 0;
@@ -111,6 +117,9 @@ struct RunStats {
     uint64_t fid_jobs_submitted = 0;
     uint64_t job_poll_calls = 0;
     uint64_t job_poll_ready = 0;
+    uint64_t ensure_free_slot_wait_calls = 0;
+    uint64_t ensure_free_slot_wait_slots = 0;
+    uint64_t ensure_free_slot_wait_ns = 0;
 
     size_t returned_results = 0;
     size_t selectivity_count = 0;
@@ -141,6 +150,9 @@ struct SearchCallStats {
     uint64_t job_poll_ready = 0;
     uint64_t tb_predicate_blocks_touched = 0;
     uint64_t tb_predicate_output_bytes = 0;
+    uint64_t tb_submit_ns = 0;
+    uint64_t tb_wait_ns = 0;
+    uint64_t tb_wait_calls = 0;
 };
 
 struct CompressionStats {
@@ -181,6 +193,33 @@ double compression_pct_of_raw(uint64_t raw_bytes, uint64_t compressed_bytes) {
 
 size_t tb_bytes_per_bucket(size_t n_elements) {
     return (n_elements + 7u) / 8u;
+}
+
+template <typename Fn>
+void for_each_touched_tb_byte(
+    size_t span_offset,
+    size_t segment_len,
+    size_t bytes_per_bucket,
+    Fn&& fn) {
+    if (segment_len == 0 || bytes_per_bucket == 0) {
+        return;
+    }
+    if (segment_len >= bytes_per_bucket) {
+        for (size_t byte_idx = 0; byte_idx < bytes_per_bucket; ++byte_idx) {
+            fn(byte_idx);
+        }
+        return;
+    }
+
+    const size_t start = span_offset % bytes_per_bucket;
+    const size_t first_len = std::min(segment_len, bytes_per_bucket - start);
+    for (size_t i = 0; i < first_len; ++i) {
+        fn(start + i);
+    }
+    const size_t remain = segment_len - first_len;
+    for (size_t i = 0; i < remain; ++i) {
+        fn(i);
+    }
 }
 
 std::vector<uint8_t> reorder_tb_node_major_to_bucket_major(
@@ -496,6 +535,17 @@ struct AsyncRangeRuntime {
     uint32_t scan_high_u32 = std::numeric_limits<uint32_t>::max();
     uint64_t fid_baseline_raw_bytes = 0;
     uint64_t fid_baseline_compressed_bytes = 0;
+    struct TbJobPlan {
+        size_t block_id = 0;
+        uint32_t raw_len = 0;
+        uint32_t local_lo = 0;
+        uint32_t local_hi = 0;
+        size_t segment_len = 0;
+        size_t span_offset = 0;
+    };
+    std::vector<TbJobPlan> tb_job_plans;
+    std::vector<std::vector<uint32_t>> tb_blocks_by_byte;
+    std::vector<std::vector<uint32_t>> tb_bytes_by_block;
     std::vector<size_t> numeric_result_nodes;
     compass_iaa_filter::detail::IaaBlockStorage fid_storage;
     compass_iaa_filter::detail::IaaBlockStorage tb_storage;
@@ -514,6 +564,9 @@ struct AsyncRangeQueryCache {
     uint32_t tb_jobs_pending = 0;
     uint64_t tb_predicate_blocks_touched = 0;
     uint64_t tb_predicate_output_bytes = 0;
+    std::vector<uint8_t> tb_block_state;
+    std::vector<uint64_t> tb_block_tokens;
+    std::vector<uint16_t> tb_byte_pending_blocks;
     std::vector<FidScanBlock> fid_blocks;
     std::vector<uint8_t> fid_ready;
     std::vector<uint8_t> fid_state;
@@ -522,6 +575,9 @@ struct AsyncRangeQueryCache {
 constexpr uint8_t kFidStateNotSubmitted = 0;
 constexpr uint8_t kFidStateInflight = 1;
 constexpr uint8_t kFidStateReady = 2;
+constexpr uint8_t kTbStateNotSubmitted = 0;
+constexpr uint8_t kTbStateInflight = 1;
+constexpr uint8_t kTbStateReady = 2;
 
 std::optional<RangePredicateSpec> parse_single_numeric_range_predicate(
     const std::string& expression,
@@ -745,6 +801,7 @@ AsyncRangeRuntime build_async_range_runtime(
     runtime.nfilters = nfilters;
     runtime.missing_bucket = nfilters - 1;
     runtime.usable_bins = usable_bins;
+    runtime.tb_bytes_per_bucket = tb_bytes_per_bucket(manifest.n_elements);
     runtime.min_value = attr.min_value;
     runtime.max_value = attr.max_value;
     runtime.low = spec->low;
@@ -817,7 +874,66 @@ AsyncRangeRuntime build_async_range_runtime(
     runtime.bucket_low = static_cast<uint32_t>(bucket_lo);
     runtime.bucket_high = static_cast<uint32_t>(bucket_hi);
     runtime.tb_allowed_buckets = std::move(allowed_bucket_ids);
-    runtime.tb_bytes_per_bucket = tb_bytes_per_bucket(manifest.n_elements);
+    runtime.tb_job_plans.clear();
+    runtime.tb_blocks_by_byte.assign(runtime.tb_bytes_per_bucket, {});
+    runtime.tb_bytes_by_block.assign(runtime.tb_storage.block_count(), {});
+
+    if (runtime.tb_storage.block_size != 0 &&
+        runtime.tb_bytes_per_bucket != 0 &&
+        !runtime.tb_allowed_buckets.empty()) {
+        const uint16_t first_bucket = runtime.tb_allowed_buckets.front();
+        const uint16_t last_bucket = runtime.tb_allowed_buckets.back();
+        const size_t span_start = static_cast<size_t>(first_bucket) * runtime.tb_bytes_per_bucket;
+        const size_t span_end =
+            (static_cast<size_t>(last_bucket) + 1u) * runtime.tb_bytes_per_bucket;
+        if (span_start >= runtime.tb_storage.raw_size || span_end > runtime.tb_storage.raw_size) {
+            throw std::runtime_error("TB merged span is outside of reordered TB storage");
+        }
+
+        const size_t start_block = span_start / runtime.tb_storage.block_size;
+        const size_t end_block = (span_end - 1) / runtime.tb_storage.block_size;
+        runtime.tb_job_plans.reserve(end_block - start_block + 1);
+        for (size_t block_id = start_block; block_id <= end_block; ++block_id) {
+            if (block_id >= runtime.tb_storage.block_count()) {
+                throw std::runtime_error(
+                    "TB block id out of range while building runtime TB plans");
+            }
+            const uint32_t raw_len = runtime.tb_storage.raw_block_sizes[block_id];
+            if (raw_len == 0) {
+                continue;
+            }
+
+            const size_t block_base = block_id * runtime.tb_storage.block_size;
+            const size_t segment_start = std::max(span_start, block_base);
+            const size_t segment_end = std::min(
+                span_end,
+                block_base + static_cast<size_t>(raw_len));
+            if (segment_end <= segment_start) {
+                continue;
+            }
+
+            AsyncRangeRuntime::TbJobPlan plan;
+            plan.block_id = block_id;
+            plan.raw_len = raw_len;
+            plan.local_lo = static_cast<uint32_t>(segment_start - block_base);
+            plan.local_hi = static_cast<uint32_t>(segment_end - block_base - 1);
+            plan.segment_len = static_cast<size_t>(plan.local_hi - plan.local_lo + 1u);
+            plan.span_offset = segment_start - span_start;
+            runtime.tb_job_plans.push_back(plan);
+
+            std::vector<uint32_t>& bytes_for_block = runtime.tb_bytes_by_block[block_id];
+            for_each_touched_tb_byte(
+                plan.span_offset,
+                plan.segment_len,
+                runtime.tb_bytes_per_bucket,
+                [&](size_t byte_idx) {
+                    runtime.tb_blocks_by_byte[byte_idx].push_back(
+                        static_cast<uint32_t>(block_id));
+                    bytes_for_block.push_back(static_cast<uint32_t>(byte_idx));
+                });
+        }
+    }
+
     runtime.scan_low_u32 = runtime.low_bounded ? encode_numeric_to_u32(spec->low) : 0;
     runtime.scan_high_u32 =
         runtime.high_bounded ? encode_numeric_to_u32(spec->high) : std::numeric_limits<uint32_t>::max();
@@ -860,10 +976,9 @@ size_t max_raw_block_size(const compass_iaa_filter::detail::IaaBlockStorage& sto
 
 size_t required_async_job_output_bytes(const AsyncRangeRuntime& runtime) {
     const size_t max_fid = max_raw_block_size(runtime.fid_storage);
-    const size_t max_tb = std::max<size_t>(
-        1,
-        std::min(max_raw_block_size(runtime.tb_storage), runtime.tb_bytes_per_bucket));
-    return std::max<size_t>(1, std::max(max_fid, max_tb));
+    // TB extract can emit a full touched block segment for contiguous bucket ranges.
+    const size_t max_tb_extract = std::max<size_t>(1, max_raw_block_size(runtime.tb_storage));
+    return std::max<size_t>(1, std::max(max_fid, max_tb_extract));
 }
 
 CompressionStats compute_compression_stats(const AsyncRangeRuntime& runtime) {
@@ -884,6 +999,9 @@ AsyncRangeQueryCache make_preallocated_query_cache(const AsyncRangeRuntime& runt
     cache.tb_jobs_pending = 0;
     cache.tb_predicate_blocks_touched = 0;
     cache.tb_predicate_output_bytes = 0;
+    cache.tb_block_state.assign(runtime.tb_storage.block_count(), kTbStateNotSubmitted);
+    cache.tb_block_tokens.assign(runtime.tb_storage.block_count(), 0);
+    cache.tb_byte_pending_blocks.assign(runtime.tb_bytes_per_bucket, 0);
 
     const size_t fid_blocks = runtime.fid_storage.block_count();
     cache.fid_blocks.resize(fid_blocks);
@@ -908,6 +1026,9 @@ void reset_preallocated_query_cache(
         throw std::runtime_error("AsyncRangeQueryCache reset received null pointer");
     }
     if (cache->tb_query_mask.size() != runtime.tb_bytes_per_bucket ||
+        cache->tb_block_state.size() != runtime.tb_storage.block_count() ||
+        cache->tb_block_tokens.size() != runtime.tb_storage.block_count() ||
+        cache->tb_byte_pending_blocks.size() != runtime.tb_bytes_per_bucket ||
         cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
         cache->fid_ready.size() != runtime.fid_storage.block_count() ||
         cache->fid_state.size() != runtime.fid_storage.block_count()) {
@@ -919,6 +1040,9 @@ void reset_preallocated_query_cache(
     cache->tb_jobs_pending = 0;
     cache->tb_predicate_blocks_touched = 0;
     cache->tb_predicate_output_bytes = 0;
+    std::fill(cache->tb_block_state.begin(), cache->tb_block_state.end(), kTbStateNotSubmitted);
+    std::fill(cache->tb_block_tokens.begin(), cache->tb_block_tokens.end(), 0);
+    std::fill(cache->tb_byte_pending_blocks.begin(), cache->tb_byte_pending_blocks.end(), 0);
     std::fill(cache->fid_ready.begin(), cache->fid_ready.end(), static_cast<uint8_t>(0));
     std::fill(cache->fid_state.begin(), cache->fid_state.end(), kFidStateNotSubmitted);
     for (size_t block_id = 0; block_id < cache->fid_blocks.size(); ++block_id) {
@@ -938,7 +1062,7 @@ void prefault_query_cache_buffers(AsyncRangeQueryCache* cache) {
     volatile uint8_t sink = 0;
     constexpr size_t kPageBytes = 4096;
 
-    auto touch_vec = [&](std::vector<uint8_t>& vec) {
+    auto touch_vec_u8 = [&](std::vector<uint8_t>& vec) {
         if (vec.empty()) {
             return;
         }
@@ -948,17 +1072,37 @@ void prefault_query_cache_buffers(AsyncRangeQueryCache* cache) {
         sink ^= vec.back();
     };
 
-    touch_vec(cache->tb_query_mask);
-    touch_vec(cache->fid_ready);
-    touch_vec(cache->fid_state);
+    auto touch_vec_bytes = [&](const void* ptr, size_t bytes) {
+        if (ptr == nullptr || bytes == 0) {
+            return;
+        }
+        const uint8_t* p = static_cast<const uint8_t*>(ptr);
+        for (size_t i = 0; i < bytes; i += kPageBytes) {
+            sink ^= p[i];
+        }
+        sink ^= p[bytes - 1];
+    };
+
+    touch_vec_u8(cache->tb_query_mask);
+    touch_vec_u8(cache->tb_block_state);
+    touch_vec_u8(cache->fid_ready);
+    touch_vec_u8(cache->fid_state);
+    touch_vec_bytes(
+        cache->tb_byte_pending_blocks.data(),
+        cache->tb_byte_pending_blocks.size() * sizeof(uint16_t));
+    touch_vec_bytes(
+        cache->tb_block_tokens.data(),
+        cache->tb_block_tokens.size() * sizeof(uint64_t));
     for (FidScanBlock& block : cache->fid_blocks) {
-        touch_vec(block.matches);
+        touch_vec_u8(block.matches);
     }
     (void)sink;
 }
 
 class AsyncJobRing {
 public:
+    using JobToken = uint64_t;
+
     AsyncJobRing(size_t queue_size = 128, size_t wait_batch = 64, size_t output_buffer_bytes = 1)
         : queue_size_(queue_size), wait_batch_(wait_batch), output_buffer_bytes_(output_buffer_bytes) {
         if (queue_size_ == 0 || wait_batch_ == 0 || wait_batch_ > queue_size_) {
@@ -996,7 +1140,7 @@ public:
     }
 
     template <typename SetupFn, typename CompleteFn>
-    void submit(size_t output_capacity, SetupFn&& setup_fn, CompleteFn&& complete_fn) {
+    JobToken submit(size_t output_capacity, SetupFn&& setup_fn, CompleteFn&& complete_fn) {
         ensure_free_slot();
 
         const size_t slot_id = free_slots_.front();
@@ -1008,9 +1152,18 @@ public:
                 "AsyncJobRing submit output capacity exceeds preallocated slot buffer");
         }
 
+        JobToken token = next_token_++;
+        if (token == 0) {
+            token = next_token_++;
+        }
+        slot.token = token;
+        token_to_slot_[token] = slot_id;
+
         setup_fn(slot.job, slot.output);
         const qpl_status submit_status = qpl_submit_job(slot.job);
         if (submit_status != QPL_STS_OK) {
+            token_to_slot_.erase(token);
+            slot.token = 0;
             throw std::runtime_error(
                 "AsyncJobRing: qpl_submit_job failed with status " +
                 std::to_string(static_cast<int>(submit_status)));
@@ -1018,10 +1171,7 @@ public:
 
         slot.complete = std::forward<CompleteFn>(complete_fn);
         pending_slots_.push_back(slot_id);
-
-        if (pending_slots_.size() >= queue_size_) {
-            wait_oldest(wait_batch_);
-        }
+        return token;
     }
 
     void flush() {
@@ -1032,8 +1182,53 @@ public:
         wait_oldest(1);
     }
 
+    bool wait_token(JobToken token) {
+        if (token == 0) {
+            return false;
+        }
+        auto it = token_to_slot_.find(token);
+        if (it == token_to_slot_.end()) {
+            return false;
+        }
+
+        const size_t slot_id = it->second;
+        auto pending_it = std::find(pending_slots_.begin(), pending_slots_.end(), slot_id);
+        if (pending_it != pending_slots_.end()) {
+            pending_slots_.erase(pending_it);
+        }
+
+        Slot& slot = slots_[slot_id];
+        const qpl_status wait_status = qpl_wait_job(slot.job);
+        if (wait_status != QPL_STS_OK) {
+            throw std::runtime_error(
+                "AsyncJobRing: qpl_wait_job(token) failed with status " +
+                std::to_string(static_cast<int>(wait_status)));
+        }
+
+        complete_slot(slot_id);
+        return true;
+    }
+
     bool has_pending() const {
         return !pending_slots_.empty();
+    }
+
+    uint64_t ensure_free_slot_wait_calls() const {
+        return ensure_free_slot_wait_calls_;
+    }
+
+    uint64_t ensure_free_slot_wait_slots() const {
+        return ensure_free_slot_wait_slots_;
+    }
+
+    uint64_t ensure_free_slot_wait_ns() const {
+        return ensure_free_slot_wait_ns_;
+    }
+
+    void reset_debug_counters() {
+        ensure_free_slot_wait_calls_ = 0;
+        ensure_free_slot_wait_slots_ = 0;
+        ensure_free_slot_wait_ns_ = 0;
     }
 
     void prefault_output_buffers() {
@@ -1078,6 +1273,7 @@ private:
     struct Slot {
         std::unique_ptr<uint8_t[]> job_storage;
         qpl_job* job = nullptr;
+        JobToken token = 0;
         std::vector<uint8_t> output;
         std::function<void(qpl_job*, std::vector<uint8_t>&, uint64_t)> complete;
     };
@@ -1086,7 +1282,14 @@ private:
         if (!free_slots_.empty()) {
             return;
         }
+        ++ensure_free_slot_wait_calls_;
+        ensure_free_slot_wait_slots_ += static_cast<uint64_t>(
+            std::min(wait_batch_, pending_slots_.size()));
+        const auto wait_start = std::chrono::steady_clock::now();
         wait_oldest(wait_batch_);
+        const auto wait_end = std::chrono::steady_clock::now();
+        ensure_free_slot_wait_ns_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count());
         if (free_slots_.empty()) {
             throw std::runtime_error("AsyncJobRing internal error: no free slots after wait");
         }
@@ -1115,17 +1318,25 @@ private:
         if (slot.complete) {
             slot.complete(slot.job, slot.output, 0);
         }
+        if (slot.token != 0) {
+            token_to_slot_.erase(slot.token);
+            slot.token = 0;
+        }
         slot.complete = nullptr;
-        slot.output.clear();
         free_slots_.push_back(slot_id);
     }
 
     size_t queue_size_ = 128;
     size_t wait_batch_ = 64;
     size_t output_buffer_bytes_ = 1;
+    uint64_t ensure_free_slot_wait_calls_ = 0;
+    uint64_t ensure_free_slot_wait_slots_ = 0;
+    uint64_t ensure_free_slot_wait_ns_ = 0;
+    JobToken next_token_ = 1;
     std::vector<Slot> slots_;
     std::deque<size_t> free_slots_;
     std::deque<size_t> pending_slots_;
+    std::unordered_map<JobToken, size_t> token_to_slot_;
 };
 
 void submit_tb_prefetch_jobs(
@@ -1139,12 +1350,30 @@ void submit_tb_prefetch_jobs(
     if (cache->tb_query_mask.size() != runtime.tb_bytes_per_bucket) {
         throw std::runtime_error("TB query mask size mismatch");
     }
+    if (cache->tb_block_state.size() != runtime.tb_storage.block_count() ||
+        cache->tb_block_tokens.size() != runtime.tb_storage.block_count() ||
+        cache->tb_byte_pending_blocks.size() != runtime.tb_bytes_per_bucket) {
+        throw std::runtime_error("TB block/token cache size mismatch");
+    }
+    if (runtime.tb_blocks_by_byte.size() != runtime.tb_bytes_per_bucket ||
+        runtime.tb_bytes_by_block.size() != runtime.tb_storage.block_count()) {
+        throw std::runtime_error("TB runtime plan size mismatch");
+    }
 
     std::fill(cache->tb_query_mask.begin(), cache->tb_query_mask.end(), static_cast<uint8_t>(0));
     cache->tb_query_mask_ready = 0;
     cache->tb_jobs_pending = 0;
     cache->tb_predicate_blocks_touched = 0;
     cache->tb_predicate_output_bytes = 0;
+    std::fill(cache->tb_block_state.begin(), cache->tb_block_state.end(), kTbStateNotSubmitted);
+    std::fill(cache->tb_block_tokens.begin(), cache->tb_block_tokens.end(), 0);
+    for (size_t byte_idx = 0; byte_idx < runtime.tb_bytes_per_bucket; ++byte_idx) {
+        const size_t needed_blocks = runtime.tb_blocks_by_byte[byte_idx].size();
+        if (needed_blocks > static_cast<size_t>(std::numeric_limits<uint16_t>::max())) {
+            throw std::runtime_error("TB byte pending block count exceeds uint16_t");
+        }
+        cache->tb_byte_pending_blocks[byte_idx] = static_cast<uint16_t>(needed_blocks);
+    }
 
     if (runtime.tb_storage.block_size == 0 || runtime.tb_bytes_per_bucket == 0) {
         cache->tb_query_mask_ready = 1;
@@ -1155,44 +1384,25 @@ void submit_tb_prefetch_jobs(
         return;
     }
 
-    const uint16_t first_bucket = runtime.tb_allowed_buckets.front();
-    const uint16_t last_bucket = runtime.tb_allowed_buckets.back();
-    const size_t span_start = static_cast<size_t>(first_bucket) * runtime.tb_bytes_per_bucket;
-    const size_t span_end =
-        (static_cast<size_t>(last_bucket) + 1u) * runtime.tb_bytes_per_bucket;
-    if (span_start >= runtime.tb_storage.raw_size || span_end > runtime.tb_storage.raw_size) {
-        throw std::runtime_error("TB merged span is outside of reordered TB storage");
-    }
-
     const size_t bytes_per_bucket = runtime.tb_bytes_per_bucket;
-    const size_t start_block = span_start / runtime.tb_storage.block_size;
-    const size_t end_block = (span_end - 1) / runtime.tb_storage.block_size;
-    for (size_t block_id = start_block; block_id <= end_block; ++block_id) {
-        if (block_id >= runtime.tb_storage.block_count()) {
-            throw std::runtime_error("TB block id out of range during merged extract prefetch");
+    for (const AsyncRangeRuntime::TbJobPlan& plan : runtime.tb_job_plans) {
+        const size_t block_id = plan.block_id;
+        const uint32_t raw_len = plan.raw_len;
+        const uint32_t local_lo = plan.local_lo;
+        const uint32_t local_hi = plan.local_hi;
+        const size_t segment_len = plan.segment_len;
+        const size_t span_offset = plan.span_offset;
+        if (block_id >= cache->tb_block_state.size() ||
+            block_id >= cache->tb_block_tokens.size()) {
+            throw std::runtime_error("TB plan block id exceeds query cache bounds");
         }
-        const uint32_t raw_len = runtime.tb_storage.raw_block_sizes[block_id];
-        if (raw_len == 0) {
-            continue;
-        }
-
-        const size_t block_base = block_id * runtime.tb_storage.block_size;
-        const size_t segment_start = std::max(span_start, block_base);
-        const size_t segment_end = std::min(span_end, block_base + static_cast<size_t>(raw_len));
-        if (segment_end <= segment_start) {
-            continue;
-        }
-
-        const uint32_t local_lo = static_cast<uint32_t>(segment_start - block_base);
-        const uint32_t local_hi = static_cast<uint32_t>(segment_end - block_base - 1);
-        const size_t segment_len = static_cast<size_t>(local_hi - local_lo + 1u);
-        const size_t span_offset = segment_start - span_start;
 
         ++cache->tb_jobs_pending;
         ++cache->tb_predicate_blocks_touched;
         cache->tb_predicate_output_bytes += safe_size_t_to_u64(segment_len);
+        cache->tb_block_state[block_id] = kTbStateInflight;
 
-        ring->submit(
+        const AsyncJobRing::JobToken token = ring->submit(
             segment_len,
             [&, block_id, raw_len, local_lo, local_hi, segment_len](qpl_job* job, std::vector<uint8_t>& out) {
                 job->op = qpl_op_extract;
@@ -1209,7 +1419,10 @@ void submit_tb_prefetch_jobs(
                 job->num_input_elements = raw_len;
                 job->flags = QPL_FLAG_FIRST | QPL_FLAG_LAST | QPL_FLAG_DECOMPRESS_ENABLE;
             },
-            [cache, metrics, bytes_per_bucket, span_offset, segment_len](qpl_job* job, std::vector<uint8_t>& out, uint64_t elapsed_ns) {
+            [&runtime, cache, metrics, bytes_per_bucket, block_id, span_offset, segment_len](
+                qpl_job* job,
+                std::vector<uint8_t>& out,
+                uint64_t elapsed_ns) {
                 const size_t produced = static_cast<size_t>(job->total_out);
                 if (produced != segment_len || bytes_per_bucket == 0) {
                     throw std::runtime_error("Unexpected TB merged extract output size from IAA");
@@ -1223,6 +1436,20 @@ void submit_tb_prefetch_jobs(
                         "TB extract completion observed with zero pending jobs");
                 }
                 --cache->tb_jobs_pending;
+                cache->tb_block_state[block_id] = kTbStateReady;
+                cache->tb_block_tokens[block_id] = 0;
+                if (block_id >= runtime.tb_bytes_by_block.size()) {
+                    throw std::runtime_error("TB block completion mapping is out of range");
+                }
+                for (uint32_t byte_idx : runtime.tb_bytes_by_block[block_id]) {
+                    if (byte_idx >= cache->tb_byte_pending_blocks.size()) {
+                        throw std::runtime_error("TB byte pending index is out of range");
+                    }
+                    if (cache->tb_byte_pending_blocks[byte_idx] == 0) {
+                        throw std::runtime_error("TB byte pending count underflow");
+                    }
+                    --cache->tb_byte_pending_blocks[byte_idx];
+                }
                 if (cache->tb_jobs_pending == 0) {
                     cache->tb_query_mask_ready = 1;
                 }
@@ -1232,6 +1459,7 @@ void submit_tb_prefetch_jobs(
                     metrics->tb_bytes_decompressed += static_cast<uint64_t>(segment_len);
                 }
             });
+        cache->tb_block_tokens[block_id] = token;
     }
 
     if (cache->tb_jobs_pending == 0) {
@@ -1311,12 +1539,11 @@ bool tb_match_node(
     AsyncJobRing* ring,
     AsyncRangeQueryCache* cache,
     size_t node_id,
+    SearchCallStats* call_stats,
     compass_iaa_filter::QueryDecompressionMetrics* metrics) {
     (void)ring;
+    (void)call_stats;
     if (cache == nullptr || runtime.tb_bytes_per_bucket == 0 || node_id >= runtime.n_elements) {
-        return false;
-    }
-    if (cache->tb_query_mask_ready == 0) {
         return false;
     }
     const size_t byte_idx = node_id / 8;
@@ -1324,6 +1551,10 @@ bool tb_match_node(
     if (byte_idx >= cache->tb_query_mask.size()) {
         return false;
     }
+    if (cache->tb_query_mask_ready == 0) {
+        return false;
+    }
+
     if (metrics != nullptr) {
         ++metrics->tb_cache_hits;
     }
@@ -1435,11 +1666,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_compass_filter(
     auto timed_eval = [&](bool traversal_mode, size_t node_id) -> bool {
         bool allowed = false;
         if (traversal_mode) {
-            allowed = engine.allow_traversal(node_id, cache, &call_stats->decomp);
+            allowed = engine.allow_traversal(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         } else {
-            allowed = engine.allow_result(node_id, cache, &call_stats->decomp);
+            allowed = engine.allow_result(node_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         }
-        ++call_stats->filter_eval_calls;
+        if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
         return allowed;
     };
 
@@ -1549,21 +1780,20 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
     DistT curdist = index.fstdistfunc_(query_data, index.getDataByInternalId(curr_obj), index.dist_func_param_);
 
     if (cache->tb_query_mask.size() != runtime.tb_bytes_per_bucket ||
+        cache->tb_block_state.size() != runtime.tb_storage.block_count() ||
+        cache->tb_block_tokens.size() != runtime.tb_storage.block_count() ||
+        cache->tb_byte_pending_blocks.size() != runtime.tb_bytes_per_bucket ||
         cache->fid_blocks.size() != runtime.fid_storage.block_count() ||
         cache->fid_ready.size() != runtime.fid_storage.block_count() ||
         cache->fid_state.size() != runtime.fid_storage.block_count()) {
         throw std::runtime_error(
             "AsyncRangeQueryCache must be fully preallocated before search");
     }
-    submit_tb_prefetch_jobs(ring, runtime, cache, &call_stats->decomp);
-    while (cache->tb_query_mask_ready == 0) {
-        if (!ring->has_pending()) {
-            throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
-        }
-        ring->wait_one();
-    }
-    call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
-    call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
+    const auto tb_submit_start = std::chrono::steady_clock::now();
+    submit_tb_prefetch_jobs(ring, runtime, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+    const auto tb_submit_end = std::chrono::steady_clock::now();
+    if (kMeasureInSearchStats) call_stats->tb_submit_ns += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(tb_submit_end - tb_submit_start).count());
 
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
@@ -1623,8 +1853,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
     next_temp_result_buffer.reserve(index.maxM0_ * 4);
 
     auto poll_ready_jobs = [&]() {
-        ++call_stats->job_poll_calls;
-        call_stats->job_poll_ready += static_cast<uint64_t>(ring->poll_ready_jobs());
+        if (kMeasureInSearchStats) ++call_stats->job_poll_calls;
+        if (kMeasureInSearchStats) call_stats->job_poll_ready += static_cast<uint64_t>(ring->poll_ready_jobs());
     };
 
     auto submit_pending_fid_blocks = [&]() {
@@ -1637,8 +1867,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
             }
             pending_fid_block_marks[fid_block_id] = static_cast<uint8_t>(0);
             if (cache->fid_state[fid_block_id] == kFidStateNotSubmitted) {
-                submit_fid_scan_job(ring, runtime, fid_block_id, cache, &call_stats->decomp);
-                ++call_stats->fid_jobs_submitted;
+                submit_fid_scan_job(ring, runtime, fid_block_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+                if (kMeasureInSearchStats) ++call_stats->fid_jobs_submitted;
             }
         }
         pending_fid_blocks_to_submit.clear();
@@ -1661,16 +1891,16 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
         if (temp_result_buffer.empty()) {
             return;
         }
-        ++call_stats->deferred_retry_rounds;
+        if (kMeasureInSearchStats) ++call_stats->deferred_retry_rounds;
         next_temp_result_buffer.clear();
         for (const FrontierCandidate& entry : temp_result_buffer) {
             if (!entry.need_fid) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 push_result_candidate_if_allowed(entry);
                 continue;
             }
             if (entry.fid_block_id >= cache->fid_state.size()) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 continue;
             }
             if (cache->fid_state[entry.fid_block_id] != kFidStateReady) {
@@ -1682,15 +1912,34 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 ring,
                 cache,
                 static_cast<size_t>(entry.candidate_id),
-                &call_stats->decomp);
-            ++call_stats->filter_eval_calls;
-            ++call_stats->fid_ready_candidates;
+                (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
+            if (kMeasureInSearchStats) ++call_stats->fid_ready_candidates;
             if (fid_match) {
                 push_result_candidate_if_allowed(entry);
             }
         }
         temp_result_buffer.swap(next_temp_result_buffer);
     };
+
+    if (cache->tb_query_mask_ready == 0) {
+        if (!ring->has_pending()) {
+            throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
+        }
+        const uint64_t tb_wait_ops = static_cast<uint64_t>(cache->tb_jobs_pending);
+        const auto tb_wait_start = std::chrono::steady_clock::now();
+        ring->flush();
+        const auto tb_wait_end = std::chrono::steady_clock::now();
+        if (kMeasureInSearchStats) call_stats->tb_wait_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(tb_wait_end - tb_wait_start).count());
+        if (kMeasureInSearchStats) call_stats->tb_wait_calls += tb_wait_ops;
+        if (cache->tb_query_mask_ready == 0) {
+            throw std::runtime_error("TB query mask is still not ready after flush");
+        }
+    }
+
+    if (kMeasureInSearchStats) call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
+    if (kMeasureInSearchStats) call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
 
     // Base-layer traversal loop with staged non-blocking range FID handling.
     while (true) {
@@ -1779,14 +2028,15 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 ring,
                 cache,
                 static_cast<size_t>(candidate_id),
-                &call_stats->decomp);
-            ++call_stats->filter_eval_calls;
+                call_stats,
+                (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
             if (!tb_match) {
-                ++call_stats->neighbors_tb_rejected;
+                if (kMeasureInSearchStats) ++call_stats->neighbors_tb_rejected;
                 continue;
             }
 
-            ++call_stats->neighbors_tb_passed;
+            if (kMeasureInSearchStats) ++call_stats->neighbors_tb_passed;
             FrontierCandidate entry;
             entry.candidate_id = candidate_id;
             entry.deleted = index.isMarkedDeleted(candidate_id);
@@ -1822,14 +2072,14 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
         for (const FrontierCandidate& entry : frontier_candidates) {
             const bool consider = (top_candidates.size() < ef || lower_bound > entry.dist);
             if (!consider) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 continue;
             }
 
             candidate_set.emplace(-entry.dist, entry.candidate_id);
 
             if (!entry.need_fid) {
-                ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
                 push_result_candidate_if_allowed(entry);
                 continue;
             }
@@ -1841,9 +2091,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                     ring,
                     cache,
                     static_cast<size_t>(entry.candidate_id),
-                    &call_stats->decomp);
-                ++call_stats->filter_eval_calls;
-                ++call_stats->fid_ready_candidates;
+                    (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
+                if (kMeasureInSearchStats) ++call_stats->fid_ready_candidates;
                 if (fid_match) {
                     push_result_candidate_if_allowed(entry);
                 }
@@ -1851,7 +2101,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
             }
 
             temp_result_buffer.push_back(entry);
-            ++call_stats->deferred_candidates_enqueued;
+            if (kMeasureInSearchStats) ++call_stats->deferred_candidates_enqueued;
         }
 
         // Stage 5: retry deferred candidates that may now be ready.
@@ -2021,6 +2271,7 @@ RunStats run_search_typed(
             &warmup_stats);
         shared_ring->flush();
     }
+    shared_ring->reset_debug_counters();
 
     size_t returned_results = 0;
 
@@ -2108,6 +2359,9 @@ RunStats run_search_typed(
         stats.fid_jobs_submitted += call_stats.fid_jobs_submitted;
         stats.job_poll_calls += call_stats.job_poll_calls;
         stats.job_poll_ready += call_stats.job_poll_ready;
+        stats.tb_submit_ns += call_stats.tb_submit_ns;
+        stats.tb_wait_ns += call_stats.tb_wait_ns;
+        stats.tb_wait_calls += call_stats.tb_wait_calls;
         stats.search_loop_time_ns += query_search_ns;
 
         returned_results += result.size();
@@ -2164,6 +2418,9 @@ RunStats run_search_typed(
     stats.returned_results = returned_results;
     stats.average_recall_at_k =
         (query_count > 0) ? (stats.recall_sum / static_cast<double>(query_count)) : 0.0;
+    stats.ensure_free_slot_wait_calls = shared_ring->ensure_free_slot_wait_calls();
+    stats.ensure_free_slot_wait_slots = shared_ring->ensure_free_slot_wait_slots();
+    stats.ensure_free_slot_wait_ns = shared_ring->ensure_free_slot_wait_ns();
 
     (void)metadata;
     return stats;
@@ -2337,6 +2594,13 @@ std::string build_summary(
     oss << "debug_fid_jobs_submitted: " << stats.fid_jobs_submitted << "\n";
     oss << "debug_job_poll_calls: " << stats.job_poll_calls << "\n";
     oss << "debug_job_poll_ready: " << stats.job_poll_ready << "\n";
+    oss << "debug_tb_submit_ms: " << (static_cast<double>(stats.tb_submit_ns) / 1e6) << "\n";
+    oss << "debug_tb_wait_ms: " << (static_cast<double>(stats.tb_wait_ns) / 1e6) << "\n";
+    oss << "debug_tb_wait_calls: " << stats.tb_wait_calls << "\n";
+    oss << "debug_ensure_free_slot_wait_calls: " << stats.ensure_free_slot_wait_calls << "\n";
+    oss << "debug_ensure_free_slot_wait_slots: " << stats.ensure_free_slot_wait_slots << "\n";
+    oss << "debug_ensure_free_slot_wait_ms: "
+        << (static_cast<double>(stats.ensure_free_slot_wait_ns) / 1e6) << "\n";
 
     if (stats.queries_with_enns_lt_k > 0) {
         oss << "warning: filtering condition is too restrictive for k on "
