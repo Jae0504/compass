@@ -18,6 +18,11 @@ Usage:
     [--num-queries <int>] \
     [--out-dir <path>] \
     [--postfilter-max-candidates <int>] \
+    [--postfilter-max-candidates-list <comma-separated>] \
+    [--postfilter-max-candidates-list-1pct <comma-separated>] \
+    [--postfilter-max-candidates-list-10pct <comma-separated>] \
+    [--postfilter-ef-list-1pct <comma-separated>] \
+    [--postfilter-ef-list-10pct <comma-separated>] \
     [--build|--no-build] \
     [--plot|--no-plot]
 
@@ -30,6 +35,11 @@ Core defaults:
   --num-queries                 20
   --out-dir                     <this_dir>/out/filter_method_compare
   --postfilter-max-candidates   3000
+  --postfilter-max-candidates-list 3000
+  --postfilter-max-candidates-list-1pct (inherits --postfilter-max-candidates-list)
+  --postfilter-max-candidates-list-10pct (inherits --postfilter-max-candidates-list)
+  --postfilter-ef-list-1pct     8
+  --postfilter-ef-list-10pct    8
   --fid-block-size-bytes        65536
   --tb-block-size-bytes         1048576
   --build                       enabled
@@ -210,14 +220,14 @@ parse_ef_list_into_array() {
 # Methods to run.
 # Comment out entries here for quick manual method selection.
 METHODS=(
-  "post_filter_hnsw"
-  "in_search_filter_hnsw"
+  # "post_filter_hnsw"
+  # "in_search_filter_hnsw"
   "acorn"
-  "compass_lz4"
-  "compass_iaa_1"
-  "compass_iaa_2"
-  "compass_iaa_4"
-  "compass_iaa_8"
+  # "compass_lz4"
+  # "compass_iaa_1"
+  # "compass_iaa_2"
+  # "compass_iaa_4"
+  # "compass_iaa_8"
 )
 
 DATASET="hnm"
@@ -225,11 +235,18 @@ K=10
 EF_LIST="64,96,128,160,200"
 EF_LIST_1PCT="32, 48, 64, 96"
 EF_LIST_10PCT="32, 48, 64, 96, 128, 160, 200"
-ACORN_EF_LIST_1PCT="24,32,48,64"
-ACORN_EF_LIST_10PCT="8,16,24,64"
-NUM_QUERIES=20
+IN_SEARCH_EF_LIST_1PCT="4,8,16,32,64"
+IN_SEARCH_EF_LIST_10PCT="4,8,16,32,64"
+ACORN_EF_LIST_1PCT="44,52,64,80,96,112,128,144,160,320"
+ACORN_EF_LIST_10PCT="80,96,600, 800"
+NUM_QUERIES=100
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 POSTFILTER_MAX_CANDIDATES=3000
+POSTFILTER_MAX_CANDIDATES_LIST="3000"
+POSTFILTER_MAX_CANDIDATES_LIST_1PCT="21000,22000,23000,24000,25000"
+POSTFILTER_MAX_CANDIDATES_LIST_10PCT="3200,3400,3800,4500,6000"
+POSTFILTER_EF_LIST_1PCT="8"
+POSTFILTER_EF_LIST_10PCT="8"
 DO_BUILD=1
 DO_PLOT=1
 
@@ -281,6 +298,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --postfilter-max-candidates)
       POSTFILTER_MAX_CANDIDATES="$2"
+      shift 2
+      ;;
+    --postfilter-max-candidates-list)
+      POSTFILTER_MAX_CANDIDATES_LIST="$2"
+      shift 2
+      ;;
+    --postfilter-max-candidates-list-1pct)
+      POSTFILTER_MAX_CANDIDATES_LIST_1PCT="$2"
+      shift 2
+      ;;
+    --postfilter-max-candidates-list-10pct)
+      POSTFILTER_MAX_CANDIDATES_LIST_10PCT="$2"
+      shift 2
+      ;;
+    --postfilter-ef-list-1pct)
+      POSTFILTER_EF_LIST_1PCT="$2"
+      shift 2
+      ;;
+    --postfilter-ef-list-10pct)
+      POSTFILTER_EF_LIST_10PCT="$2"
       shift 2
       ;;
     --build)
@@ -383,6 +420,12 @@ if [[ "$POSTFILTER_MAX_CANDIDATES" -lt "$K" ]]; then
   echo "Error: --postfilter-max-candidates must be >= --k" >&2
   exit 1
 fi
+if [[ -z "$POSTFILTER_MAX_CANDIDATES_LIST_1PCT" ]]; then
+  POSTFILTER_MAX_CANDIDATES_LIST_1PCT="$POSTFILTER_MAX_CANDIDATES_LIST"
+fi
+if [[ -z "$POSTFILTER_MAX_CANDIDATES_LIST_10PCT" ]]; then
+  POSTFILTER_MAX_CANDIDATES_LIST_10PCT="$POSTFILTER_MAX_CANDIDATES_LIST"
+fi
 if ! [[ "$FID_BLOCK_SIZE_BYTES" =~ ^[0-9]+$ ]] || [[ "$FID_BLOCK_SIZE_BYTES" -le 0 ]]; then
   echo "Error: --fid-block-size-bytes must be a positive integer" >&2
   exit 1
@@ -463,12 +506,31 @@ fi
 
 parse_ef_list_into_array "$EF_LIST_1PCT" "ef-list-1pct" EF_VALUES_1PCT_STR
 parse_ef_list_into_array "$EF_LIST_10PCT" "ef-list-10pct" EF_VALUES_10PCT_STR
+parse_ef_list_into_array "$IN_SEARCH_EF_LIST_1PCT" "in-search-ef-list-1pct" IN_SEARCH_EF_VALUES_1PCT_STR
+parse_ef_list_into_array "$IN_SEARCH_EF_LIST_10PCT" "in-search-ef-list-10pct" IN_SEARCH_EF_VALUES_10PCT_STR
 parse_ef_list_into_array "$ACORN_EF_LIST_1PCT" "acorn-ef-list-1pct" ACORN_EF_VALUES_1PCT_STR
 parse_ef_list_into_array "$ACORN_EF_LIST_10PCT" "acorn-ef-list-10pct" ACORN_EF_VALUES_10PCT_STR
+parse_ef_list_into_array "$POSTFILTER_EF_LIST_1PCT" "postfilter-ef-list-1pct" POSTFILTER_EF_VALUES_1PCT_STR
+parse_ef_list_into_array "$POSTFILTER_EF_LIST_10PCT" "postfilter-ef-list-10pct" POSTFILTER_EF_VALUES_10PCT_STR
+parse_ef_list_into_array "$POSTFILTER_MAX_CANDIDATES_LIST_1PCT" "postfilter-max-candidates-list-1pct" POSTFILTER_MAX_VALUES_1PCT_STR
+parse_ef_list_into_array "$POSTFILTER_MAX_CANDIDATES_LIST_10PCT" "postfilter-max-candidates-list-10pct" POSTFILTER_MAX_VALUES_10PCT_STR
 IFS=' ' read -r -a EF_VALUES_1PCT <<< "$EF_VALUES_1PCT_STR"
 IFS=' ' read -r -a EF_VALUES_10PCT <<< "$EF_VALUES_10PCT_STR"
+IFS=' ' read -r -a IN_SEARCH_EF_VALUES_1PCT <<< "$IN_SEARCH_EF_VALUES_1PCT_STR"
+IFS=' ' read -r -a IN_SEARCH_EF_VALUES_10PCT <<< "$IN_SEARCH_EF_VALUES_10PCT_STR"
 IFS=' ' read -r -a ACORN_EF_VALUES_1PCT <<< "$ACORN_EF_VALUES_1PCT_STR"
 IFS=' ' read -r -a ACORN_EF_VALUES_10PCT <<< "$ACORN_EF_VALUES_10PCT_STR"
+IFS=' ' read -r -a POSTFILTER_EF_VALUES_1PCT <<< "$POSTFILTER_EF_VALUES_1PCT_STR"
+IFS=' ' read -r -a POSTFILTER_EF_VALUES_10PCT <<< "$POSTFILTER_EF_VALUES_10PCT_STR"
+IFS=' ' read -r -a POSTFILTER_MAX_VALUES_1PCT <<< "$POSTFILTER_MAX_VALUES_1PCT_STR"
+IFS=' ' read -r -a POSTFILTER_MAX_VALUES_10PCT <<< "$POSTFILTER_MAX_VALUES_10PCT_STR"
+
+for max_candidates in "${POSTFILTER_MAX_VALUES_1PCT[@]}" "${POSTFILTER_MAX_VALUES_10PCT[@]}"; do
+  if [[ "$max_candidates" -lt "$K" ]]; then
+    echo "Error: every postfilter max-candidates list value must be >= --k (found: $max_candidates)" >&2
+    exit 1
+  fi
+done
 
 RESULTS_1PCT="$OUT_DIR/results_1pct.csv"
 RESULTS_10PCT="$OUT_DIR/results_10pct.csv"
@@ -485,11 +547,16 @@ run_single() {
   local acorn_index_path="$5"
   local out_csv="$6"
   local filter_expr="$7"
+  local postfilter_max_candidates="${8:-$POSTFILTER_MAX_CANDIDATES}"
 
   local summary_dir="$OUT_DIR/summaries/${selectivity_pct}pct/${method}"
   mkdir -p "$summary_dir"
-  local summary_path="$summary_dir/ef_${ef}.summary.txt"
-  local log_path="$summary_dir/ef_${ef}.log"
+  local summary_stem="ef_${ef}"
+  if [[ "$method" == "post_filter_hnsw" ]]; then
+    summary_stem="ef_${ef}_pfc_${postfilter_max_candidates}"
+  fi
+  local summary_path="$summary_dir/${summary_stem}.summary.txt"
+  local log_path="$summary_dir/${summary_stem}.log"
 
   local -a cmd
   case "$method" in
@@ -502,8 +569,8 @@ run_single() {
         --k "$K"
         --ef "$ef"
         --filter "$filter_expr"
-        --search-mode post_filter
-        --postfilter-max-candidates "$POSTFILTER_MAX_CANDIDATES"
+        --search-mode post_filter_iterative
+        --postfilter-max-candidates "$postfilter_max_candidates"
         --payload-jsonl "$PAYLOAD_JSONL"
         --num-queries "$NUM_QUERIES"
         --summary-out "$summary_path"
@@ -588,8 +655,10 @@ run_single() {
   local tb_comp_ratio=""
   local total_comp_ratio=""
   local postfilter_value_out=""
-  if [[ "$method" == "in_search_filter_hnsw" || "$method" == "post_filter_hnsw" ]]; then
+  if [[ "$method" == "in_search_filter_hnsw" ]]; then
     postfilter_value_out="$POSTFILTER_MAX_CANDIDATES"
+  elif [[ "$method" == "post_filter_hnsw" ]]; then
+    postfilter_value_out="$postfilter_max_candidates"
   fi
 
   local -a run_cmd
@@ -655,12 +724,43 @@ run_scenario() {
 
   for method in "${METHODS[@]}"; do
     local -a method_ef_values=("${ef_values_ref[@]}")
-    if [[ "$method" == "acorn" ]]; then
+    local -a postfilter_values=()
+    if [[ "$method" == "in_search_filter_hnsw" ]]; then
+      if [[ "$selectivity_pct" == "1" ]]; then
+        method_ef_values=("${IN_SEARCH_EF_VALUES_1PCT[@]}")
+      else
+        method_ef_values=("${IN_SEARCH_EF_VALUES_10PCT[@]}")
+      fi
+    elif [[ "$method" == "post_filter_hnsw" ]]; then
+      if [[ "$selectivity_pct" == "1" ]]; then
+        method_ef_values=("${POSTFILTER_EF_VALUES_1PCT[@]}")
+        postfilter_values=("${POSTFILTER_MAX_VALUES_1PCT[@]}")
+      else
+        method_ef_values=("${POSTFILTER_EF_VALUES_10PCT[@]}")
+        postfilter_values=("${POSTFILTER_MAX_VALUES_10PCT[@]}")
+      fi
+    elif [[ "$method" == "acorn" ]]; then
       if [[ "$selectivity_pct" == "1" ]]; then
         method_ef_values=("${ACORN_EF_VALUES_1PCT[@]}")
       else
         method_ef_values=("${ACORN_EF_VALUES_10PCT[@]}")
       fi
+    fi
+    if [[ "$method" == "post_filter_hnsw" ]]; then
+      for ef in "${method_ef_values[@]}"; do
+        for postfilter_max_candidates in "${postfilter_values[@]}"; do
+          run_single \
+            "$method" \
+            "$selectivity_pct" \
+            "$ef" \
+            "$manifest_path" \
+            "$acorn_index_path" \
+            "$out_csv" \
+            "$filter_expr" \
+            "$postfilter_max_candidates"
+        done
+      done
+      continue
     fi
     for ef in "${method_ef_values[@]}"; do
       run_single \
@@ -689,6 +789,12 @@ echo "  payload-jsonl: $PAYLOAD_JSONL"
 echo "  k: $K"
 echo "  ef list (1%): ${EF_VALUES_1PCT[*]}"
 echo "  ef list (10%): ${EF_VALUES_10PCT[*]}"
+echo "  in_search ef list (1%): ${IN_SEARCH_EF_VALUES_1PCT[*]}"
+echo "  in_search ef list (10%): ${IN_SEARCH_EF_VALUES_10PCT[*]}"
+echo "  post_filter ef list (1%): ${POSTFILTER_EF_VALUES_1PCT[*]}"
+echo "  post_filter ef list (10%): ${POSTFILTER_EF_VALUES_10PCT[*]}"
+echo "  post_filter max-candidates list (1%): ${POSTFILTER_MAX_VALUES_1PCT[*]}"
+echo "  post_filter max-candidates list (10%): ${POSTFILTER_MAX_VALUES_10PCT[*]}"
 echo "  acorn ef list (1%): ${ACORN_EF_VALUES_1PCT[*]}"
 echo "  acorn ef list (10%): ${ACORN_EF_VALUES_10PCT[*]}"
 echo "  postfilter-max-candidates: $POSTFILTER_MAX_CANDIDATES"

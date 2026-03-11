@@ -1416,7 +1416,12 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
     // TB is used as a permissive traversal prefilter before exact result gating.
     ring->flush();
     const auto tb_submit_start = std::chrono::steady_clock::now();
-    if (kMeasureInSearchStats) call_stats->tb_jobs_submitted += submit_tb_prefetch_jobs(ring, runtime, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+    const uint64_t tb_jobs_submitted = submit_tb_prefetch_jobs(
+        ring,
+        runtime,
+        cache,
+        (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+    if (kMeasureInSearchStats) call_stats->tb_jobs_submitted += tb_jobs_submitted;
     if (kMeasureInSearchStats) call_stats->tb_submit_time_ns += static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - tb_submit_start).count());
@@ -1678,7 +1683,13 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
         }
 
         // Stage 3: submit async FID scans for this expansion (non-blocking).
-        if (kMeasureInSearchStats) call_stats->fid_jobs_submitted += submit_fid_scan_jobs(ring, runtime, blocks_by_leaf, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+        const uint64_t fid_jobs_submitted = submit_fid_scan_jobs(
+            ring,
+            runtime,
+            blocks_by_leaf,
+            cache,
+            (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+        if (kMeasureInSearchStats) call_stats->fid_jobs_submitted += fid_jobs_submitted;
 
         // Stage 4: compute distances for traversal-passed neighbors.
         for (FrontierCandidate& entry : frontier_candidates) {
