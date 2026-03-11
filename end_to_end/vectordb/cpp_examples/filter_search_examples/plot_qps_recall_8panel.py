@@ -5,22 +5,18 @@ import math
 import os
 from collections import defaultdict
 
+import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
 from matplotlib.ticker import LogLocator
 
 METHOD_LABELS = {
-    "post_filter_hnsw": "Post-filter HNSW",
-    "in_search_filter_hnsw": "HNSW filter",
-    "acorn": "ACORN",
-    "compass_lz4": "COMPASS-LZ4",
-    "compass_lz4_grouping": "COMPASS-LZ4-group",
-    "compass_iaa": "COMPASS-IAA",
-    "compass_iaa_grouping": "COMPASS-IAA-group",
-    "compass_iaa_1": "COMPASS-IAA_1",
-    "compass_iaa_2": "COMPASS-IAA_2",
-    "compass_iaa_4": "COMPASS-IAA_4",
-    "compass_iaa_8": "COMPASS-IAA_8",
+    "post_filter_hnsw": "HNSW (Post)",
+    "in_search_filter_hnsw": "HNSW (In-stage)",
+    "acorn": "ACORN (In-stage)",
+    "compass_lz4": "COMPASS w. LZ4 (In-stage)",
+    "compass_iaa_8": "COMPASS (In-stage)",
 }
 
 METHOD_ORDER = [
@@ -28,13 +24,7 @@ METHOD_ORDER = [
     "in_search_filter_hnsw",
     "acorn",
     "compass_lz4",
-    "compass_lz4_grouping",
-    "compass_iaa_1",
-    "compass_iaa_2",
-    "compass_iaa_4",
     "compass_iaa_8",
-    "compass_iaa",
-    "compass_iaa_grouping",
 ]
 
 METHOD_COLORS = {
@@ -42,12 +32,6 @@ METHOD_COLORS = {
     "in_search_filter_hnsw": "#9467bd",
     "acorn": "#2ca02c",
     "compass_lz4": "#ff7f0e",
-    "compass_lz4_grouping": "#ffbb78",
-    "compass_iaa": "#1f77b4",
-    "compass_iaa_grouping": "#17becf",
-    "compass_iaa_1": "#9ecae1",
-    "compass_iaa_2": "#6baed6",
-    "compass_iaa_4": "#3182bd",
     "compass_iaa_8": "#08519c",
 }
 
@@ -56,12 +40,6 @@ METHOD_MARKERS = {
     "in_search_filter_hnsw": "s",
     "acorn": "P",
     "compass_lz4": "o",
-    "compass_lz4_grouping": "X",
-    "compass_iaa": "^",
-    "compass_iaa_grouping": "h",
-    "compass_iaa_1": "v",
-    "compass_iaa_2": ">",
-    "compass_iaa_4": "<",
     "compass_iaa_8": "^",
 }
 
@@ -71,7 +49,7 @@ DATASET_LAYOUT = [
     [("laion", "(c) LAION"), ("hnm", "(d) H&M")],
 ]
 FIG_W_CM = 33.0
-FIG_H_CM = 24.0
+FIG_H_CM = 22.0
 # 254 DPI = 100 px/cm exactly, so 33x24 cm maps to exactly 3300x2400 pixels.
 SAVE_DPI = 254
 
@@ -154,7 +132,7 @@ def apply_axis_style(ax):
     ax.set_facecolor("#ffffff")
     ax.patch.set_alpha(1.0)
     ax.set_yscale("log")
-    ax.set_xlim(0.6, 1.01)
+    ax.set_xlim(0.9, 1.01)
     # Keep y-axis on the left only.
     ax.yaxis.set_label_position("left")
     ax.yaxis.tick_left()
@@ -210,11 +188,10 @@ def add_pair_labels(fig, axes):
     bot_pair2_x = (axes[1][2].get_position().x0 + axes[1][3].get_position().x1) * 0.5
 
     # Pair-level Recall and dataset captions (a/b/c/d).
-    row_gap_center_y = (top_left.y0 + bot_left.y1) * 0.5
-    top_recall_y = row_gap_center_y + 0.015
-    top_caption_y = row_gap_center_y - 0.015
+    top_caption_y = top_left.y0 - 0.065
+    top_recall_y = top_caption_y + 0.022
 
-    bottom_caption_y = max(0.02, bot_right.y0 - 0.055)
+    bottom_caption_y = max(0.02, bot_right.y0 - 0.065)
     bottom_recall_y = bottom_caption_y + 0.022
 
     fig.text(top_pair1_x, top_recall_y, "Recall", ha="center", va="center", fontweight="bold")
@@ -255,7 +232,7 @@ def build_legend(fig, all_series):
         handles,
         labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, 0.985),
+        bbox_to_anchor=(0.5, 1.0),
         ncol=max(1, min(len(labels), 6)),
         frameon=False,
     )
@@ -267,16 +244,19 @@ def plot_figure(dataset_series_map, output_path):
         "font.size": 12,
         "font.weight": "bold",
         "axes.labelweight": "bold",
+        "axes.titlesize": 12,
         "axes.titleweight": "bold",
     })
 
-    fig, axes = plt.subplots(
-        2,
-        4,
-        figsize=(FIG_W_CM / 2.54, FIG_H_CM / 2.54),
-        sharey="row",
-    )
+    fig = plt.figure(figsize=(FIG_W_CM / 2.54, FIG_H_CM / 2.54))
     fig.patch.set_facecolor("#ffffff")
+
+    gs = GridSpec(
+        2, 4, figure=fig,
+        left=0.06, right=0.995, top=0.930, bottom=0.063,
+        wspace=0.25, hspace=0.34,
+    )
+    axes = np.array([[fig.add_subplot(gs[row, col]) for col in range(4)] for row in range(2)])
 
     for row_idx, row_cfg in enumerate(DATASET_LAYOUT):
         for pair_idx, (dataset_name, _caption) in enumerate(row_cfg):
@@ -285,18 +265,18 @@ def plot_figure(dataset_series_map, output_path):
             for sel_offset, (sel_key, sel_label) in enumerate(SELECTIVITY_CONFIG):
                 ax = axes[row_idx][base_col + sel_offset]
                 plot_panel(ax, series, sel_key, sel_label)
-                # Only keep y tick labels on the left-most subplot per row.
-                if base_col + sel_offset != 0:
-                    ax.tick_params(axis="y", labelleft=False)
 
-    # One y-axis label per row.
-    axes[0][0].set_ylabel("Queries Per Second (QPS)", fontweight="bold")
-    axes[1][0].set_ylabel("Queries Per Second (QPS)", fontweight="bold")
+    # One y-axis label per row (leftmost panel only).
+    axes[0][0].set_ylabel("Queries per Second (QPS)", fontweight="bold", fontsize=12, fontfamily="Arial")
+    axes[1][0].set_ylabel("Queries per Second (QPS)", fontweight="bold", fontsize=12, fontfamily="Arial")
     for ax in axes.flat:
         ax.set_xlabel("")
 
-    # Keep layout as large as possible while reserving top legend and bottom captions.
-    fig.subplots_adjust(left=0.06, right=0.995, top=0.90, bottom=0.105, wspace=0.12, hspace=0.34)
+    # Shift bottom row upward without changing panel sizes.
+    bottom_row_shift = 0.03
+    for ax in axes[1]:
+        pos = ax.get_position()
+        ax.set_position([pos.x0, pos.y0 + bottom_row_shift, pos.width, pos.height])
 
     build_legend(fig, dataset_series_map)
     add_pair_labels(fig, axes)
