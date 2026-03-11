@@ -17,6 +17,9 @@ Usage:
     [--num-queries <int>] \
     [--out-dir <path>] \
     [--postfilter-max-candidates <int>] \
+    [--postfilter-ef-list <comma-separated>] \
+    [--postfilter-ef-list-1pct <comma-separated>] \
+    [--postfilter-ef-list-10pct <comma-separated>] \
     [--postfilter-max-candidates-list <comma-separated>] \
     [--postfilter-max-candidates-list-1pct <comma-separated>] \
     [--postfilter-max-candidates-list-10pct <comma-separated>] \
@@ -38,6 +41,9 @@ Core defaults:
   --num-queries                 100
   --out-dir                     <this_dir>/out/filter_method_compare
   --postfilter-max-candidates   3000 (in_search_filter_hnsw)
+  --postfilter-ef-list          8 (post_filter_hnsw sweep)
+  --postfilter-ef-list-1pct     (inherits --postfilter-ef-list)
+  --postfilter-ef-list-10pct    (inherits --postfilter-ef-list)
   --postfilter-max-candidates-list 500,1000,1500,2000 (post_filter_hnsw sweep)
   --postfilter-max-candidates-list-1pct (inherits --postfilter-max-candidates-list)
   --postfilter-max-candidates-list-10pct (inherits --postfilter-max-candidates-list)
@@ -130,8 +136,8 @@ ensure_executable_file() {
 DATASET="sift1m"
 K=10
 EF_LIST="32,64,96,128,160,200"
-EF_LIST_1PCT="112, 128, 144, 160, 176, 192, 224, 256"
-EF_LIST_10PCT="1000, 1200, 1600, 1800, 2200, 2600, 3200, 4000"
+EF_LIST_1PCT="112, 128, 144, 160, 176, 192, 224"
+EF_LIST_10PCT="1000, 1200, 1600, 1800, 2200, 2600, 3200"
 EF_LIST_SET_BY_USER=0
 IN_SEARCH_EF_LIST_1PCT="4"
 IN_SEARCH_EF_LIST_10PCT="24"
@@ -141,11 +147,14 @@ NUM_QUERIES=100
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 POSTFILTER_MAX_CANDIDATES=3000
 POSTFILTER_MAX_CANDIDATES_SET_BY_USER=0
+POSTFILTER_EF_LIST="8"
+POSTFILTER_EF_LIST_1PCT=""
+POSTFILTER_EF_LIST_10PCT=""
 POSTFILTER_MAX_CANDIDATES_LIST="1500,1600,1700,1800,2000"
 POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=0
 POSTFILTER_MAX_CANDIDATES_LIST_1PCT="1900,2100,2400,2800,3200"
-POSTFILTER_MAX_CANDIDATES_LIST_10PCT="500,700,1200,2000,4000"
-DO_BUILD=1
+POSTFILTER_MAX_CANDIDATES_LIST_10PCT="200,232,264,300,400"
+DO_BUILD=0
 DO_PLOT=1
 IAA_AB_COMPARE=0
 SKIP_IAA_CONFIG=0
@@ -226,6 +235,18 @@ while [[ $# -gt 0 ]]; do
     --postfilter-max-candidates)
       POSTFILTER_MAX_CANDIDATES="$2"
       POSTFILTER_MAX_CANDIDATES_SET_BY_USER=1
+      shift 2
+      ;;
+    --postfilter-ef-list)
+      POSTFILTER_EF_LIST="$2"
+      shift 2
+      ;;
+    --postfilter-ef-list-1pct)
+      POSTFILTER_EF_LIST_1PCT="$2"
+      shift 2
+      ;;
+    --postfilter-ef-list-10pct)
+      POSTFILTER_EF_LIST_10PCT="$2"
       shift 2
       ;;
     --postfilter-max-candidates-list)
@@ -370,6 +391,12 @@ fi
 # use it as the post_filter_hnsw sweep list too.
 if [[ "$POSTFILTER_MAX_CANDIDATES_SET_BY_USER" -eq 1 && "$POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER" -eq 0 ]]; then
   POSTFILTER_MAX_CANDIDATES_LIST="$POSTFILTER_MAX_CANDIDATES"
+fi
+if [[ -z "$POSTFILTER_EF_LIST_1PCT" ]]; then
+  POSTFILTER_EF_LIST_1PCT="$POSTFILTER_EF_LIST"
+fi
+if [[ -z "$POSTFILTER_EF_LIST_10PCT" ]]; then
+  POSTFILTER_EF_LIST_10PCT="$POSTFILTER_EF_LIST"
 fi
 if [[ -z "$POSTFILTER_MAX_CANDIDATES_LIST_1PCT" ]]; then
   POSTFILTER_MAX_CANDIDATES_LIST_1PCT="$POSTFILTER_MAX_CANDIDATES_LIST"
@@ -624,6 +651,8 @@ parse_ef_list_into_array "$EFFECTIVE_IN_SEARCH_EF_LIST_1PCT" "--in-search-ef-lis
 parse_ef_list_into_array "$EFFECTIVE_IN_SEARCH_EF_LIST_10PCT" "--in-search-ef-list-10pct" IN_SEARCH_EF_VALUES_10PCT
 parse_ef_list_into_array "$ACORN_EF_LIST_1PCT" "--acorn-ef-list-1pct" ACORN_EF_VALUES_1PCT
 parse_ef_list_into_array "$ACORN_EF_LIST_10PCT" "--acorn-ef-list-10pct" ACORN_EF_VALUES_10PCT
+parse_ef_list_into_array "$POSTFILTER_EF_LIST_1PCT" "--postfilter-ef-list-1pct" POSTFILTER_EF_VALUES_1PCT
+parse_ef_list_into_array "$POSTFILTER_EF_LIST_10PCT" "--postfilter-ef-list-10pct" POSTFILTER_EF_VALUES_10PCT
 parse_positive_int_list_into_array \
   "$POSTFILTER_MAX_CANDIDATES_LIST_1PCT" \
   "--postfilter-max-candidates-list-1pct" \
@@ -1041,13 +1070,13 @@ run_selectivity() {
   else
     methods=(
       "post_filter_hnsw"
-      "in_search_filter_hnsw"
-      "acorn"
-      "compass_lz4"
+      # "in_search_filter_hnsw"
+      # "acorn"
+      # "compass_lz4"
       # "compass_iaa_1"
       # "compass_iaa_2"
-      # "compass_iaa_4"
-      "compass_iaa_8"
+      # # "compass_iaa_4"
+      # "compass_iaa_8"
     )
   fi
 
@@ -1058,6 +1087,12 @@ run_selectivity() {
         method_ef_values=("${IN_SEARCH_EF_VALUES_1PCT[@]}")
       else
         method_ef_values=("${IN_SEARCH_EF_VALUES_10PCT[@]}")
+      fi
+    elif [[ "$method" == "post_filter_hnsw" ]]; then
+      if [[ "$selectivity_pct" == "1" ]]; then
+        method_ef_values=("${POSTFILTER_EF_VALUES_1PCT[@]}")
+      else
+        method_ef_values=("${POSTFILTER_EF_VALUES_10PCT[@]}")
       fi
     elif [[ "$method" == "acorn" ]]; then
       if [[ "$selectivity_pct" == "1" ]]; then
@@ -1217,6 +1252,8 @@ echo "  ef list (1%): ${EF_VALUES_1PCT[*]}"
 echo "  ef list (10%): ${EF_VALUES_10PCT[*]}"
 echo "  in_search ef list (1%): ${IN_SEARCH_EF_VALUES_1PCT[*]}"
 echo "  in_search ef list (10%): ${IN_SEARCH_EF_VALUES_10PCT[*]}"
+echo "  post_filter ef list (1%): ${POSTFILTER_EF_VALUES_1PCT[*]}"
+echo "  post_filter ef list (10%): ${POSTFILTER_EF_VALUES_10PCT[*]}"
 echo "  acorn ef list (1%): ${ACORN_EF_VALUES_1PCT[*]}"
 echo "  acorn ef list (10%): ${ACORN_EF_VALUES_10PCT[*]}"
 echo "  postfilter max-candidates list (1%): ${POSTFILTER_MAX_VALUES_1PCT[*]}"
