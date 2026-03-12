@@ -109,6 +109,9 @@ struct RunStats {
     uint64_t tb_submit_ns = 0;
     uint64_t tb_wait_ns = 0;
     uint64_t tb_wait_calls = 0;
+    uint64_t fid_wait_ns = 0;
+    uint64_t fid_wait_calls = 0;
+    uint64_t level0_expansions = 0;
     uint64_t neighbors_tb_passed = 0;
     uint64_t neighbors_tb_rejected = 0;
     uint64_t fid_ready_candidates = 0;
@@ -153,6 +156,9 @@ struct SearchCallStats {
     uint64_t tb_submit_ns = 0;
     uint64_t tb_wait_ns = 0;
     uint64_t tb_wait_calls = 0;
+    uint64_t fid_wait_ns = 0;
+    uint64_t fid_wait_calls = 0;
+    uint64_t level0_expansions = 0;
 };
 
 struct CompressionStats {
@@ -1566,6 +1572,7 @@ bool fid_match_node(
     AsyncJobRing* ring,
     AsyncRangeQueryCache* cache,
     size_t node_id,
+    SearchCallStats* call_stats,
     compass_iaa_filter::QueryDecompressionMetrics* metrics) {
     if (cache == nullptr ||
         runtime.fid_storage.block_size == 0 ||
@@ -1585,7 +1592,14 @@ bool fid_match_node(
             throw std::runtime_error(
                 "FID block is not ready and no pending async jobs exist");
         }
+        const auto fid_wait_start = std::chrono::steady_clock::now();
         ring->wait_one();
+        const auto fid_wait_end = std::chrono::steady_clock::now();
+        if (call_stats != nullptr) {
+            call_stats->fid_wait_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(fid_wait_end - fid_wait_start).count());
+            ++call_stats->fid_wait_calls;
+        }
     }
     if (metrics != nullptr) {
         ++metrics->fid_cache_hits;
@@ -1867,8 +1881,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
             }
             pending_fid_block_marks[fid_block_id] = static_cast<uint8_t>(0);
             if (cache->fid_state[fid_block_id] == kFidStateNotSubmitted) {
-                submit_fid_scan_job(ring, runtime, fid_block_id, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
-                if (kMeasureInSearchStats) ++call_stats->fid_jobs_submitted;
+                submit_fid_scan_job(ring, runtime, fid_block_id, cache, &call_stats->decomp);
+                ++call_stats->fid_jobs_submitted;
             }
         }
         pending_fid_blocks_to_submit.clear();
@@ -1912,6 +1926,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 ring,
                 cache,
                 static_cast<size_t>(entry.candidate_id),
+                call_stats,
                 (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
             if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
             if (kMeasureInSearchStats) ++call_stats->fid_ready_candidates;
@@ -1969,19 +1984,10 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 retry_temp_buffer_once();
                 continue;
             }
-
-            bool has_inflight = false;
-            for (const FrontierCandidate& buffered_entry : temp_result_buffer) {
-                if (buffered_entry.need_fid &&
-                    buffered_entry.fid_block_id < cache->fid_state.size() &&
-                    cache->fid_state[buffered_entry.fid_block_id] == kFidStateInflight) {
-                    has_inflight = true;
-                    break;
-                }
-            }
-            if (has_inflight) {
+            retry_temp_buffer_once();
+            if (!temp_result_buffer.empty()) {
                 throw std::runtime_error(
-                    "Temporary result entries remain while FID blocks are inflight but no pending jobs exist");
+                    "Deferred range result entries remain without pending async jobs");
             }
             break;
         }
@@ -1998,9 +2004,15 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 retry_temp_buffer_once();
                 continue;
             }
+            retry_temp_buffer_once();
+            if (!temp_result_buffer.empty()) {
+                throw std::runtime_error(
+                    "Deferred range result entries remain after early-stop without pending jobs");
+            }
             break;
         }
         candidate_set.pop();
+        ++call_stats->level0_expansions;
 
         const hnswlib::tableint current_node_id = current.second;
         int* data = reinterpret_cast<int*>(index.get_linklist0(current_node_id));
@@ -2032,11 +2044,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
             if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
             if (!tb_match) {
-                if (kMeasureInSearchStats) ++call_stats->neighbors_tb_rejected;
+                ++call_stats->neighbors_tb_rejected;
                 continue;
             }
 
-            if (kMeasureInSearchStats) ++call_stats->neighbors_tb_passed;
+            ++call_stats->neighbors_tb_passed;
             FrontierCandidate entry;
             entry.candidate_id = candidate_id;
             entry.deleted = index.isMarkedDeleted(candidate_id);
@@ -2067,7 +2079,29 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 index.dist_func_param_);
         }
 
-        // Stage 4: non-blocking completion checks and candidate/result updates.
+        // Stage 3.5: force all required FID blocks for this frontier to complete
+        // before candidate/result updates. This makes result gating behavior
+        // equivalent to synchronous FID-available processing for validation.
+        for (const FrontierCandidate& entry : frontier_candidates) {
+            if (!entry.need_fid || entry.fid_block_id >= cache->fid_state.size()) {
+                continue;
+            }
+            while (cache->fid_state[entry.fid_block_id] != kFidStateReady) {
+                if (!ring->has_pending()) {
+                    throw std::runtime_error(
+                        "FID block is not ready before candidate update and no pending async jobs exist");
+                }
+                const auto fid_wait_start = std::chrono::steady_clock::now();
+                ring->wait_one();
+                const auto fid_wait_end = std::chrono::steady_clock::now();
+                call_stats->fid_wait_ns += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(fid_wait_end - fid_wait_start).count());
+                ++call_stats->fid_wait_calls;
+                poll_ready_jobs();
+            }
+        }
+
+        // Stage 4: candidate/result updates after all required FID blocks are ready.
         poll_ready_jobs();
         for (const FrontierCandidate& entry : frontier_candidates) {
             const bool consider = (top_candidates.size() < ef || lower_bound > entry.dist);
@@ -2084,24 +2118,18 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 continue;
             }
 
-            if (entry.fid_block_id < cache->fid_state.size() &&
-                cache->fid_state[entry.fid_block_id] == kFidStateReady) {
-                const bool fid_match = fid_match_node(
-                    runtime,
-                    ring,
-                    cache,
-                    static_cast<size_t>(entry.candidate_id),
-                    (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
-                if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
-                if (kMeasureInSearchStats) ++call_stats->fid_ready_candidates;
-                if (fid_match) {
-                    push_result_candidate_if_allowed(entry);
-                }
-                continue;
+            const bool fid_match = fid_match_node(
+                runtime,
+                ring,
+                cache,
+                static_cast<size_t>(entry.candidate_id),
+                call_stats,
+                (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+            if (kMeasureInSearchStats) ++call_stats->filter_eval_calls;
+            if (kMeasureInSearchStats) ++call_stats->fid_ready_candidates;
+            if (fid_match) {
+                push_result_candidate_if_allowed(entry);
             }
-
-            temp_result_buffer.push_back(entry);
-            if (kMeasureInSearchStats) ++call_stats->deferred_candidates_enqueued;
         }
 
         // Stage 5: retry deferred candidates that may now be ready.
@@ -2130,6 +2158,89 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
 
     index.visited_list_pool_->releaseVisitedList(vl);
     return result;
+}
+
+bool numeric_value_matches_range(double value, const RangePredicateSpec& spec) {
+    if (std::isfinite(spec.low)) {
+        if (spec.low_inclusive) {
+            if (value < spec.low) {
+                return false;
+            }
+        } else if (value <= spec.low) {
+            return false;
+        }
+    }
+    if (std::isfinite(spec.high)) {
+        if (spec.high_inclusive) {
+            if (value > spec.high) {
+                return false;
+            }
+        } else if (value >= spec.high) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<size_t> collect_numeric_result_nodes_from_jsonl(
+    const std::string& payload_jsonl_path,
+    const RangePredicateSpec& spec,
+    size_t expected_rows) {
+    std::ifstream in(payload_jsonl_path);
+    if (!in.is_open()) {
+        throw std::runtime_error("Failed to open payload JSONL for ENNS GT: " + payload_jsonl_path);
+    }
+
+    std::vector<size_t> out;
+    out.reserve(expected_rows / 8);
+    std::string line;
+    size_t row_id = 0;
+    while (row_id < expected_rows && std::getline(in, line)) {
+        if (line.empty()) {
+            throw std::runtime_error(
+                "Encountered empty JSONL line while building ENNS GT at row " +
+                std::to_string(row_id));
+        }
+
+        nlohmann::json j;
+        try {
+            j = nlohmann::json::parse(line);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                "Failed to parse payload JSONL row " + std::to_string(row_id) +
+                " while building ENNS GT: " + std::string(e.what()));
+        }
+        if (!j.is_object()) {
+            throw std::runtime_error(
+                "Payload JSONL row is not an object while building ENNS GT at row " +
+                std::to_string(row_id));
+        }
+
+        auto it = j.find(spec.field);
+        if (it == j.end() || it->is_null()) {
+            throw std::runtime_error(
+                "Missing numeric field '" + spec.field + "' in payload JSONL row " +
+                std::to_string(row_id) + " while building ENNS GT");
+        }
+        if (!it->is_number()) {
+            throw std::runtime_error(
+                "Field '" + spec.field + "' is non-numeric in payload JSONL row " +
+                std::to_string(row_id) + " while building ENNS GT");
+        }
+
+        const double value = it->get<double>();
+        if (numeric_value_matches_range(value, spec)) {
+            out.push_back(row_id);
+        }
+        ++row_id;
+    }
+
+    if (row_id < expected_rows) {
+        throw std::runtime_error(
+            "Payload JSONL has fewer rows than graph elements while building ENNS GT: rows=" +
+            std::to_string(row_id) + ", expected=" + std::to_string(expected_rows));
+    }
+    return out;
 }
 
 template <typename DistT, typename QueryT>
@@ -2192,7 +2303,18 @@ RunStats run_search_typed(
     std::unique_ptr<AsyncJobRing> shared_ring;
     shared_ring = std::make_unique<AsyncJobRing>(128, 64, async_job_output_bytes);
 
-    std::vector<size_t> result_nodes = async_runtime->numeric_result_nodes;
+    std::string gt_parse_reason;
+    const std::optional<RangePredicateSpec> gt_spec =
+        parse_single_numeric_range_predicate(args.filter_expression, &gt_parse_reason);
+    if (!gt_spec.has_value()) {
+        throw std::runtime_error(
+            "Failed to derive payload-jsonl ENNS range predicate from filter expression: " +
+            gt_parse_reason);
+    }
+    std::vector<size_t> result_nodes = collect_numeric_result_nodes_from_jsonl(
+        args.payload_jsonl,
+        *gt_spec,
+        index.getCurrentElementCount());
     std::vector<FilteredCandidate> filtered_candidates;
     filtered_candidates.reserve(result_nodes.size());
     for (size_t node_id : result_nodes) {
@@ -2362,6 +2484,9 @@ RunStats run_search_typed(
         stats.tb_submit_ns += call_stats.tb_submit_ns;
         stats.tb_wait_ns += call_stats.tb_wait_ns;
         stats.tb_wait_calls += call_stats.tb_wait_calls;
+        stats.fid_wait_ns += call_stats.fid_wait_ns;
+        stats.fid_wait_calls += call_stats.fid_wait_calls;
+        stats.level0_expansions += call_stats.level0_expansions;
         stats.search_loop_time_ns += query_search_ns;
 
         returned_results += result.size();
@@ -2597,6 +2722,19 @@ std::string build_summary(
     oss << "debug_tb_submit_ms: " << (static_cast<double>(stats.tb_submit_ns) / 1e6) << "\n";
     oss << "debug_tb_wait_ms: " << (static_cast<double>(stats.tb_wait_ns) / 1e6) << "\n";
     oss << "debug_tb_wait_calls: " << stats.tb_wait_calls << "\n";
+    oss << "debug_fid_wait_ms: " << (static_cast<double>(stats.fid_wait_ns) / 1e6) << "\n";
+    oss << "debug_fid_wait_calls: " << stats.fid_wait_calls << "\n";
+    oss << "debug_level0_expansions: " << stats.level0_expansions << "\n";
+    oss << "debug_fid_blocks_per_expansion: "
+        << ((stats.level0_expansions > 0)
+                ? (static_cast<double>(stats.fid_blocks_decompressed) / static_cast<double>(stats.level0_expansions))
+                : 0.0)
+        << "\n";
+    oss << "debug_tb_passed_per_expansion: "
+        << ((stats.level0_expansions > 0)
+                ? (static_cast<double>(stats.neighbors_tb_passed) / static_cast<double>(stats.level0_expansions))
+                : 0.0)
+        << "\n";
     oss << "debug_ensure_free_slot_wait_calls: " << stats.ensure_free_slot_wait_calls << "\n";
     oss << "debug_ensure_free_slot_wait_slots: " << stats.ensure_free_slot_wait_slots << "\n";
     oss << "debug_ensure_free_slot_wait_ms: "
