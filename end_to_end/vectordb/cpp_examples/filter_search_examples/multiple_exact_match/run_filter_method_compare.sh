@@ -220,34 +220,34 @@ parse_ef_list_into_array() {
 # Methods to run.
 # Comment out entries here for quick manual method selection.
 METHODS=(
-  # "post_filter_hnsw"
-  # "in_search_filter_hnsw"
+  "post_filter_hnsw"
+  "in_search_filter_hnsw"
   "acorn"
-  # "compass_lz4"
+  "compass_lz4"
   # "compass_iaa_1"
   # "compass_iaa_2"
   # "compass_iaa_4"
-  # "compass_iaa_8"
+  "compass_iaa_8"
 )
 
 DATASET="hnm"
 K=10
 EF_LIST="64,96,128,160,200"
-EF_LIST_1PCT="32, 48, 64, 96"
-EF_LIST_10PCT="32, 48, 64, 96, 128, 160, 200"
-IN_SEARCH_EF_LIST_1PCT="4,8,16,32,64"
-IN_SEARCH_EF_LIST_10PCT="4,8,16,32,64"
-ACORN_EF_LIST_1PCT="44,52,64,80,96,112,128,144,160,320"
-ACORN_EF_LIST_10PCT="80,96,600, 800"
+EF_LIST_1PCT="9,10,16,24"
+EF_LIST_10PCT="36,64,96,128,400"
+IN_SEARCH_EF_LIST_1PCT="4"
+IN_SEARCH_EF_LIST_10PCT="4,12,16,48"
+ACORN_EF_LIST_1PCT="8,9,12,14,26,30,40"
+ACORN_EF_LIST_10PCT="10,13,17,32,80"
 NUM_QUERIES=100
 OUT_DIR="$SCRIPT_DIR/out/filter_method_compare"
 POSTFILTER_MAX_CANDIDATES=3000
 POSTFILTER_MAX_CANDIDATES_LIST="3000"
-POSTFILTER_MAX_CANDIDATES_LIST_1PCT="21000,22000,23000,24000,25000"
-POSTFILTER_MAX_CANDIDATES_LIST_10PCT="3200,3400,3800,4500,6000"
+POSTFILTER_MAX_CANDIDATES_LIST_1PCT="18000,19000,20000,22000,23000, 25000"
+POSTFILTER_MAX_CANDIDATES_LIST_10PCT="3200,3400,3500,3600,3700,4200,5000"
 POSTFILTER_EF_LIST_1PCT="8"
 POSTFILTER_EF_LIST_10PCT="8"
-DO_BUILD=1
+DO_BUILD=0
 DO_PLOT=1
 
 FILTER_EXPR_AND="department_name == 'Baby Toys/Acc' AND garment_group_name == 'Accessories'"
@@ -464,8 +464,8 @@ fi
 : "${QUERY_PATH:=/storage/jykang5/compass_base_query/hnm_query.fvecs}"
 : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/hnm/manifest.json}"
 : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/hnm/manifest.json}"
-: "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m64_nf256.index}"
-: "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m64_nf256.index}"
+: "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m128_nf256.index}"
+: "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m128_nf256.index}"
 : "${PAYLOAD_JSONL:=/storage/jykang5/payloads/hnm_payloads.jsonl}"
 
 HNSW_RUN="$SCRIPT_DIR/hnswlib_filter_search.run"
