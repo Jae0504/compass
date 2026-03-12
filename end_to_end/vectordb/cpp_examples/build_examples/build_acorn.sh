@@ -20,6 +20,8 @@ Options:
   --laion-payload <path>   Path to LAION payload (.json/.jsonl)
   --hnm-base <path>        Path to H&M base vectors (.fvecs/.bvecs)
   --hnm-payload <path>     Path to H&M payload (.json/.jsonl)
+  --metadata-float-key <k> Use raw float metadata field (laion/hnm only)
+  --metadata-no-bucket     Keep unique token IDs (no modulo bucketing)
   --out-dir <dir>          Output directory for ACORN indices
   --nfilters <int>         Number of filter groups (default: 10)
   --m <int>                ACORN M (default: 32)
@@ -51,6 +53,8 @@ EF_CONSTRUCTION=-1
 THREADS=64
 SKIP_BUILD=0
 DRY_RUN=0
+METADATA_FLOAT_KEY=""
+METADATA_NO_BUCKET=0
 
 SIFT_BASE=""
 LAION_BASE=""
@@ -82,6 +86,8 @@ while [[ $# -gt 0 ]]; do
     --laion-payload) LAION_PAYLOAD="$2"; shift 2 ;;
     --hnm-base) HNM_BASE="$2"; shift 2 ;;
     --hnm-payload) HNM_PAYLOAD="$2"; shift 2 ;;
+    --metadata-float-key) METADATA_FLOAT_KEY="$2"; shift 2 ;;
+    --metadata-no-bucket) METADATA_NO_BUCKET=1; shift ;;
     --out-dir) OUT_DIR="$2"; shift 2 ;;
     --nfilters) NFILTERS="$2"; shift 2 ;;
     --m) M="$2"; shift 2 ;;
@@ -159,6 +165,13 @@ if [[ -n "$LAION_BASE" || -n "$LAION_PAYLOAD" ]]; then
     echo "LAION payload not found: $LAION_PAYLOAD" >&2
     exit 1
   fi
+  EXTRA_ARGS=()
+  if [[ -n "$METADATA_FLOAT_KEY" ]]; then
+    EXTRA_ARGS+=(--metadata-float-key "$METADATA_FLOAT_KEY")
+  fi
+  if [[ "$METADATA_NO_BUCKET" -eq 1 ]]; then
+    EXTRA_ARGS+=(--metadata-no-bucket)
+  fi
   run_cmd "$RUNNER" \
     --dataset-type laion \
     --base "$LAION_BASE" \
@@ -169,7 +182,8 @@ if [[ -n "$LAION_BASE" || -n "$LAION_PAYLOAD" ]]; then
     --mbeta "$MBETA" \
     --ef-search "$EF_SEARCH" \
     --ef-construction "$EF_CONSTRUCTION" \
-    --threads "$THREADS"
+    --threads "$THREADS" \
+    "${EXTRA_ARGS[@]}"
 fi
 
 if [[ -n "$HNM_BASE" || -n "$HNM_PAYLOAD" ]]; then
@@ -185,6 +199,13 @@ if [[ -n "$HNM_BASE" || -n "$HNM_PAYLOAD" ]]; then
     echo "H&M payload not found: $HNM_PAYLOAD" >&2
     exit 1
   fi
+  EXTRA_ARGS=()
+  if [[ -n "$METADATA_FLOAT_KEY" ]]; then
+    EXTRA_ARGS+=(--metadata-float-key "$METADATA_FLOAT_KEY")
+  fi
+  if [[ "$METADATA_NO_BUCKET" -eq 1 ]]; then
+    EXTRA_ARGS+=(--metadata-no-bucket)
+  fi
   run_cmd "$RUNNER" \
     --dataset-type hnm \
     --base "$HNM_BASE" \
@@ -195,7 +216,8 @@ if [[ -n "$HNM_BASE" || -n "$HNM_PAYLOAD" ]]; then
     --mbeta "$MBETA" \
     --ef-search "$EF_SEARCH" \
     --ef-construction "$EF_CONSTRUCTION" \
-    --threads "$THREADS"
+    --threads "$THREADS" \
+    "${EXTRA_ARGS[@]}"
 fi
 
 echo "Done."

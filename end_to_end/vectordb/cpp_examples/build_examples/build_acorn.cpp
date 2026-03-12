@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -45,6 +46,8 @@ struct Args {
     std::string base_path;
     std::string out_path;
     std::string payload_path;
+    std::string metadata_float_key;
+    bool metadata_no_bucket = false;
     int nfilters = 100;
     int m = 32;
     int mbeta = 64;
@@ -164,6 +167,8 @@ void usage(const char* argv0) {
         << " --base <path(.fvecs|.bvecs)>"
         << " --out <path(.index)>"
         << " [--payload <path(.json|.jsonl)>]"
+        << " [--metadata-float-key <json field name>]"
+        << " [--metadata-no-bucket]"
         << " [--nfilters 100]"
         << " [--m 32]"
         << " [--mbeta 64]"
@@ -229,6 +234,10 @@ Args parse_args(int argc, char** argv) {
             args.out_path = require_value(cur);
         } else if (cur == "--payload") {
             args.payload_path = require_value(cur);
+        } else if (cur == "--metadata-float-key") {
+            args.metadata_float_key = require_value(cur);
+        } else if (cur == "--metadata-no-bucket") {
+            args.metadata_no_bucket = true;
         } else if (cur == "--nfilters") {
             args.nfilters = parse_int_or_throw(require_value(cur), "--nfilters");
         } else if (cur == "--m") {
@@ -265,6 +274,12 @@ Args parse_args(int argc, char** argv) {
     }
     if (args.dataset_type != "sift1m") {
         ensure_readable_file(args.payload_path, "--payload");
+    }
+    if (!args.metadata_float_key.empty() && args.dataset_type == "sift1m") {
+        throw std::runtime_error("--metadata-float-key is supported only for laion/hnm");
+    }
+    if (args.metadata_no_bucket && args.dataset_type == "sift1m") {
+        throw std::runtime_error("--metadata-no-bucket is supported only for laion/hnm");
     }
 
     if (!ends_with(lower_copy(args.base_path), ".fvecs") && !ends_with(lower_copy(args.base_path), ".bvecs")) {
@@ -356,6 +371,37 @@ uint64_t fnv1a64(const std::string& s) {
     return h;
 }
 
+int float_to_metadata_id(float value) {
+    static_assert(sizeof(float) == sizeof(uint32_t), "Unexpected float size");
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(float));
+    return static_cast<int32_t>(bits);
+}
+
+std::optional<float> json_value_to_float(const json& row, const std::string& key) {
+    if (!row.is_object() || !row.contains(key) || row[key].is_null()) {
+        return std::nullopt;
+    }
+    const json& v = row[key];
+    if (v.is_number()) {
+        return static_cast<float>(v.get<double>());
+    }
+    if (v.is_string()) {
+        const std::string trimmed = trim_copy(strip_outer_quotes(v.get<std::string>()));
+        if (trimmed.empty()) {
+            return std::nullopt;
+        }
+        char* end = nullptr;
+        errno = 0;
+        const float parsed = std::strtof(trimmed.c_str(), &end);
+        if (errno != 0 || end == trimmed.c_str() || *end != '\0') {
+            return std::nullopt;
+        }
+        return parsed;
+    }
+    return std::nullopt;
+}
+
 class BucketAssigner {
 public:
     explicit BucketAssigner(int nfilters) : nfilters_(nfilters) {}
@@ -367,7 +413,9 @@ public:
         }
 
         int id = 0;
-        if (static_cast<int>(token_to_id_.size()) < nfilters_) {
+        if (nfilters_ <= 0) {
+            id = static_cast<int>(token_to_id_.size());
+        } else if (static_cast<int>(token_to_id_.size()) < nfilters_) {
             id = static_cast<int>(token_to_id_.size());
         } else {
             id = static_cast<int>(fnv1a64(token) % static_cast<uint64_t>(nfilters_));
@@ -444,7 +492,8 @@ std::vector<int> build_metadata_from_jsonl(
         const std::string& payload_path,
         const std::string& dataset_type,
         size_t expected_rows,
-        int nfilters) {
+        int nfilters,
+        bool no_bucket) {
     std::ifstream in(payload_path);
     if (!in.is_open()) {
         throw std::runtime_error("Failed to open payload: " + payload_path);
@@ -452,7 +501,7 @@ std::vector<int> build_metadata_from_jsonl(
 
     std::vector<int> metadata;
     metadata.reserve(expected_rows);
-    BucketAssigner assigner(nfilters);
+    BucketAssigner assigner(no_bucket ? -1 : nfilters);
 
     std::string line;
     size_t line_no = 0;
@@ -482,7 +531,60 @@ std::vector<int> build_metadata_from_jsonl(
     }
 
     std::cout << "Loaded JSONL metadata: rows=" << metadata.size()
-              << ", unique_tokens=" << assigner.unique_tokens() << std::endl;
+              << ", unique_tokens=" << assigner.unique_tokens()
+              << ", no_bucket=" << (no_bucket ? "true" : "false")
+              << std::endl;
+    return metadata;
+}
+
+std::vector<int> build_metadata_from_jsonl_float_key(
+        const std::string& payload_path,
+        const std::string& float_key,
+        size_t expected_rows) {
+    std::ifstream in(payload_path);
+    if (!in.is_open()) {
+        throw std::runtime_error("Failed to open payload: " + payload_path);
+    }
+
+    std::vector<int> metadata;
+    metadata.reserve(expected_rows);
+
+    std::string line;
+    size_t line_no = 0;
+    while (std::getline(in, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        ++line_no;
+        json row;
+        try {
+            row = json::parse(line);
+        } catch (...) {
+            std::ostringstream oss;
+            oss << "Invalid JSON row at line " << line_no << " in payload: " << payload_path;
+            throw std::runtime_error(oss.str());
+        }
+
+        const auto f = json_value_to_float(row, float_key);
+        if (!f.has_value()) {
+            std::ostringstream oss;
+            oss << "Missing/non-numeric float field '" << float_key << "' at line " << line_no;
+            throw std::runtime_error(oss.str());
+        }
+        metadata.push_back(float_to_metadata_id(*f));
+        if (metadata.size() >= expected_rows) {
+            break;
+        }
+    }
+
+    if (metadata.size() < expected_rows) {
+        std::ostringstream oss;
+        oss << "Payload rows (" << metadata.size() << ") are fewer than base vectors (" << expected_rows << ")";
+        throw std::runtime_error(oss.str());
+    }
+
+    std::cout << "Loaded float metadata from JSONL: rows=" << metadata.size()
+              << ", field=" << float_key << std::endl;
     return metadata;
 }
 
@@ -490,7 +592,8 @@ std::vector<int> build_metadata_from_json_array(
         const std::string& payload_path,
         const std::string& dataset_type,
         size_t expected_rows,
-        int nfilters) {
+        int nfilters,
+        bool no_bucket) {
     std::ifstream in(payload_path);
     if (!in.is_open()) {
         throw std::runtime_error("Failed to open payload: " + payload_path);
@@ -509,7 +612,7 @@ std::vector<int> build_metadata_from_json_array(
 
     std::vector<int> metadata;
     metadata.reserve(expected_rows);
-    BucketAssigner assigner(nfilters);
+    BucketAssigner assigner(no_bucket ? -1 : nfilters);
     for (size_t i = 0; i < expected_rows; ++i) {
         const json& row = root[i];
         const std::string token = (dataset_type == "laion") ? token_for_laion(row) : token_for_hnm(row);
@@ -517,7 +620,47 @@ std::vector<int> build_metadata_from_json_array(
     }
 
     std::cout << "Loaded JSON-array metadata: rows=" << metadata.size()
-              << ", unique_tokens=" << assigner.unique_tokens() << std::endl;
+              << ", unique_tokens=" << assigner.unique_tokens()
+              << ", no_bucket=" << (no_bucket ? "true" : "false")
+              << std::endl;
+    return metadata;
+}
+
+std::vector<int> build_metadata_from_json_array_float_key(
+        const std::string& payload_path,
+        const std::string& float_key,
+        size_t expected_rows) {
+    std::ifstream in(payload_path);
+    if (!in.is_open()) {
+        throw std::runtime_error("Failed to open payload: " + payload_path);
+    }
+
+    json root;
+    in >> root;
+    if (!root.is_array()) {
+        throw std::runtime_error("JSON payload is not an array: " + payload_path);
+    }
+    if (root.size() < expected_rows) {
+        std::ostringstream oss;
+        oss << "Payload rows (" << root.size() << ") are fewer than base vectors (" << expected_rows << ")";
+        throw std::runtime_error(oss.str());
+    }
+
+    std::vector<int> metadata;
+    metadata.reserve(expected_rows);
+    for (size_t i = 0; i < expected_rows; ++i) {
+        const json& row = root[i];
+        const auto f = json_value_to_float(row, float_key);
+        if (!f.has_value()) {
+            std::ostringstream oss;
+            oss << "Missing/non-numeric float field '" << float_key << "' at row index " << i;
+            throw std::runtime_error(oss.str());
+        }
+        metadata.push_back(float_to_metadata_id(*f));
+    }
+
+    std::cout << "Loaded float metadata from JSON-array: rows=" << metadata.size()
+              << ", field=" << float_key << std::endl;
     return metadata;
 }
 
@@ -525,20 +668,57 @@ std::vector<int> build_json_metadata(
         const std::string& payload_path,
         const std::string& dataset_type,
         size_t expected_rows,
-        int nfilters) {
+        int nfilters,
+        const std::string& metadata_float_key,
+        bool metadata_no_bucket) {
+    if (!metadata_float_key.empty()) {
+        const std::string lower = lower_copy(payload_path);
+        if (ends_with(lower, ".jsonl")) {
+            return build_metadata_from_jsonl_float_key(payload_path, metadata_float_key, expected_rows);
+        }
+        if (ends_with(lower, ".json")) {
+            return build_metadata_from_json_array_float_key(payload_path, metadata_float_key, expected_rows);
+        }
+        try {
+            return build_metadata_from_jsonl_float_key(payload_path, metadata_float_key, expected_rows);
+        } catch (...) {
+            return build_metadata_from_json_array_float_key(payload_path, metadata_float_key, expected_rows);
+        }
+    }
+
     const std::string lower = lower_copy(payload_path);
     if (ends_with(lower, ".jsonl")) {
-        return build_metadata_from_jsonl(payload_path, dataset_type, expected_rows, nfilters);
+        return build_metadata_from_jsonl(
+                payload_path,
+                dataset_type,
+                expected_rows,
+                nfilters,
+                metadata_no_bucket);
     }
     if (ends_with(lower, ".json")) {
-        return build_metadata_from_json_array(payload_path, dataset_type, expected_rows, nfilters);
+        return build_metadata_from_json_array(
+                payload_path,
+                dataset_type,
+                expected_rows,
+                nfilters,
+                metadata_no_bucket);
     }
 
     // Fallback: try line-oriented JSON first, then array JSON.
     try {
-        return build_metadata_from_jsonl(payload_path, dataset_type, expected_rows, nfilters);
+        return build_metadata_from_jsonl(
+                payload_path,
+                dataset_type,
+                expected_rows,
+                nfilters,
+                metadata_no_bucket);
     } catch (...) {
-        return build_metadata_from_json_array(payload_path, dataset_type, expected_rows, nfilters);
+        return build_metadata_from_json_array(
+                payload_path,
+                dataset_type,
+                expected_rows,
+                nfilters,
+                metadata_no_bucket);
     }
 }
 
@@ -546,7 +726,13 @@ std::vector<int> build_metadata(const Args& args, size_t n) {
     if (args.dataset_type == "sift1m") {
         return build_sift_metadata(n, args.nfilters);
     }
-    return build_json_metadata(args.payload_path, args.dataset_type, n, args.nfilters);
+    return build_json_metadata(
+            args.payload_path,
+            args.dataset_type,
+            n,
+            args.nfilters,
+            args.metadata_float_key,
+            args.metadata_no_bucket);
 }
 
 }  // namespace
@@ -575,6 +761,11 @@ int main(int argc, char** argv) {
                   << "  dataset_type: " << args.dataset_type << "\n"
                   << "  base: " << args.base_path << "\n"
                   << "  out: " << args.out_path << "\n"
+                  << "  metadata_float_key: "
+                  << (args.metadata_float_key.empty() ? std::string("<bucketed-token-mode>") : args.metadata_float_key)
+                  << "\n"
+                  << "  metadata_no_bucket: " << (args.metadata_no_bucket ? "true" : "false")
+                  << "\n"
                   << "  n=" << ds.num << ", d=" << ds.dim << "\n"
                   << "  nfilters=" << args.nfilters
                   << ", M=" << args.m
