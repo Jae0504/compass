@@ -87,42 +87,50 @@ def plot(output_path):
                zorder=3)
 
     # --- Small white gap on every bar at the log break ---
-    BREAK_Y = 316.0
-    BRK_LO  = BREAK_Y / 1.08
-    BRK_HI  = BREAK_Y * 1.08
+    # BREAK_Y = 316.0
+    # BRK_LO  = BREAK_Y / 1.08
+    # BRK_HI  = BREAK_Y * 1.08
 
-    for m_idx, method in enumerate(METHODS):
-        offsets = xs + (m_idx - (n_methods - 1) / 2) * bar_w
-        for x_pos in offsets:
-            xl = x_pos - bar_w / 2 + 0.005
-            xr = x_pos + bar_w / 2 - 0.005
-            ax.fill([xl, xr, xr, xl],
-                    [BRK_LO, BRK_LO, BRK_HI, BRK_HI],
-                    color="white", zorder=5, linewidth=0)
+    # for m_idx, method in enumerate(METHODS):
+    #     offsets = xs + (m_idx - (n_methods - 1) / 2) * bar_w
+    #     for x_pos in offsets:
+    #         xl = x_pos - bar_w / 2 + 0.005
+    #         xr = x_pos + bar_w / 2 - 0.005
+    #         ax.fill([xl, xr, xr, xl],
+    #                 [BRK_LO, BRK_LO, BRK_HI, BRK_HI],
+    #                 color="white", zorder=5, linewidth=0)
 
     ax.set_yscale("log")
     ax.set_ylim(0.5, 4e5)
-    ax.set_yticks([1, 10, 10_000, 100_000])
-    ax.yaxis.set_major_formatter(FuncFormatter(_size_fmt))
+    ax.set_yticks([1, 10, 100, 1_000, 10_000, 100_000])
+    ax.yaxis.set_major_formatter(FuncFormatter(
+        lambda val, pos: {1: "1", 10: "10", 100: r"$10^2$", 1_000: r"$10^3$",
+                          10_000: r"$10^4$", 100_000: r"$10^5$"}.get(int(val), "")))
     ax.yaxis.set_minor_locator(plt.NullLocator())
 
     # Break marks on y-axis (geometric midpoint of the log gap)
-    FACTOR  = 1.25   # ±25 % in log space ≈ small visual tick
-    trans = blended_transform_factory(ax.transAxes, ax.transData)
-    mark_kw = dict(transform=trans, color="k", clip_on=False,
-                   linewidth=1.2, zorder=10)
-    for x_c in [-0.01, 0.025]:   # two parallel slashes
-        ax.plot([x_c - 0.025, x_c + 0.025],
-                [BREAK_Y / FACTOR, BREAK_Y * FACTOR],
-                **mark_kw)
+    # FACTOR  = 1.25   # ±25 % in log space ≈ small visual tick
+    # trans = blended_transform_factory(ax.transAxes, ax.transData)
+    # mark_kw = dict(transform=trans, color="k", clip_on=False,
+    #                linewidth=1.2, zorder=10)
+    # for x_c in [-0.01, 0.025]:   # two parallel slashes
+    #     ax.plot([x_c - 0.025, x_c + 0.025],
+    #             [BREAK_Y / FACTOR, BREAK_Y * FACTOR],
+    #             **mark_kw)
 
     ax.set_xticks(xs)
     ax.set_xticklabels(DATASETS)
-    ax.set_xlabel("Benchmark")
-    ax.set_ylabel("Metadata Size")
+    ax.set_xlabel("Benchmark", labelpad=1)
+    ax.tick_params(axis="x", pad=2)
+    ax.set_ylabel("Metadata Size (MB)")
     ax.grid(True, axis="y", linestyle="--", linewidth=0.8,
             alpha=0.4, color="#c7c7c7", zorder=0)
     ax.set_axisbelow(True)
+
+    plt.tight_layout(pad=0.3, rect=[0, 0, 1, 0.92])
+    # Force same axes height as plot_three_component_breakdown.py (h=0.6870)
+    pos = ax.get_position()
+    ax.set_position([pos.x0, pos.y0, pos.width, 0.6870])
 
     all_handles = [
         Patch(facecolor=METHOD_COLORS[m], label=m) for m in METHODS
@@ -136,8 +144,6 @@ def plot(output_path):
                handlelength=0.7, handleheight=0.7,
                columnspacing=0.3, handletextpad=0.3,
                prop={"family": "Arial", "size": 12, "weight": "normal"})
-
-    plt.tight_layout(pad=0.3, rect=[0, 0, 1, 0.92])
 
     out_dir = os.path.dirname(os.path.abspath(output_path))
     os.makedirs(out_dir, exist_ok=True)
