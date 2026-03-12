@@ -2,3 +2,5 @@
 dataset/
 graph_filter_exp/
 *.run
+*.png
+*,svg
