@@ -1,0 +1,4 @@
+suite,scenario,qid,expansion_id,dim,n_tb1_nodes,distance_ns
+multiple_exact_match,1pct_e8_smoke,0,0,2048,2,1778
+multiple_exact_match,1pct_e8_smoke,0,1,2048,2,1802
+multiple_exact_match,1pct_e8_smoke,0,4,2048,37,26122

@@ -1,0 +1,6 @@
+suite,scenario,qid,expansion_id,dim,n_tb1_nodes,distance_ns
+range_search,1pct_e8_smoke,0,0,512,8,1946
+range_search,1pct_e8_smoke,0,1,512,10,2173
+range_search,1pct_e8_smoke,0,2,512,1,183
+range_search,1pct_e8_smoke,0,6,512,4,863
+range_search,1pct_e8_smoke,0,32,512,10,2095
