@@ -150,22 +150,22 @@ def _try_plot_matplotlib(
         axis.grid(axis="y", which="major", linestyle=":", alpha=0.35, linewidth=1.0)
         axis.grid(axis="y", which="minor", linestyle=":", alpha=0.22, linewidth=0.8)
 
-    # White break stripe on bars — at the same data y as the two slashes.
-    stripe_y_data = (top_min + top_max) / 2   # matches y_mid in figure coords
-    stripe_h_data = (top_max - top_min) * 0.03
-    all_bar_x   = stack_x + lz4_x + deflate_x
-    all_bar_vals = (
-        [dist[i] + trav[i] + cand[i] for i in range(len(dist))]
-        + list(common_lz4)
-        + list(common_deflate)
-    )
-    for bx, val in zip(all_bar_x, all_bar_vals):
-        if val >= top_min:   # bar reaches into the top panel
-            ax_top.add_patch(plt.Rectangle(
-                (bx - w / 2, stripe_y_data - stripe_h_data),
-                w, stripe_h_data * 2,
-                color="white", zorder=5, clip_on=True, transform=ax_top.transData,
-            ))
+    # # White break stripe on bars — at the same data y as the two slashes.
+    # stripe_y_data = (top_min + top_max) / 2   # matches y_mid in figure coords
+    # stripe_h_data = (top_max - top_min) * 0.03
+    # all_bar_x   = stack_x + lz4_x + deflate_x
+    # all_bar_vals = (
+    #     [dist[i] + trav[i] + cand[i] for i in range(len(dist))]
+    #     + list(common_lz4)
+    #     + list(common_deflate)
+    # )
+    # for bx, val in zip(all_bar_x, all_bar_vals):
+    #     if val >= top_min:   # bar reaches into the top panel
+    #         ax_top.add_patch(plt.Rectangle(
+    #             (bx - w / 2, stripe_y_data - stripe_h_data),
+    #             w, stripe_h_data * 2,
+    #             color="white", zorder=5, clip_on=True, transform=ax_top.transData,
+    #         ))
 
     # Broken-axis spines.
     ax_top.spines["bottom"].set_visible(False)
@@ -196,12 +196,12 @@ def _try_plot_matplotlib(
     bbox_top = ax_top.get_position()
     y_mid  = (bbox_top.y0 + bbox_top.y1) / 2   # middle of the top panel
     x0 = bbox_top.x0
-    for shift_x in (-dw * 0.3, dw * 0.3):
-        fig.add_artist(plt.Line2D(
-            [x0 + shift_x - dw / 2, x0 + shift_x + dw / 2],
-            [y_mid - dh / 2,         y_mid + dh / 2],
-            **lkw,
-        ))
+    # for shift_x in (-dw * 0.3, dw * 0.3):
+    #     fig.add_artist(plt.Line2D(
+    #         [x0 + shift_x - dw / 2, x0 + shift_x + dw / 2],
+    #         [y_mid - dh / 2,         y_mid + dh / 2],
+    #         **lkw,
+    #     ))
 
     fig.savefig(out_path, dpi=200)
     return True
