@@ -78,6 +78,7 @@ def main() -> None:
             "matplotlib and numpy are required. Install with: pip install matplotlib numpy"
         ) from e
     from matplotlib.ticker import AutoMinorLocator, NullLocator
+    from matplotlib.patches import Patch
 
     plt.rcParams["font.family"] = "Arial"
     plt.rcParams["font.size"] = 12
@@ -105,6 +106,8 @@ def main() -> None:
         a_submit,
         width,
         color="#1E8FFF",
+        hatch="///",
+        edgecolor="black",
         label="Submit (A)",
     )
     ax.bar(
@@ -121,6 +124,8 @@ def main() -> None:
         l_submit,
         width,
         color="#FF0000",
+        hatch="///",
+        edgecolor="black",
         label="Submit (N-A)",
     )
     ax.bar(
@@ -178,17 +183,29 @@ def main() -> None:
     ax.xaxis.set_minor_locator(NullLocator())
     ax.tick_params(axis="y", which="minor", left=False, right=False, length=0)
     ax.tick_params(axis="x", which="minor", bottom=False, top=False)
-    ax.grid(axis="y", which="major", linestyle="-", linewidth=0.9, alpha=0.45)
+    ax.grid(axis="y", which="major", linestyle=":", linewidth=0.9, alpha=0.45)
     ax.grid(axis="y", which="minor", linestyle=":", linewidth=0.7, alpha=0.35)
+    handles, labels = ax.get_legend_handles_labels()
+    non_overlappable_patch = Patch(
+        facecolor="gray",
+        hatch="///",
+        edgecolor="black",
+        label="Non-overlappable",
+    )
+    handles.append(non_overlappable_patch)
+    labels.append("Non-overlappable")
     legend = fig.legend(
+        handles,
+        labels,
         loc="upper center",
         bbox_to_anchor=(0.5, 1.04),
-        ncol=4,
+        ncol=5,
         frameon=False,
         prop={"family": "Arial", "size": 12, "weight": "bold"},
-        handlelength=1.0,
-        handleheight=1.0,
-        columnspacing=0.9,
+        handlelength=0.6,
+        handleheight=0.6,
+        columnspacing=0.5,
+        handletextpad=0.4,
     )
     for text in legend.get_texts():
         text.set_fontweight("bold")
