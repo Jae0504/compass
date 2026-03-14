@@ -155,11 +155,14 @@ def main():
     legend_handles = []
     legend_labels  = []
 
+    # If synthetic data (dim=0) exists, use it for all subplots
+    has_synthetic = 0 in df["dim"].unique()
+
     for ax_idx, (ax, dim) in enumerate(zip(axes, DIMS)):
         is_leftmost = (ax_idx == 0)
         chunk_size  = dim_chunk[dim]
 
-        df_dim        = df[df["dim"] == dim]
+        df_dim        = df[df["dim"] == 0] if has_synthetic else df[df["dim"] == dim]
         avail_engines = sorted(df_dim["engine_count"].unique())
         engines_to_plot = [e for e in ENGINE_COUNTS if e in avail_engines]
 
@@ -188,7 +191,7 @@ def main():
                 lz4_x     = merged["n_nodes"].to_numpy()
                 lz4_y     = (merged["lz4_decompress_ns_median"]
                              + merged["latency_ns_median"]).to_numpy()
-                lz4_label = "LZ4 + Dist calc"
+                lz4_label = "Decomp. (LZ4, CPU) + Dist calc"
         elif not df_lz4_cs.empty:
             lz4_x = df_lz4_cs["n_nodes"].to_numpy()
             lz4_y = df_lz4_cs["lz4_decompress_ns_median"].to_numpy()
@@ -245,10 +248,10 @@ def main():
                          color=IAA_COLORS[eng], linewidth=0,
                          marker=IAA_MARKERS[eng], markersize=5,
                          linestyle="none",
-                         label=f"IAA wait e{eng}", zorder=4)
+                         label=f"Decomp. (Deflate, IAA_{eng})", zorder=4)
             if is_leftmost:
                 legend_handles.append(h)
-                legend_labels.append(f"IAA wait e{eng}")
+                legend_labels.append(f"Decomp. (Deflate, IAA_{eng})")
 
         # ── LZ4 line ────────────────────────────────────────────────────────
         if lz4_x is not None and lz4_y is not None:
@@ -310,7 +313,7 @@ def main():
                labelspacing=0.2)
 
     fig.subplots_adjust(left=0.09, right=0.99, top=0.85, bottom=0.15, wspace=0.20)
-    fig.text(0.5, 0.01, "Number of nodes / jobs",
+    fig.text(0.5, 0.01, "Batch size (#FID checks)",
              ha="center", va="bottom",
              fontsize=12, fontweight="bold")
 

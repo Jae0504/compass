@@ -226,6 +226,55 @@ static std::vector<uint8_t> iaa_compress(const std::vector<uint8_t>& in, QplJob&
     return out;
 }
 
+static std::vector<std::vector<uint8_t>> synthetic_chunks(
+    size_t chunk_size,
+    int pool,
+    uint32_t seed) {
+    std::mt19937 rng(seed);
+
+    // Build a Zipf-like alphabet of 16 distinct values with skewed frequencies.
+    // This mimics real FID data where a few bucket IDs dominate (e.g., popular
+    // categories), giving a realistic compression ratio for both DEFLATE and LZ4.
+    constexpr int N_SYMBOLS = 16;
+    uint8_t alphabet[N_SYMBOLS];
+    {
+        std::uniform_int_distribution<int> val_dist(0, 255);
+        for (int k = 0; k < N_SYMBOLS; ++k) {
+            alphabet[k] = static_cast<uint8_t>(val_dist(rng));
+        }
+    }
+    // Zipf weights: w(k) = 1/(k+1), so symbol 0 is ~16x more frequent than symbol 15.
+    double cum[N_SYMBOLS];
+    double total = 0.0;
+    for (int k = 0; k < N_SYMBOLS; ++k) {
+        total += 1.0 / static_cast<double>(k + 1);
+        cum[k] = total;
+    }
+    for (int k = 0; k < N_SYMBOLS; ++k) {
+        cum[k] /= total;
+    }
+
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+
+    std::vector<std::vector<uint8_t>> chunks(static_cast<size_t>(pool),
+                                              std::vector<uint8_t>(chunk_size));
+    for (int i = 0; i < pool; ++i) {
+        auto& c = chunks[static_cast<size_t>(i)];
+        for (size_t j = 0; j < chunk_size; ++j) {
+            const double r = u01(rng);
+            int idx = 0;
+            while (idx < N_SYMBOLS - 1 && r > cum[idx]) {
+                ++idx;
+            }
+            c[j] = alphabet[idx];
+        }
+        // Guarantee at least one element matches the scan_eq target (value 1)
+        std::uniform_int_distribution<size_t> pos_dist(0, chunk_size - 1);
+        c[pos_dist(rng)] = 1;
+    }
+    return chunks;
+}
+
 struct Dataset {
     int dim = 0;
     std::string fid_path;
@@ -244,6 +293,7 @@ struct Args {
         4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
     };
     std::vector<int> n_list = {1, 2, 4, 8, 16, 32, 64};
+    bool synthetic = false;
 };
 
 static Args parse_args(int argc, char** argv) {
@@ -278,11 +328,13 @@ static Args parse_args(int argc, char** argv) {
             args.chunk_sizes = parse_size_list(need(cur));
         } else if (cur == "--n-list") {
             args.n_list = parse_int_list(need(cur));
+        } else if (cur == "--synthetic") {
+            args.synthetic = true;
         } else if (cur == "-h" || cur == "--help") {
             std::cout
                 << "Usage: " << argv[0] << " [--out-csv PATH] [--engine-count N] [--append]"
                 << " [--warmup N] [--iters N] [--pool-size N] [--cpu-core N] [--numa-node N]"
-                << " [--chunk-sizes csv] [--n-list csv]\n";
+                << " [--chunk-sizes csv] [--n-list csv] [--synthetic]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown arg: " + cur);
@@ -396,14 +448,37 @@ int main(int argc, char** argv) {
         QplJob compressor;
         compressor.init(qpl_path_hardware);
 
-        for (const auto& ds : datasets) {
-            std::cout << "[BENCH] dim=" << ds.dim << " file=" << ds.fid_path << "\n";
-            std::vector<uint8_t> raw = load_file(ds.fid_path);
-            raw = tile_to_size(raw, std::max(max_chunk * 2, raw.size()));
+        // Build list of (dim, chunks-generator) pairs.
+        // In synthetic mode: one entry with dim=0, random data.
+        // In real mode:      three entries from FID files.
+        struct DimRun {
+            int dim;
+            std::function<std::vector<std::vector<uint8_t>>(size_t chunk_size)> make_chunks;
+        };
+        std::vector<DimRun> runs;
+
+        if (args.synthetic) {
+            std::cout << "[BENCH] synthetic mode (random 0-255, at least one match per chunk)\n";
+            runs.push_back({0, [&](size_t chunk_size) {
+                return synthetic_chunks(chunk_size, args.pool_size, static_cast<uint32_t>(42 + chunk_size));
+            }});
+        } else {
+            for (const auto& ds : datasets) {
+                std::cout << "[BENCH] dim=" << ds.dim << " file=" << ds.fid_path << "\n";
+                std::vector<uint8_t> raw = load_file(ds.fid_path);
+                raw = tile_to_size(raw, std::max(max_chunk * 2, raw.size()));
+                runs.push_back({ds.dim, [raw = std::move(raw), &args, dim = ds.dim](size_t chunk_size) {
+                    return random_chunks(raw, chunk_size, args.pool_size, static_cast<uint32_t>(42 + dim + chunk_size));
+                }});
+            }
+        }
+
+        for (auto& run : runs) {
+            const int out_dim = run.dim;
 
             for (size_t chunk_size : args.chunk_sizes) {
                 std::cout << "  chunk_size=" << chunk_size << " bytes\n";
-                auto chunks = random_chunks(raw, chunk_size, args.pool_size, static_cast<uint32_t>(42 + ds.dim + chunk_size));
+                auto chunks = run.make_chunks(chunk_size);
                 auto lz4 = prepare_lz4(chunks, chunk_size);
                 auto iaa = prepare_iaa(chunks, chunk_size, compressor, *std::max_element(args.n_list.begin(), args.n_list.end()));
 
@@ -413,7 +488,7 @@ int main(int argc, char** argv) {
                     }
 
                     const int total_iters = args.warmup + args.iters;
-                    std::mt19937 rng(static_cast<uint32_t>(123 + ds.dim + n_jobs + chunk_size));
+                    std::mt19937 rng(static_cast<uint32_t>(123 + out_dim + n_jobs + chunk_size));
                     std::uniform_int_distribution<int> pick(0, args.pool_size - 1);
                     std::vector<std::vector<int>> picks(static_cast<size_t>(total_iters), std::vector<int>(static_cast<size_t>(n_jobs), 0));
                     for (int t = 0; t < total_iters; ++t) {
@@ -575,7 +650,7 @@ int main(int argc, char** argv) {
                     const uint64_t lz4_med = median_ns(lz4_vals);
 
                     csv
-                        << ds.dim << ','
+                        << out_dim << ','
                         << args.engine_count << ','
                         << chunk_size << ','
                         << n_jobs << ','

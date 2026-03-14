@@ -32,6 +32,7 @@ DIST_OUT_DIR="$DIST_DIR/out"
 
 SKIP_BENCH=0
 SKIP_DIST=0
+SYNTHETIC=0
 
 WARMUP=10
 ITERS=50
@@ -50,10 +51,12 @@ while [[ $# -gt 0 ]]; do
     --chunk-2048)  CHUNK_2048="$2";           shift 2 ;;
     --skip-bench)  SKIP_BENCH=1;              shift   ;;
     --skip-dist)   SKIP_DIST=1;               shift   ;;
+    --synthetic)   SYNTHETIC=1;               shift   ;;
     --out-dir)     OUT_DIR="$2";              shift 2 ;;
     --base-dir)    BASE_DIR="$2";             shift 2 ;;
     --cpu-core)    CPU_CORE="$2";             shift 2 ;;
     --numa-node)   NUMA_NODE="$2";            shift 2 ;;
+    --chunk-sizes) CHUNK_SIZES_CSV="$2";     shift 2 ;;
     *) echo "Unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -96,11 +99,17 @@ else
       sudo chown -R jykang5 /dev/iax
     fi
 
+    synthetic_opt=()
+    if [[ "$SYNTHETIC" -eq 1 ]]; then
+      synthetic_opt=(--synthetic)
+    fi
+
     echo "  [engine=$engine] running bench"
     run "$BENCH_BIN" \
       --out-csv    "$DECOMP_CSV" \
       --engine-count "$engine" \
       "${append_opt[@]}" \
+      "${synthetic_opt[@]}" \
       --warmup     "$WARMUP" \
       --iters      "$ITERS" \
       --pool-size  "$POOL_SIZE" \
