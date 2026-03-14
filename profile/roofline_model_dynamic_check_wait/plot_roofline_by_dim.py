@@ -242,8 +242,9 @@ def main():
             y_wait = df_cs["iaa_wait_ns_median"].to_numpy()
 
             h, = ax.plot(x, y_wait,
-                         color=IAA_COLORS[eng], linewidth=1.5,
+                         color=IAA_COLORS[eng], linewidth=0,
                          marker=IAA_MARKERS[eng], markersize=5,
+                         linestyle="none",
                          label=f"IAA wait e{eng}", zorder=4)
             if is_leftmost:
                 legend_handles.append(h)
@@ -282,6 +283,7 @@ def main():
             else:
                 ax.set_ylabel("")
             ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.6)
+            ax.tick_params(axis="y", which="minor", length=0)
         else:
             ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
                     ha="center", va="center")

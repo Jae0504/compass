@@ -21,9 +21,9 @@ CFG_DIR="$ROOT_DIR/scripts/iaa"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 ENGINES=(1 2 4 8)
-CHUNK_128=65536
-CHUNK_512=262144
-CHUNK_2048=262144
+CHUNK_128="$((1024*128))"
+CHUNK_512="$((1024*256))"
+CHUNK_2048="$((1024*256))"
 CPU_CORE=8
 NUMA_NODE=0
 
@@ -39,7 +39,7 @@ POOL_SIZE=128
 CHUNK_SIZES_CSV="65536,262144,1048576"
 N_LIST_CSV="1,2,4,8,16,32"
 
-BASE_DIR="/home/jykang5/compass/dataset2/compass_base_query"
+BASE_DIR="/storage/jykang5/compass_base_query"
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -81,7 +81,7 @@ if [[ "$SKIP_BENCH" -eq 1 ]]; then
     echo "ERROR: --skip-bench set but $DECOMP_CSV not found" >&2; exit 1
   fi
 else
-  echo "[1/3] Running decompression bench (engines: ${ENGINES[*]}, dim: $DIM)"
+  echo "[1/3] Running decompression bench (engines: ${ENGINES[*]})"
   mkdir -p "$OUT_DIR"
   rm -f "$DECOMP_CSV"
   append_opt=()

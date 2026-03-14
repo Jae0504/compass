@@ -372,9 +372,9 @@ int main(int argc, char** argv) {
         bind_numa_node(args.numa_node);
 
         const std::vector<Dataset> datasets = {
-            {128, "/home/jykang5/compass/dataset2/fid_tb/n_filter_100/sift1m/sift1m_synthetic_id_bucket_fid.bin"},
-            {512, "/home/jykang5/compass/dataset2/fid_tb/laion/laion_original_width_fid.bin"},
-            {2048, "/home/jykang5/compass/dataset2/fid_tb/hnm/hnm_department_name_fid.bin"},
+            {128, "/storage/jykang5/fid_tb/n_filter_100/sift1m/sift1m_synthetic_id_bucket_fid.bin"},
+            {512, "/storage/jykang5/fid_tb/laion/laion_original_width_fid.bin"},
+            {2048, "/storage/jykang5/fid_tb/hnm/hnm_department_name_fid.bin"},
         };
 
         const size_t max_chunk = *std::max_element(args.chunk_sizes.begin(), args.chunk_sizes.end());
