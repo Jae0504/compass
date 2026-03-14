@@ -5,4 +5,4 @@ graph_filter_exp/
 *.png
 *,svg
 __pycache__/
-*_out/
+*out*/
