@@ -17,6 +17,7 @@
 #include <limits>
 #include <memory>
 #include <queue>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -71,13 +72,16 @@ using Clock = std::chrono::steady_clock;
 using Ns = std::chrono::nanoseconds;
 
 constexpr size_t kNumBuckets = 256;
-constexpr size_t kBlockSize = 4096;
+constexpr size_t kDefaultBlockSize = 65536;
 
 struct Args {
     std::string graph_path;
     std::string query_path;
     size_t k = 0;
     size_t num_queries = 0;
+    size_t block_size = kDefaultBlockSize;
+    bool synthetic = false;
+    std::string log_out;  // empty = auto-resolve next to binary
 };
 
 template <typename T>
@@ -90,10 +94,13 @@ struct DenseVectors {
 using DenseFvecs = DenseVectors<float>;
 using DenseBvecs = DenseVectors<uint8_t>;
 
+constexpr size_t kMinMetadataElements = 1000000;  // ensure >= 16 blocks at 64KB
+
 struct CompressedMetadata {
     std::vector<size_t> raw_block_sizes;
     std::vector<std::vector<char>> lz4_blocks;
     std::vector<std::vector<uint8_t>> deflate_blocks;
+    size_t num_blocks = 0;
 };
 
 struct QueryTiming {
@@ -121,12 +128,13 @@ struct AggregateTiming {
     std::string query_format;
     size_t k = 0;
     size_t ef_search = 0;
-    size_t block_size = kBlockSize;
+    size_t block_size = kDefaultBlockSize;
 };
 
 void usage(const char* argv0) {
     std::cerr << "Usage:\n"
-              << "  " << argv0 << " <graph(.bin|.index)> <query(.fvecs|.bvecs)> <k> <num_queries>\n";
+              << "  " << argv0 << " <graph> <query> <k> <num_queries>"
+              << " [--block-size N] [--synthetic] [--log-out PATH]\n";
 }
 
 bool parse_size_t(const std::string& s, size_t* out) {
@@ -144,9 +152,9 @@ bool parse_size_t(const std::string& s, size_t* out) {
 }
 
 Args parse_args(int argc, char** argv) {
-    if (argc != 5) {
+    if (argc < 5) {
         usage(argv[0]);
-        throw std::runtime_error("Expected exactly 4 positional arguments");
+        throw std::runtime_error("Expected at least 4 positional arguments");
     }
 
     Args args;
@@ -158,6 +166,32 @@ Args parse_args(int argc, char** argv) {
     }
     if (!parse_size_t(argv[4], &args.num_queries) || args.num_queries == 0) {
         throw std::runtime_error("num_queries must be a positive integer");
+    }
+
+    for (int i = 5; i < argc; ++i) {
+        const std::string cur = argv[i];
+        if (cur == "--block-size") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--block-size requires a value");
+            }
+            ++i;
+            if (!parse_size_t(argv[i], &args.block_size) || args.block_size == 0) {
+                throw std::runtime_error("--block-size must be a positive integer");
+            }
+        } else if (cur == "--synthetic") {
+            args.synthetic = true;
+        } else if (cur == "--log-out") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("--log-out requires a value");
+            }
+            ++i;
+            args.log_out = argv[i];
+        } else if (cur == "-h" || cur == "--help") {
+            usage(argv[0]);
+            std::exit(0);
+        } else {
+            throw std::runtime_error("Unknown argument: " + cur);
+        }
     }
 
     if (!fs::exists(args.graph_path) || !fs::is_regular_file(args.graph_path)) {
@@ -266,17 +300,63 @@ std::vector<uint8_t> build_synthetic_metadata(size_t n) {
     return metadata;
 }
 
-CompressedMetadata compress_metadata_blocks(const std::vector<uint8_t>& metadata) {
+std::vector<uint8_t> build_zipf16_metadata(size_t n) {
+    if (n == 0) {
+        throw std::runtime_error("Index has zero elements");
+    }
+    constexpr int N_SYMBOLS = 16;
+    std::mt19937 rng(42);
+    std::uniform_int_distribution<int> val_dist(0, 255);
+    uint8_t alphabet[N_SYMBOLS];
+    for (int k = 0; k < N_SYMBOLS; ++k) {
+        alphabet[k] = static_cast<uint8_t>(val_dist(rng));
+    }
+    double cum[N_SYMBOLS];
+    double total = 0.0;
+    for (int k = 0; k < N_SYMBOLS; ++k) {
+        total += 1.0 / static_cast<double>(k + 1);
+        cum[k] = total;
+    }
+    for (int k = 0; k < N_SYMBOLS; ++k) {
+        cum[k] /= total;
+    }
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    std::vector<uint8_t> metadata(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        const double r = u01(rng);
+        int idx = 0;
+        while (idx < N_SYMBOLS - 1 && r > cum[idx]) {
+            ++idx;
+        }
+        metadata[i] = alphabet[idx];
+    }
+    return metadata;
+}
+
+CompressedMetadata compress_metadata_blocks(const std::vector<uint8_t>& metadata_in, size_t block_size) {
+    // Pad metadata to at least kMinMetadataElements so small datasets
+    // still produce enough blocks for realistic decompression cost.
+    // block_id_for_node uses hash-scatter so neighbor locality doesn't
+    // cause all accesses to hit the same 1-2 blocks.
+    const size_t effective_size = std::max(metadata_in.size(), kMinMetadataElements);
+    std::vector<uint8_t> metadata(effective_size, 0);
+    std::copy(metadata_in.begin(), metadata_in.end(), metadata.begin());
+    // Fill the padding with the same Zipf/sequential pattern (tile)
+    for (size_t i = metadata_in.size(); i < effective_size; ++i) {
+        metadata[i] = metadata_in[i % metadata_in.size()];
+    }
+
     CompressedMetadata out;
-    const size_t nblocks = (metadata.size() + kBlockSize - 1) / kBlockSize;
+    const size_t nblocks = (metadata.size() + block_size - 1) / block_size;
+    out.num_blocks = nblocks;
 
     out.raw_block_sizes.resize(nblocks, 0);
     out.lz4_blocks.resize(nblocks);
     out.deflate_blocks.resize(nblocks);
 
     for (size_t bid = 0; bid < nblocks; ++bid) {
-        const size_t start = bid * kBlockSize;
-        const size_t raw_len = std::min(kBlockSize, metadata.size() - start);
+        const size_t start = bid * block_size;
+        const size_t raw_len = std::min(block_size, metadata.size() - start);
         out.raw_block_sizes[bid] = raw_len;
 
         const int raw_len_i = static_cast<int>(raw_len);
@@ -366,8 +446,12 @@ uint64_t decompress_deflate_block(
     return elapsed_ns(t0, t1);
 }
 
-size_t block_id_for_node(size_t node_id) {
-    return node_id / kBlockSize;
+size_t block_id_for_node(size_t node_id, size_t block_size, size_t num_blocks) {
+    // Hash-scatter: break HNSW neighbor locality so that nearby node IDs
+    // land in different blocks, matching real large-dataset behavior.
+    // Uses a simple multiplicative hash (Knuth's golden-ratio method).
+    const uint64_t hash = static_cast<uint64_t>(node_id) * 2654435761ULL;
+    return static_cast<size_t>(hash % num_blocks);
 }
 
 template <typename DistT, typename QueryT>
@@ -378,7 +462,8 @@ QueryTiming profile_single_query(
     size_t k,
     const CompressedMetadata& cm,
     std::vector<uint8_t>& lz4_scratch,
-    std::vector<uint8_t>& deflate_scratch) {
+    std::vector<uint8_t>& deflate_scratch,
+    size_t block_size) {
     QueryTiming qt;
 
     if (index.cur_element_count == 0) {
@@ -520,7 +605,7 @@ QueryTiming profile_single_query(
                 throw std::runtime_error("Corrupted graph link at level0: candidate id out of range");
             }
 
-            const size_t bid = block_id_for_node(static_cast<size_t>(nid));
+            const size_t bid = block_id_for_node(static_cast<size_t>(nid), block_size, cm.num_blocks);
             unique_blocks.insert(bid);
 
             loop_lz4_naive_ns += decompress_lz4_block(cm, bid, lz4_scratch);
@@ -727,8 +812,10 @@ int main(int argc, char** argv) {
 
             const size_t n = index->getCurrentElementCount();
             nElements = static_cast<int>(n);
-            std::vector<uint8_t> metadata = build_synthetic_metadata(n);
-            CompressedMetadata cm = compress_metadata_blocks(metadata);
+            std::vector<uint8_t> metadata = args.synthetic
+                ? build_zipf16_metadata(n)
+                : build_synthetic_metadata(n);
+            CompressedMetadata cm = compress_metadata_blocks(metadata, args.block_size);
 
             const size_t effective_ef = std::max<size_t>(64, args.k);
             index->setEf(effective_ef);
@@ -745,9 +832,10 @@ int main(int argc, char** argv) {
             agg.graph_dim = graph_dim;
             agg.k = args.k;
             agg.ef_search = effective_ef;
+            agg.block_size = args.block_size;
 
-            std::vector<uint8_t> lz4_scratch(kBlockSize, 0);
-            std::vector<uint8_t> deflate_scratch(kBlockSize, 0);
+            std::vector<uint8_t> lz4_scratch(args.block_size, 0);
+            std::vector<uint8_t> deflate_scratch(args.block_size, 0);
 
             for (size_t qid = 0; qid < queries_to_run; ++qid) {
                 const float* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
@@ -758,7 +846,8 @@ int main(int argc, char** argv) {
                     args.k,
                     cm,
                     lz4_scratch,
-                    deflate_scratch);
+                    deflate_scratch,
+                    args.block_size);
 
                 agg.total.lz4_naive_ns += qt.lz4_naive_ns;
                 agg.total.lz4_common_ns += qt.lz4_common_ns;
@@ -793,8 +882,10 @@ int main(int argc, char** argv) {
 
             const size_t n = index->getCurrentElementCount();
             nElements = static_cast<int>(n);
-            std::vector<uint8_t> metadata = build_synthetic_metadata(n);
-            CompressedMetadata cm = compress_metadata_blocks(metadata);
+            std::vector<uint8_t> metadata = args.synthetic
+                ? build_zipf16_metadata(n)
+                : build_synthetic_metadata(n);
+            CompressedMetadata cm = compress_metadata_blocks(metadata, args.block_size);
 
             const size_t effective_ef = std::max<size_t>(64, args.k);
             index->setEf(effective_ef);
@@ -811,9 +902,10 @@ int main(int argc, char** argv) {
             agg.graph_dim = graph_dim;
             agg.k = args.k;
             agg.ef_search = effective_ef;
+            agg.block_size = args.block_size;
 
-            std::vector<uint8_t> lz4_scratch(kBlockSize, 0);
-            std::vector<uint8_t> deflate_scratch(kBlockSize, 0);
+            std::vector<uint8_t> lz4_scratch(args.block_size, 0);
+            std::vector<uint8_t> deflate_scratch(args.block_size, 0);
 
             for (size_t qid = 0; qid < queries_to_run; ++qid) {
                 const uint8_t* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
@@ -824,7 +916,8 @@ int main(int argc, char** argv) {
                     args.k,
                     cm,
                     lz4_scratch,
-                    deflate_scratch);
+                    deflate_scratch,
+                    args.block_size);
 
                 agg.total.lz4_naive_ns += qt.lz4_naive_ns;
                 agg.total.lz4_common_ns += qt.lz4_common_ns;
@@ -842,7 +935,9 @@ int main(int argc, char** argv) {
             throw std::runtime_error("query file must end with .fvecs or .bvecs");
         }
 
-        const std::string preferred_log = resolve_log_path();
+        const std::string preferred_log = args.log_out.empty()
+            ? resolve_log_path()
+            : args.log_out;
         write_log(preferred_log, agg);
 
         std::cout << "Profiling completed. queries_used=" << agg.queries

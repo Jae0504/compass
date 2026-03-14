@@ -93,12 +93,13 @@ def _try_plot_matplotlib(
         "candidate": "#47D45A",
     }
 
-    # Break: bottom panel 0–0.2  (ticks 0.0, 0.1, 0.2)
-    #        top    panel 0.35–0.45 (tick 0.4)
+    # Break: bottom panel 0–0.1
+    #        top panel: up to max deflate value
     #        jump character drawn on y-axis between the two panels.
-    bottom_max = 0.22   # slight headroom above 0.2 tick
-    top_min    = 0.23   # just above bottom_max so zigzag sits between 0.2 and 0.4
-    top_max    = 0.41
+    bottom_max = 0.105
+    max_deflate = max(common_deflate) if common_deflate else 1.0
+    top_min    = max_deflate * 0.88
+    top_max    = max_deflate * 1.05
 
     # Taller bottom panel (more data range) than top panel.
     fig = plt.figure(figsize=(16.0 / 2.54, 4.5 / 2.54))
@@ -127,11 +128,13 @@ def _try_plot_matplotlib(
 
     # Y-ticks.
     fmt = FuncFormatter(lambda val, _: f"{val:.1f}")
-    ax_bottom.set_yticks([0.0, 0.1, 0.2])
+    ax_bottom.set_yticks([0.0, 0.1])
     ax_bottom.yaxis.set_major_formatter(fmt)
     ax_bottom.yaxis.set_minor_locator(AutoMinorLocator(5))
     ax_bottom.tick_params(axis="y", which="minor", left=False, right=False, labelleft=False)
-    ax_top.set_yticks([0.4])
+    # Round max deflate to nearest 0.5 for a clean tick
+    deflate_tick = round(max_deflate * 2) / 2
+    ax_top.set_yticks([deflate_tick])
     ax_top.yaxis.set_major_formatter(fmt)
     ax_top.tick_params(axis="y", which="minor", left=False, right=False, labelleft=False)
 
