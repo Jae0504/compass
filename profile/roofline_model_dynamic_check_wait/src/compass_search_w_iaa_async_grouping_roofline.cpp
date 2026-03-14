@@ -2369,9 +2369,9 @@ int main(int argc, char** argv) {
 
 // ./compass_search_w_iaa_async.run \
 //   --dataset-type sift1m \
-//   --graph /storage/jykang5/compass_graphs/sift_m128_efc200.bin \
-//   --query /storage/jykang5/compass_base_query/sift1m_query.fvecs \
-//   --fidtb-manifest /storage/jykang5/fid_tb/n_filter_100/sift1m/manifest.json \
+//   --graph /home/jykang5/compass/dataset2/compass_graphs/sift_m128_efc200.bin \
+//   --query /home/jykang5/compass/dataset2/compass_base_query/sift1m_query.fvecs \
+//   --fidtb-manifest /home/jykang5/compass/dataset2/fid_tb/n_filter_100/sift1m/manifest.json \
 //   --filter "synthetic_id_bucket == 0" \
 //   --k 10 \
 //   --ef 200 \

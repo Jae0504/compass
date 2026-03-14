@@ -34,10 +34,10 @@ SKIP_DIST=0
 WARMUP=10
 ITERS=50
 POOL_SIZE=128
-CHUNK_SIZES_CSV="1024*16,65536,1048576"
-N_LIST_CSV="1,2,4,8,16,32,64"
+CHUNK_SIZES_CSV="65536,262144,1048576"
+N_LIST_CSV="1,2,4,8,16,32"
 
-BASE_DIR="/storage/jykang5/compass_base_query"
+BASE_DIR="/home/jykang5/compass/dataset2/compass_base_query"
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do

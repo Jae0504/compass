@@ -33,7 +33,7 @@ using filter_search_io::VecFileInfo;
 
 namespace {
 
-constexpr bool kMeasureInSearchStats = false;
+constexpr bool kMeasureInSearchStats = true;
 
 
 struct Args {
@@ -127,6 +127,10 @@ struct RunStats {
     size_t queries_with_enns_lt_k = 0;
     std::string execution_mode = "async_multi_eq";
 
+    uint64_t upper_layer_time_ns = 0;
+    uint64_t fid_decomp_expansions = 0;
+    uint64_t dist_calc_fid_expan_ns = 0;
+
     std::vector<QueryMetrics> per_query_metrics;
 };
 
@@ -152,6 +156,9 @@ struct SearchCallStats {
     uint64_t tb_wait_time_ns = 0;
     uint64_t fid_submit_time_ns = 0;
     uint64_t fid_wait_time_ns = 0;
+    uint64_t upper_layer_time_ns = 0;
+    uint64_t fid_decomp_expansions = 0;
+    uint64_t dist_calc_fid_expan_ns = 0;
 };
 
 void usage(const char* argv0) {
@@ -1427,6 +1434,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
             std::chrono::steady_clock::now() - tb_submit_start).count());
 
     // Stage 1: upper-layer greedy descent (standard HNSW, no base-layer filtering yet).
+    const auto upper_layer_start = std::chrono::steady_clock::now();
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
         while (changed) {
@@ -1450,6 +1458,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
             }
         }
     }
+    if (kMeasureInSearchStats) call_stats->upper_layer_time_ns += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - upper_layer_start).count());
 
     for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
         const MultiEqLeafRuntime& leaf = runtime.leaves[leaf_idx];
@@ -1683,20 +1694,36 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
         }
 
         // Stage 3: submit async FID scans for this expansion (non-blocking).
+        const auto fid_submit_start = std::chrono::steady_clock::now();
         const uint64_t fid_jobs_submitted = submit_fid_scan_jobs(
             ring,
             runtime,
             blocks_by_leaf,
             cache,
             (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
-        if (kMeasureInSearchStats) call_stats->fid_jobs_submitted += fid_jobs_submitted;
+        if (kMeasureInSearchStats) {
+            call_stats->fid_jobs_submitted += fid_jobs_submitted;
+            call_stats->fid_submit_time_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - fid_submit_start).count());
+        }
+        const bool had_fid_jobs = (fid_jobs_submitted > 0);
+        if (had_fid_jobs) {
+            ++call_stats->fid_decomp_expansions;
+        }
 
         // Stage 4: compute distances for traversal-passed neighbors.
+        const auto dist_start = std::chrono::steady_clock::now();
         for (FrontierCandidate& entry : frontier_candidates) {
             entry.dist = index.fstdistfunc_(
                 query_data,
                 index.getDataByInternalId(entry.candidate_id),
                 index.dist_func_param_);
+        }
+        if (had_fid_jobs) {
+            call_stats->dist_calc_fid_expan_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - dist_start).count());
         }
 
         // Stage 5: update frontier immediately, defer result checks until FID becomes ready.
@@ -2012,6 +2039,9 @@ RunStats run_search_typed(
         stats.tb_wait_time_ns += call_stats.tb_wait_time_ns;
         stats.fid_submit_time_ns += call_stats.fid_submit_time_ns;
         stats.fid_wait_time_ns += call_stats.fid_wait_time_ns;
+        stats.upper_layer_time_ns += call_stats.upper_layer_time_ns;
+        stats.fid_decomp_expansions += call_stats.fid_decomp_expansions;
+        stats.dist_calc_fid_expan_ns += call_stats.dist_calc_fid_expan_ns;
 
         returned_results += result.size();
 
@@ -2204,6 +2234,13 @@ std::string build_summary(
         << (static_cast<double>(stats.fid_submit_time_ns) / 1e6) << "\n";
     oss << "async_time_fid_wait_ms: "
         << (static_cast<double>(stats.fid_wait_time_ns) / 1e6) << "\n";
+    oss << "upper_layer_time_ms: " << (static_cast<double>(stats.upper_layer_time_ns) / 1e6) << "\n";
+    oss << "avg_upper_layer_time_per_query_us: "
+        << (stats.query_count > 0 ? static_cast<double>(stats.upper_layer_time_ns) / 1e3 / static_cast<double>(stats.query_count) : 0.0) << "\n";
+    oss << "fid_decomp_expansions: " << stats.fid_decomp_expansions << "\n";
+    oss << "dist_calc_fid_expan_time_ms: " << (static_cast<double>(stats.dist_calc_fid_expan_ns) / 1e6) << "\n";
+    oss << "avg_dist_calc_fid_expan_us: "
+        << (stats.fid_decomp_expansions > 0 ? static_cast<double>(stats.dist_calc_fid_expan_ns) / 1e3 / static_cast<double>(stats.fid_decomp_expansions) : 0.0) << "\n";
 
     if (stats.queries_with_enns_lt_k > 0) {
         oss << "warning: filtering condition is too restrictive for k on "

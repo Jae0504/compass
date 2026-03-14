@@ -33,7 +33,7 @@ using filter_search_io::VecFileInfo;
 
 namespace {
 
-constexpr bool kMeasureInSearchStats = false;
+constexpr bool kMeasureInSearchStats = true;
 
 constexpr size_t kDefaultLz4FidBlockSizeBytes = 8192 * 8;
 constexpr size_t kDefaultLz4TbBlockSizeBytes = 8192 * 128;
@@ -111,6 +111,12 @@ struct RunStats {
     uint64_t fid_tb_mismatch_log_capped = 0;
     uint64_t lz4_tb_decompress_time_ns = 0;
 
+    uint64_t upper_layer_time_ns = 0;
+    uint64_t fid_decomp_expansions = 0;
+    uint64_t dist_calc_fid_expan_ns = 0;
+    uint64_t tb_lz4_decompress_ns = 0;
+    uint64_t fid_lz4_decompress_ns = 0;
+
     size_t returned_results = 0;
     size_t selectivity_count = 0;
     size_t total_elements = 0;
@@ -134,6 +140,9 @@ struct SearchCallStats {
     uint64_t fid_tb_mismatch_count = 0;
     uint64_t fid_tb_mismatch_log_capped = 0;
     uint64_t lz4_tb_decompress_time_ns = 0;
+    uint64_t upper_layer_time_ns = 0;
+    uint64_t fid_decomp_expansions = 0;
+    uint64_t dist_calc_fid_expan_ns = 0;
 };
 
 void usage(const char* argv0) {
@@ -953,21 +962,28 @@ void decompress_lz4_block_into(
         return;
     }
 
+    const auto lz4_start = std::chrono::steady_clock::now();
     const int ret = LZ4_decompress_safe(
         storage.compressed_blocks[block_id].data(),
         reinterpret_cast<char*>(output->data()),
         static_cast<int>(storage.compressed_blocks[block_id].size()),
         static_cast<int>(raw_len));
+    const uint64_t lz4_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - lz4_start).count());
 
     if (ret != static_cast<int>(raw_len)) {
         throw std::runtime_error("LZ4 decompression failed at block " + std::to_string(block_id));
     }
 
     if (metrics != nullptr) {
+        metrics->lz4_decompress_time_ns += lz4_ns;
         if (is_fid) {
+            metrics->fid_lz4_decompress_ns += lz4_ns;
             ++metrics->fid_blocks_decompressed;
             metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
         } else {
+            metrics->tb_lz4_decompress_ns += lz4_ns;
             ++metrics->tb_blocks_decompressed;
             metrics->tb_bytes_decompressed += static_cast<uint64_t>(raw_len);
         }
@@ -1314,6 +1330,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
 
     DistT curdist = index.fstdistfunc_(query_data, index.getDataByInternalId(curr_obj), index.dist_func_param_);
 
+    const auto upper_layer_start = std::chrono::steady_clock::now();
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
         while (changed) {
@@ -1337,6 +1354,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             }
         }
     }
+    call_stats->upper_layer_time_ns += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - upper_layer_start).count());
 
     // Decompress TB blocks after upper-layer traversal, before level-0 expansion.
     for (size_t leaf_idx = 0; leaf_idx < runtime.leaves.size(); ++leaf_idx) {
@@ -1410,6 +1430,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
             return fid_match_node(leaf, &leaf_cache, node_id, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
         };
 
+        const uint64_t fid_blocks_before_expan = call_stats->decomp.fid_blocks_decompressed;
+        const auto dist_expan_start = std::chrono::steady_clock::now();
         for (size_t idx = 0; idx < neighbor_ids.size(); ++idx) {
             const hnswlib::tableint candidate_id = neighbor_ids[idx];
             const size_t node_id = static_cast<size_t>(candidate_id);
@@ -1451,6 +1473,12 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_sequential_eq_filt
                     lower_bound = top_candidates.top().first;
                 }
             }
+        }
+        if (call_stats->decomp.fid_blocks_decompressed > fid_blocks_before_expan) {
+            ++call_stats->fid_decomp_expansions;
+            call_stats->dist_calc_fid_expan_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - dist_expan_start).count());
         }
     }
 
@@ -1701,6 +1729,11 @@ RunStats run_search_typed(
         stats.fid_tb_mismatch_count += call_stats.fid_tb_mismatch_count;
         stats.fid_tb_mismatch_log_capped += call_stats.fid_tb_mismatch_log_capped;
         stats.lz4_tb_decompress_time_ns += call_stats.lz4_tb_decompress_time_ns;
+        stats.upper_layer_time_ns += call_stats.upper_layer_time_ns;
+        stats.fid_decomp_expansions += call_stats.fid_decomp_expansions;
+        stats.dist_calc_fid_expan_ns += call_stats.dist_calc_fid_expan_ns;
+        stats.tb_lz4_decompress_ns += call_stats.decomp.tb_lz4_decompress_ns;
+        stats.fid_lz4_decompress_ns += call_stats.decomp.fid_lz4_decompress_ns;
         stats.search_loop_time_ns += query_search_ns;
 
         returned_results += result.size();
@@ -1891,6 +1924,15 @@ std::string build_summary(
     oss << "tb_predicate_output_bytes: " << stats.tb_predicate_output_bytes << "\n";
     oss << "fid_tb_mismatch_count: " << stats.fid_tb_mismatch_count << "\n";
     oss << "fid_tb_mismatch_log_capped: " << stats.fid_tb_mismatch_log_capped << "\n";
+    oss << "upper_layer_time_ms: " << (static_cast<double>(stats.upper_layer_time_ns) / 1e6) << "\n";
+    oss << "avg_upper_layer_time_per_query_us: "
+        << (stats.query_count > 0 ? static_cast<double>(stats.upper_layer_time_ns) / 1e3 / static_cast<double>(stats.query_count) : 0.0) << "\n";
+    oss << "fid_decomp_expansions: " << stats.fid_decomp_expansions << "\n";
+    oss << "dist_calc_fid_expan_time_ms: " << (static_cast<double>(stats.dist_calc_fid_expan_ns) / 1e6) << "\n";
+    oss << "avg_dist_calc_fid_expan_us: "
+        << (stats.fid_decomp_expansions > 0 ? static_cast<double>(stats.dist_calc_fid_expan_ns) / 1e3 / static_cast<double>(stats.fid_decomp_expansions) : 0.0) << "\n";
+    oss << "tb_lz4_decompress_time_ms: " << (static_cast<double>(stats.tb_lz4_decompress_ns) / 1e6) << "\n";
+    oss << "fid_lz4_decompress_time_ms: " << (static_cast<double>(stats.fid_lz4_decompress_ns) / 1e6) << "\n";
 
     if (stats.queries_with_enns_lt_k > 0) {
         oss << "warning: filtering condition is too restrictive for k on "

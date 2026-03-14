@@ -25,28 +25,28 @@ POOL_SIZE=128
 CHUNK_SIZES_CSV="4096,8192,16384,32768,65536,131072,262144,524288,1048576"
 N_LIST_CSV="1,2,4,8,16,32,64"
 
-EXACT_GRAPH="/storage/jykang5/compass_graphs/sift_m128_efc200.bin"
-EXACT_QUERY="/storage/jykang5/compass_base_query/sift1m_query.fvecs"
-EXACT_MANIFEST_1PCT="/storage/jykang5/fid_tb/n_filter_100/sift1m/manifest.json"
-EXACT_MANIFEST_10PCT="/storage/jykang5/fid_tb/n_filter_10/sift1m/manifest.json"
+EXACT_GRAPH="/home/jykang5/compass/dataset2/compass_graphs/sift_m128_efc200.bin"
+EXACT_QUERY="/home/jykang5/compass/dataset2/compass_base_query/sift1m_query.fvecs"
+EXACT_MANIFEST_1PCT="/home/jykang5/compass/dataset2/fid_tb/n_filter_100/sift1m/manifest.json"
+EXACT_MANIFEST_10PCT="/home/jykang5/compass/dataset2/fid_tb/n_filter_10/sift1m/manifest.json"
 EXACT_FILTER_1PCT="synthetic_id_bucket == 99"
 EXACT_FILTER_10PCT="synthetic_id_bucket == 9"
 EXACT_EF_1PCT=160
 EXACT_EF_10PCT=1800
 
-RANGE_GRAPH="/storage/jykang5/compass_graphs/laion_m128_efc200.bin"
-RANGE_QUERY="/storage/jykang5/compass_base_query/laion_query.fvecs"
-RANGE_MANIFEST="/storage/jykang5/fid_tb/laion/manifest.json"
-RANGE_PAYLOAD="/storage/jykang5/payloads/laion_payloads.jsonl"
+RANGE_GRAPH="/home/jykang5/compass/dataset2/compass_graphs/laion_m128_efc200.bin"
+RANGE_QUERY="/home/jykang5/compass/dataset2/compass_base_query/laion_query.fvecs"
+RANGE_MANIFEST="/home/jykang5/compass/dataset2/fid_tb/laion/manifest.json"
+RANGE_PAYLOAD="/home/jykang5/compass/dataset2/payloads/laion_payloads.jsonl"
 RANGE_FILTER_1PCT="original_width >= 958 AND original_width <= 965"
 RANGE_FILTER_10PCT="original_width >= 598 AND original_width <= 769"
 RANGE_EF_1PCT=200
 RANGE_EF_10PCT=512
 
-MULTI_GRAPH="/storage/jykang5/compass_graphs/hnm_m128_efc200.bin"
-MULTI_QUERY="/storage/jykang5/compass_base_query/hnm_query.fvecs"
-MULTI_MANIFEST="/storage/jykang5/fid_tb/hnm/manifest.json"
-MULTI_PAYLOAD="/storage/jykang5/payloads/hnm_payloads.jsonl"
+MULTI_GRAPH="/home/jykang5/compass/dataset2/compass_graphs/hnm_m128_efc200.bin"
+MULTI_QUERY="/home/jykang5/compass/dataset2/compass_base_query/hnm_query.fvecs"
+MULTI_MANIFEST="/home/jykang5/compass/dataset2/fid_tb/hnm/manifest.json"
+MULTI_PAYLOAD="/home/jykang5/compass/dataset2/payloads/hnm_payloads.jsonl"
 MULTI_FILTER_1PCT="department_name == 'Baby Toys/Acc' AND garment_group_name == 'Accessories'"
 MULTI_FILTER_10PCT="department_name == 'Blouse' OR garment_group_name == 'Jersey Basic'"
 MULTI_EF_1PCT=16

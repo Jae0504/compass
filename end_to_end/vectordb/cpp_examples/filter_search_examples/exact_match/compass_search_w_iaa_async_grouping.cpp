@@ -33,7 +33,7 @@ using filter_search_io::VecFileInfo;
 
 namespace {
 
-constexpr bool kMeasureInSearchStats = false;
+constexpr bool kMeasureInSearchStats = true;
 
 struct Args {
     std::string dataset_type;
@@ -110,6 +110,15 @@ struct RunStats {
     uint64_t deferred_retry_rounds = 0;
     uint64_t job_poll_calls = 0;
     uint64_t job_poll_ready = 0;
+    uint64_t tb_submit_time_ns = 0;
+    uint64_t tb_wait_time_ns = 0;
+    uint64_t tb_wait_qpl_only_ns = 0;
+    uint64_t tb_wait_calls = 0;
+    uint64_t fid_submit_time_ns = 0;
+
+    uint64_t upper_layer_time_ns = 0;
+    uint64_t fid_decomp_expansions = 0;
+    uint64_t dist_calc_fid_expan_ns = 0;
 
     size_t returned_results = 0;
     size_t selectivity_count = 0;
@@ -138,6 +147,14 @@ struct SearchCallStats {
     uint64_t job_poll_ready = 0;
     uint64_t tb_predicate_blocks_touched = 0;
     uint64_t tb_predicate_output_bytes = 0;
+    uint64_t tb_submit_time_ns = 0;
+    uint64_t tb_wait_time_ns = 0;
+    uint64_t tb_wait_qpl_only_ns = 0;
+    uint64_t tb_wait_calls = 0;
+    uint64_t fid_submit_time_ns = 0;
+    uint64_t upper_layer_time_ns = 0;
+    uint64_t fid_decomp_expansions = 0;
+    uint64_t dist_calc_fid_expan_ns = 0;
 };
 
 void usage(const char* argv0) {
@@ -792,6 +809,10 @@ public:
         wait_oldest(1);
     }
 
+    uint64_t qpl_wait_time_ns() const {
+        return qpl_wait_time_ns_;
+    }
+
     bool has_pending() const {
         return !pending_slots_.empty();
     }
@@ -859,7 +880,11 @@ private:
             pending_slots_.pop_front();
             Slot& slot = slots_[slot_id];
 
+            const auto wait_start = std::chrono::steady_clock::now();
             const qpl_status wait_status = qpl_wait_job(slot.job);
+            qpl_wait_time_ns_ += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - wait_start).count());
             if (wait_status != QPL_STS_OK) {
                 throw std::runtime_error(
                     "AsyncJobRing: qpl_wait_job failed with status " +
@@ -881,6 +906,7 @@ private:
     size_t queue_size_ = 128;
     size_t wait_batch_ = 64;
     size_t output_buffer_bytes_ = 1;
+    uint64_t qpl_wait_time_ns_ = 0;
     std::vector<Slot> slots_;
     std::deque<size_t> free_slots_;
     std::deque<size_t> pending_slots_;
@@ -1296,8 +1322,15 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         throw std::runtime_error(
             "AsyncEqQueryCache must be fully preallocated before search");
     }
+    const auto tb_submit_start = std::chrono::steady_clock::now();
     submit_tb_prefetch_jobs(ring, runtime, cache, (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+    if (kMeasureInSearchStats) {
+        call_stats->tb_submit_time_ns += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - tb_submit_start).count());
+    }
 
+    const auto upper_layer_start = std::chrono::steady_clock::now();
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
         while (changed) {
@@ -1321,6 +1354,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
             }
         }
     }
+    call_stats->upper_layer_time_ns += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - upper_layer_start).count());
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
@@ -1365,6 +1401,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         if (pending_fid_blocks_to_submit.empty()) {
             return;
         }
+        const auto fid_submit_start = std::chrono::steady_clock::now();
         for (size_t fid_block_id : pending_fid_blocks_to_submit) {
             if (fid_block_id >= pending_fid_block_marks.size()) {
                 continue;
@@ -1376,6 +1413,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                 fid_block_id,
                 cache,
                 (kMeasureInSearchStats ? &call_stats->decomp : nullptr));
+        }
+        if (kMeasureInSearchStats) {
+            call_stats->fid_submit_time_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - fid_submit_start).count());
         }
         pending_fid_blocks_to_submit.clear();
     };
@@ -1431,7 +1473,17 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         if (!ring->has_pending()) {
             throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
         }
+        const auto tb_wait_start = std::chrono::steady_clock::now();
+        const uint64_t qpl_wait_before = ring->qpl_wait_time_ns();
         ring->wait_one();
+        const uint64_t qpl_wait_after = ring->qpl_wait_time_ns();
+        if (kMeasureInSearchStats) {
+            ++call_stats->tb_wait_calls;
+            call_stats->tb_wait_time_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - tb_wait_start).count());
+            call_stats->tb_wait_qpl_only_ns += (qpl_wait_after - qpl_wait_before);
+        }
     }
     if (kMeasureInSearchStats) call_stats->tb_predicate_blocks_touched += cache->tb_predicate_blocks_touched;
     if (kMeasureInSearchStats) call_stats->tb_predicate_output_bytes += cache->tb_predicate_output_bytes;
@@ -1549,14 +1601,24 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
         }
 
         // Stage 2: submit FID jobs for this expansion (non-blocking).
+        const bool had_fid_jobs = !pending_fid_blocks_to_submit.empty();
         submit_pending_fid_blocks();
+        if (had_fid_jobs) {
+            ++call_stats->fid_decomp_expansions;
+        }
 
         // Stage 3: compute distances for all TB-passed neighbors.
+        const auto dist_start = std::chrono::steady_clock::now();
         for (FrontierCandidate& entry : frontier_candidates) {
             entry.dist = index.fstdistfunc_(
                 query_data,
                 index.getDataByInternalId(entry.candidate_id),
                 index.dist_func_param_);
+        }
+        if (had_fid_jobs) {
+            call_stats->dist_calc_fid_expan_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - dist_start).count());
         }
 
         // Stage 4: traversal/update split.
@@ -1849,6 +1911,14 @@ RunStats run_search_typed(
         stats.deferred_retry_rounds += call_stats.deferred_retry_rounds;
         stats.job_poll_calls += call_stats.job_poll_calls;
         stats.job_poll_ready += call_stats.job_poll_ready;
+        stats.tb_submit_time_ns += call_stats.tb_submit_time_ns;
+        stats.tb_wait_time_ns += call_stats.tb_wait_time_ns;
+        stats.tb_wait_qpl_only_ns += call_stats.tb_wait_qpl_only_ns;
+        stats.tb_wait_calls += call_stats.tb_wait_calls;
+        stats.fid_submit_time_ns += call_stats.fid_submit_time_ns;
+        stats.upper_layer_time_ns += call_stats.upper_layer_time_ns;
+        stats.fid_decomp_expansions += call_stats.fid_decomp_expansions;
+        stats.dist_calc_fid_expan_ns += call_stats.dist_calc_fid_expan_ns;
         stats.search_loop_time_ns += query_search_ns;
 
         returned_results += result.size();
@@ -2035,6 +2105,18 @@ std::string build_summary(
     oss << "debug_deferred_retry_rounds: " << stats.deferred_retry_rounds << "\n";
     oss << "debug_job_poll_calls: " << stats.job_poll_calls << "\n";
     oss << "debug_job_poll_ready: " << stats.job_poll_ready << "\n";
+    oss << "debug_tb_submit_ms: " << (static_cast<double>(stats.tb_submit_time_ns) / 1e6) << "\n";
+    oss << "debug_tb_wait_ms: " << (static_cast<double>(stats.tb_wait_time_ns) / 1e6) << "\n";
+    oss << "debug_tb_qpl_wait_only_ms: " << (static_cast<double>(stats.tb_wait_qpl_only_ns) / 1e6) << "\n";
+    oss << "debug_tb_wait_calls: " << stats.tb_wait_calls << "\n";
+    oss << "debug_fid_submit_ms: " << (static_cast<double>(stats.fid_submit_time_ns) / 1e6) << "\n";
+    oss << "upper_layer_time_ms: " << (static_cast<double>(stats.upper_layer_time_ns) / 1e6) << "\n";
+    oss << "avg_upper_layer_time_per_query_us: "
+        << (stats.query_count > 0 ? static_cast<double>(stats.upper_layer_time_ns) / 1e3 / static_cast<double>(stats.query_count) : 0.0) << "\n";
+    oss << "fid_decomp_expansions: " << stats.fid_decomp_expansions << "\n";
+    oss << "dist_calc_fid_expan_time_ms: " << (static_cast<double>(stats.dist_calc_fid_expan_ns) / 1e6) << "\n";
+    oss << "avg_dist_calc_fid_expan_us: "
+        << (stats.fid_decomp_expansions > 0 ? static_cast<double>(stats.dist_calc_fid_expan_ns) / 1e3 / static_cast<double>(stats.fid_decomp_expansions) : 0.0) << "\n";
 
     if (stats.queries_with_enns_lt_k > 0) {
         oss << "warning: filtering condition is too restrictive for k on "

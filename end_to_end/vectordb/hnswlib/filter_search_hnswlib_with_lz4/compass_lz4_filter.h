@@ -35,6 +35,8 @@ constexpr int kLz4CompressionLevel = 12;
 
 struct QueryDecompressionMetrics {
     uint64_t lz4_decompress_time_ns = 0;
+    uint64_t tb_lz4_decompress_ns = 0;
+    uint64_t fid_lz4_decompress_ns = 0;
 
     uint64_t fid_blocks_decompressed = 0;
     uint64_t tb_blocks_decompressed = 0;
@@ -259,21 +261,28 @@ inline const std::vector<uint8_t>& get_or_decompress_block(
     const size_t raw_len = static_cast<size_t>(storage.raw_block_sizes[block_id]);
     std::vector<uint8_t> out(raw_len, 0);
 
+    const auto lz4_start = std::chrono::steady_clock::now();
     const int ret = LZ4_decompress_safe(
         storage.compressed_blocks[block_id].data(),
         reinterpret_cast<char*>(out.data()),
         static_cast<int>(storage.compressed_blocks[block_id].size()),
         static_cast<int>(raw_len));
+    const uint64_t lz4_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - lz4_start).count());
 
     if (ret != static_cast<int>(raw_len)) {
         throw std::runtime_error("LZ4 decompression failed at block " + std::to_string(block_id));
     }
 
     if (metrics != nullptr) {
+        metrics->lz4_decompress_time_ns += lz4_ns;
         if (is_fid) {
+            metrics->fid_lz4_decompress_ns += lz4_ns;
             ++metrics->fid_blocks_decompressed;
             metrics->fid_bytes_decompressed += static_cast<uint64_t>(raw_len);
         } else {
+            metrics->tb_lz4_decompress_ns += lz4_ns;
             ++metrics->tb_blocks_decompressed;
             metrics->tb_bytes_decompressed += static_cast<uint64_t>(raw_len);
         }

@@ -154,7 +154,7 @@ POSTFILTER_MAX_CANDIDATES_LIST="1500,1600,1700,1800,2000"
 POSTFILTER_MAX_CANDIDATES_LIST_SET_BY_USER=0
 POSTFILTER_MAX_CANDIDATES_LIST_1PCT="1900,2100,2400,2800,3200"
 POSTFILTER_MAX_CANDIDATES_LIST_10PCT="200,232,264,300,400"
-DO_BUILD=0
+DO_BUILD=1
 DO_PLOT=1
 IAA_AB_COMPARE=0
 SKIP_IAA_CONFIG=0
@@ -173,7 +173,7 @@ PAYLOAD_JSONL=""
 IAA_CONFIG_DIR="/home/jykang5/compass/scripts/iaa"
 IAA_DEVICE_OWNER="jykang5"
 FID_BLOCK_SIZE_BYTES="$((1024*128))"
-TB_BLOCK_SIZE_BYTES="$((1024*128))"
+TB_BLOCK_SIZE_BYTES="$((1024*16))"
 CPU_PIN_CORE="8"
 NUMA_MEM_NODE="0"
 NUMA_CPU_BIND="8"
@@ -442,21 +442,21 @@ set_dataset_defaults() {
         EF_LIST_1PCT="128,160,200"
         EF_LIST_10PCT="512,640,800"
       fi
-      : "${GRAPH_PATH:=/storage/jykang5/compass_graphs/sift_m128_efc200.bin}"
-      : "${QUERY_PATH:=/storage/jykang5/compass_base_query/sift1m_query.fvecs}"
-      : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/sift1m/manifest.json}"
-      : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/sift1m/manifest.json}"
-      : "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/sift1m_acorn_m64_nf100.index}"
-      : "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/sift1m_acorn_m64_nf10.index}"
+      : "${GRAPH_PATH:=/home/jykang5/compass/dataset2/compass_graphs/sift_m128_efc200.bin}"
+      : "${QUERY_PATH:=/home/jykang5/compass/dataset2/compass_base_query/sift1m_query.fvecs}"
+      : "${MANIFEST_1PCT:=/home/jykang5/compass/dataset2/fid_tb/n_filter_100/sift1m/manifest.json}"
+      : "${MANIFEST_10PCT:=/home/jykang5/compass/dataset2/fid_tb/n_filter_10/sift1m/manifest.json}"
+      : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/dataset2/compass_graphs/acorn/sift1m_acorn_m64_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/dataset2/compass_graphs/acorn/sift1m_acorn_m64_nf10.index}"
       ;;
     sift1b)
       HNSW_DATASET_TYPE="sift"
       LZ4_DATASET_TYPE="sift"
       IAA_DATASET_TYPE="sift1b"
-      : "${GRAPH_PATH:=/storage/jykang5/compass_graphs/sift1b_m128_efc200.bin}"
-      : "${QUERY_PATH:=/storage/jykang5/compass_base_query/sift1b_query.fvecs}"
-      : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/sift1b/manifest.json}"
-      : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/sift1b/manifest.json}"
+      : "${GRAPH_PATH:=/home/jykang5/compass/dataset2/compass_graphs/sift1b_m128_efc200.bin}"
+      : "${QUERY_PATH:=/home/jykang5/compass/dataset2/compass_base_query/sift1b_query.fvecs}"
+      : "${MANIFEST_1PCT:=/home/jykang5/compass/dataset2/fid_tb/n_filter_100/sift1b/manifest.json}"
+      : "${MANIFEST_10PCT:=/home/jykang5/compass/dataset2/fid_tb/n_filter_10/sift1b/manifest.json}"
       : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/sift1b/sift1b_acorn_m32_nf100.index}"
       : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/end_to_end/vectordb/dataset/acorn_graph/sift1b/sift1b_acorn_m32_nf10.index}"
       ;;
@@ -464,24 +464,24 @@ set_dataset_defaults() {
       HNSW_DATASET_TYPE="laion"
       LZ4_DATASET_TYPE="laion"
       IAA_DATASET_TYPE="laion"
-      : "${GRAPH_PATH:=/storage/jykang5/compass_graphs/laion_m128_efc200.bin}"
-      : "${QUERY_PATH:=/storage/jykang5/compass_base_query/laion_query.fvecs}"
-      : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/laion/manifest.json}"
-      : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/laion/manifest.json}"
-      : "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/laion_acorn_m32_nf100.index}"
-      : "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/laion_acorn_m32_nf10.index}"
+      : "${GRAPH_PATH:=/home/jykang5/compass/dataset2/compass_graphs/laion_m128_efc200.bin}"
+      : "${QUERY_PATH:=/home/jykang5/compass/dataset2/compass_base_query/laion_query.fvecs}"
+      : "${MANIFEST_1PCT:=/home/jykang5/compass/dataset2/fid_tb/n_filter_100/laion/manifest.json}"
+      : "${MANIFEST_10PCT:=/home/jykang5/compass/dataset2/fid_tb/n_filter_10/laion/manifest.json}"
+      : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/dataset2/compass_graphs/acorn/laion_acorn_m32_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/dataset2/compass_graphs/acorn/laion_acorn_m32_nf10.index}"
       : "${PAYLOAD_JSONL:=/fast-lab-share/benchmarks/VectorDB/FILTER/LAION/payloads.jsonl}"
       ;;
     hnm)
       HNSW_DATASET_TYPE="hnm"
       LZ4_DATASET_TYPE="hnm"
       IAA_DATASET_TYPE="hnm"
-      : "${GRAPH_PATH:=/storage/jykang5/compass_graphs/hnm_m128_efc200.bin}"
-      : "${QUERY_PATH:=/storage/jykang5/compass_base_query/hnm_query.fvecs}"
-      : "${MANIFEST_1PCT:=/storage/jykang5/fid_tb/n_filter_100/hnm/manifest.json}"
-      : "${MANIFEST_10PCT:=/storage/jykang5/fid_tb/n_filter_10/hnm/manifest.json}"
-      : "${ACORN_INDEX_1PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m32_nf100.index}"
-      : "${ACORN_INDEX_10PCT:=/storage/jykang5/compass_graphs/acorn/hnm_acorn_m32_nf10.index}"
+      : "${GRAPH_PATH:=/home/jykang5/compass/dataset2/compass_graphs/hnm_m128_efc200.bin}"
+      : "${QUERY_PATH:=/home/jykang5/compass/dataset2/compass_base_query/hnm_query.fvecs}"
+      : "${MANIFEST_1PCT:=/home/jykang5/compass/dataset2/fid_tb/n_filter_100/hnm/manifest.json}"
+      : "${MANIFEST_10PCT:=/home/jykang5/compass/dataset2/fid_tb/n_filter_10/hnm/manifest.json}"
+      : "${ACORN_INDEX_1PCT:=/home/jykang5/compass/dataset2/compass_graphs/acorn/hnm_acorn_m32_nf100.index}"
+      : "${ACORN_INDEX_10PCT:=/home/jykang5/compass/dataset2/compass_graphs/acorn/hnm_acorn_m32_nf10.index}"
       : "${PAYLOAD_JSONL:=/fast-lab-share/benchmarks/VectorDB/FILTER/HnM/payloads.jsonl}"
       ;;
     *)
@@ -1069,14 +1069,14 @@ run_selectivity() {
     )
   else
     methods=(
-      "post_filter_hnsw"
+      # "post_filter_hnsw"
       # "in_search_filter_hnsw"
       # "acorn"
-      # "compass_lz4"
+      "compass_lz4"
       # "compass_iaa_1"
       # "compass_iaa_2"
       # # "compass_iaa_4"
-      # "compass_iaa_8"
+      "compass_iaa_8"
     )
   fi
 

@@ -36,7 +36,7 @@ using filter_search_io::VecFileInfo;
 
 namespace {
 
-constexpr bool kMeasureInSearchStats = false;
+constexpr bool kMeasureInSearchStats = true;
 
 
 struct Args {
@@ -109,6 +109,7 @@ struct RunStats {
     uint64_t tb_submit_ns = 0;
     uint64_t tb_wait_ns = 0;
     uint64_t tb_wait_calls = 0;
+    uint64_t fid_submit_ns = 0;
     uint64_t fid_wait_ns = 0;
     uint64_t fid_wait_calls = 0;
     uint64_t level0_expansions = 0;
@@ -123,6 +124,10 @@ struct RunStats {
     uint64_t ensure_free_slot_wait_calls = 0;
     uint64_t ensure_free_slot_wait_slots = 0;
     uint64_t ensure_free_slot_wait_ns = 0;
+
+    uint64_t upper_layer_time_ns = 0;
+    uint64_t fid_decomp_expansions = 0;
+    uint64_t dist_calc_fid_expan_ns = 0;
 
     size_t returned_results = 0;
     size_t selectivity_count = 0;
@@ -156,9 +161,13 @@ struct SearchCallStats {
     uint64_t tb_submit_ns = 0;
     uint64_t tb_wait_ns = 0;
     uint64_t tb_wait_calls = 0;
+    uint64_t fid_submit_ns = 0;
     uint64_t fid_wait_ns = 0;
     uint64_t fid_wait_calls = 0;
     uint64_t level0_expansions = 0;
+    uint64_t upper_layer_time_ns = 0;
+    uint64_t fid_decomp_expansions = 0;
+    uint64_t dist_calc_fid_expan_ns = 0;
 };
 
 struct CompressionStats {
@@ -1809,6 +1818,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
     if (kMeasureInSearchStats) call_stats->tb_submit_ns += static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(tb_submit_end - tb_submit_start).count());
 
+    const auto upper_layer_start = std::chrono::steady_clock::now();
     for (int level = index.maxlevel_; level > 0; --level) {
         bool changed = true;
         while (changed) {
@@ -1832,6 +1842,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
             }
         }
     }
+    call_stats->upper_layer_time_ns += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - upper_layer_start).count());
 
     hnswlib::VisitedList* vl = index.visited_list_pool_->getFreeVisitedList();
     hnswlib::vl_type* visited = vl->mass;
@@ -1875,6 +1888,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
         if (pending_fid_blocks_to_submit.empty()) {
             return;
         }
+        const auto fid_submit_start = std::chrono::steady_clock::now();
         for (size_t fid_block_id : pending_fid_blocks_to_submit) {
             if (fid_block_id >= pending_fid_block_marks.size()) {
                 continue;
@@ -1884,6 +1898,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 submit_fid_scan_job(ring, runtime, fid_block_id, cache, &call_stats->decomp);
                 ++call_stats->fid_jobs_submitted;
             }
+        }
+        if (kMeasureInSearchStats) {
+            call_stats->fid_submit_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - fid_submit_start).count());
         }
         pending_fid_blocks_to_submit.clear();
     };
@@ -2069,14 +2088,25 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
         }
 
         // Stage 2: submit grouped FID range-scan jobs before distance calculation.
+        const uint64_t fid_jobs_before = call_stats->fid_jobs_submitted;
         submit_pending_fid_blocks();
+        const bool had_fid_jobs = (call_stats->fid_jobs_submitted > fid_jobs_before);
+        if (had_fid_jobs) {
+            ++call_stats->fid_decomp_expansions;
+        }
 
         // Stage 3: compute distances for all TB-passed neighbors.
+        const auto dist_start = std::chrono::steady_clock::now();
         for (FrontierCandidate& entry : frontier_candidates) {
             entry.dist = index.fstdistfunc_(
                 query_data,
                 index.getDataByInternalId(entry.candidate_id),
                 index.dist_func_param_);
+        }
+        if (had_fid_jobs) {
+            call_stats->dist_calc_fid_expan_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - dist_start).count());
         }
 
         // Stage 3.5: force all required FID blocks for this frontier to complete
@@ -2484,9 +2514,13 @@ RunStats run_search_typed(
         stats.tb_submit_ns += call_stats.tb_submit_ns;
         stats.tb_wait_ns += call_stats.tb_wait_ns;
         stats.tb_wait_calls += call_stats.tb_wait_calls;
+        stats.fid_submit_ns += call_stats.fid_submit_ns;
         stats.fid_wait_ns += call_stats.fid_wait_ns;
         stats.fid_wait_calls += call_stats.fid_wait_calls;
         stats.level0_expansions += call_stats.level0_expansions;
+        stats.upper_layer_time_ns += call_stats.upper_layer_time_ns;
+        stats.fid_decomp_expansions += call_stats.fid_decomp_expansions;
+        stats.dist_calc_fid_expan_ns += call_stats.dist_calc_fid_expan_ns;
         stats.search_loop_time_ns += query_search_ns;
 
         returned_results += result.size();
@@ -2722,6 +2756,7 @@ std::string build_summary(
     oss << "debug_tb_submit_ms: " << (static_cast<double>(stats.tb_submit_ns) / 1e6) << "\n";
     oss << "debug_tb_wait_ms: " << (static_cast<double>(stats.tb_wait_ns) / 1e6) << "\n";
     oss << "debug_tb_wait_calls: " << stats.tb_wait_calls << "\n";
+    oss << "debug_fid_submit_ms: " << (static_cast<double>(stats.fid_submit_ns) / 1e6) << "\n";
     oss << "debug_fid_wait_ms: " << (static_cast<double>(stats.fid_wait_ns) / 1e6) << "\n";
     oss << "debug_fid_wait_calls: " << stats.fid_wait_calls << "\n";
     oss << "debug_level0_expansions: " << stats.level0_expansions << "\n";
@@ -2739,6 +2774,13 @@ std::string build_summary(
     oss << "debug_ensure_free_slot_wait_slots: " << stats.ensure_free_slot_wait_slots << "\n";
     oss << "debug_ensure_free_slot_wait_ms: "
         << (static_cast<double>(stats.ensure_free_slot_wait_ns) / 1e6) << "\n";
+    oss << "upper_layer_time_ms: " << (static_cast<double>(stats.upper_layer_time_ns) / 1e6) << "\n";
+    oss << "avg_upper_layer_time_per_query_us: "
+        << (stats.query_count > 0 ? static_cast<double>(stats.upper_layer_time_ns) / 1e3 / static_cast<double>(stats.query_count) : 0.0) << "\n";
+    oss << "fid_decomp_expansions: " << stats.fid_decomp_expansions << "\n";
+    oss << "dist_calc_fid_expan_time_ms: " << (static_cast<double>(stats.dist_calc_fid_expan_ns) / 1e6) << "\n";
+    oss << "avg_dist_calc_fid_expan_us: "
+        << (stats.fid_decomp_expansions > 0 ? static_cast<double>(stats.dist_calc_fid_expan_ns) / 1e3 / static_cast<double>(stats.fid_decomp_expansions) : 0.0) << "\n";
 
     if (stats.queries_with_enns_lt_k > 0) {
         oss << "warning: filtering condition is too restrictive for k on "
