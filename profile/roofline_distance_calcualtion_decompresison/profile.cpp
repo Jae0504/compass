@@ -220,9 +220,9 @@ struct FidDataset {
 };
 
 static const std::vector<FidDataset> FID_DATASETS = {
-    {128,  "/storage/jykang5/fid_tb/n_filter_100/sift1m/sift1m_synthetic_id_bucket_fid.bin"},
-    {512,  "/storage/jykang5/fid_tb/laion/laion_original_width_fid.bin"},
-    {2048, "/storage/jykang5/fid_tb/hnm/hnm_department_name_fid.bin"},
+    {128,  "/home/jykang5/compass/dataset2/fid_tb/n_filter_100/sift1m/sift1m_synthetic_id_bucket_fid.bin"},
+    {512,  "/home/jykang5/compass/dataset2/fid_tb/laion/laion_original_width_fid.bin"},
+    {2048, "/home/jykang5/compass/dataset2/fid_tb/hnm/hnm_department_name_fid.bin"},
 };
 
 // Extract MAX_N random non-overlapping chunks of chunk_size bytes from fid_data.
@@ -614,7 +614,7 @@ static void bind_numa_node(int node) {
 // ============================================================
 
 int main(int argc, char* argv[]) {
-    std::string base_dir = "/storage/jykang5/compass_base_query";
+    std::string base_dir = "/home/jykang5/compass/dataset2/compass_base_query";
     std::string out_dir  = ".";
     int cpu_core  = 8;   // default: core 8
     int numa_node = 0;   // default: NUMA node 0

@@ -20,8 +20,10 @@ DIST_DIR="$(cd "$SCRIPT_DIR/../roofline_distance_calcualtion_decompresison" && p
 CFG_DIR="$ROOT_DIR/scripts/iaa"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-DIM=128
 ENGINES=(1 2 4 8)
+CHUNK_128=65536
+CHUNK_512=262144
+CHUNK_2048=262144
 CPU_CORE=8
 NUMA_NODE=0
 
@@ -42,8 +44,10 @@ BASE_DIR="/home/jykang5/compass/dataset2/compass_base_query"
 # ── Argument parsing ───────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dim)         DIM="$2";                  shift 2 ;;
     --engines)     read -ra ENGINES <<< "$2"; shift 2 ;;
+    --chunk-128)   CHUNK_128="$2";            shift 2 ;;
+    --chunk-512)   CHUNK_512="$2";            shift 2 ;;
+    --chunk-2048)  CHUNK_2048="$2";           shift 2 ;;
     --skip-bench)  SKIP_BENCH=1;              shift   ;;
     --skip-dist)   SKIP_DIST=1;               shift   ;;
     --out-dir)     OUT_DIR="$2";              shift 2 ;;
@@ -125,10 +129,12 @@ else
 fi
 
 # ── Step 3: plot ──────────────────────────────────────────────────────────────
-echo "[3/3] Plotting roofline (dim=$DIM)"
+echo "[3/3] Plotting roofline"
 python3 "$PLOT_PY" \
-  --dim      "$DIM" \
-  --out-dir  "$OUT_DIR" \
-  --dist-csv "$DIST_CSV"
+  --out-dir    "$OUT_DIR" \
+  --dist-csv   "$DIST_CSV" \
+  --chunk-128  "$CHUNK_128" \
+  --chunk-512  "$CHUNK_512" \
+  --chunk-2048 "$CHUNK_2048"
 
-echo "Done. Output: $OUT_DIR/roofline_dim${DIM}.png"
+echo "Done. Output: $OUT_DIR/roofline_dims.png"
