@@ -4,5 +4,6 @@ graph_filter_exp/
 *.run
 *.png
 *,svg
+*.csv
 __pycache__/
 *out*/
