@@ -1225,6 +1225,14 @@ public:
         wait_oldest(1);
     }
 
+    uint64_t wait_one_wait_ns_only() {
+        return wait_oldest_wait_ns_only(1);
+    }
+
+    uint64_t flush_wait_ns_only() {
+        return wait_oldest_wait_ns_only(pending_slots_.size());
+    }
+
     bool wait_token(JobToken token) {
         if (token == 0) {
             return false;
@@ -1354,6 +1362,29 @@ private:
 
             complete_slot(slot_id);
         }
+    }
+
+    uint64_t wait_oldest_wait_ns_only(size_t count) {
+        const size_t wait_count = std::min(count, pending_slots_.size());
+        uint64_t wait_ns_total = 0;
+        for (size_t i = 0; i < wait_count; ++i) {
+            const size_t slot_id = pending_slots_.front();
+            pending_slots_.pop_front();
+            Slot& slot = slots_[slot_id];
+
+            const auto wait_start = std::chrono::steady_clock::now();
+            const qpl_status wait_status = qpl_wait_job(slot.job);
+            const auto wait_end = std::chrono::steady_clock::now();
+            if (wait_status != QPL_STS_OK) {
+                throw std::runtime_error(
+                    "AsyncJobRing: qpl_wait_job failed with status " +
+                    std::to_string(static_cast<int>(wait_status)));
+            }
+            wait_ns_total += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count());
+            complete_slot(slot_id);
+        }
+        return wait_ns_total;
     }
 
     void complete_slot(size_t slot_id) {
@@ -1629,12 +1660,8 @@ bool fid_match_node(
             throw std::runtime_error(
                 "FID block is not ready and no pending async jobs exist");
         }
-        const auto fid_wait_start = std::chrono::steady_clock::now();
-        ring->wait_one();
-        const auto fid_wait_end = std::chrono::steady_clock::now();
+        const uint64_t wait_ns = ring->wait_one_wait_ns_only();
         if (call_stats != nullptr) {
-            const uint64_t wait_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(fid_wait_end - fid_wait_start).count());
             call_stats->fid_wait_ns += wait_ns;
             call_stats->iaa_fid_wait_no_flush_ns += wait_ns;
             ++call_stats->fid_wait_calls;
@@ -2011,11 +2038,8 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
             throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
         }
         const uint64_t tb_wait_ops = static_cast<uint64_t>(cache->tb_jobs_pending);
-        const auto tb_wait_start = std::chrono::steady_clock::now();
-        ring->flush();
-        const auto tb_wait_end = std::chrono::steady_clock::now();
-        if (kMeasureInSearchStats) call_stats->tb_wait_ns += static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(tb_wait_end - tb_wait_start).count());
+        const uint64_t tb_wait_ns = ring->flush_wait_ns_only();
+        if (kMeasureInSearchStats) call_stats->tb_wait_ns += tb_wait_ns;
         if (kMeasureInSearchStats) call_stats->tb_wait_calls += tb_wait_ops;
         if (cache->tb_query_mask_ready == 0) {
             throw std::runtime_error("TB query mask is still not ready after flush");
@@ -2042,24 +2066,22 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 if (!ring->has_pending()) {
                     break;
                 }
-                const auto fid_wait_start = std::chrono::steady_clock::now();
-                ring->wait_one();
-                if (kMeasureInSearchStats) {
-                    call_stats->iaa_fid_wait_no_flush_ns += static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - fid_wait_start).count());
+                {
+                    const uint64_t wait_ns = ring->wait_one_wait_ns_only();
+                    if (kMeasureInSearchStats) {
+                        call_stats->iaa_fid_wait_no_flush_ns += wait_ns;
+                    }
                 }
                 poll_ready_jobs();
                 retry_temp_buffer_once();
                 continue;
             }
             if (ring->has_pending()) {
-                const auto fid_wait_start = std::chrono::steady_clock::now();
-                ring->wait_one();
-                if (kMeasureInSearchStats) {
-                    call_stats->iaa_fid_wait_no_flush_ns += static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - fid_wait_start).count());
+                {
+                    const uint64_t wait_ns = ring->wait_one_wait_ns_only();
+                    if (kMeasureInSearchStats) {
+                        call_stats->iaa_fid_wait_no_flush_ns += wait_ns;
+                    }
                 }
                 poll_ready_jobs();
                 retry_temp_buffer_once();
@@ -2080,12 +2102,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                 break;
             }
             if (ring->has_pending()) {
-                const auto fid_wait_start = std::chrono::steady_clock::now();
-                ring->wait_one();
-                if (kMeasureInSearchStats) {
-                    call_stats->iaa_fid_wait_no_flush_ns += static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - fid_wait_start).count());
+                {
+                    const uint64_t wait_ns = ring->wait_one_wait_ns_only();
+                    if (kMeasureInSearchStats) {
+                        call_stats->iaa_fid_wait_no_flush_ns += wait_ns;
+                    }
                 }
                 poll_ready_jobs();
                 retry_temp_buffer_once();
@@ -2191,14 +2212,12 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
                     throw std::runtime_error(
                         "FID block is not ready before candidate update and no pending async jobs exist");
                 }
-                const auto fid_wait_start = std::chrono::steady_clock::now();
-                ring->wait_one();
-                const auto fid_wait_end = std::chrono::steady_clock::now();
-                const uint64_t wait_ns = static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(fid_wait_end - fid_wait_start).count());
-                call_stats->fid_wait_ns += wait_ns;
-                call_stats->iaa_fid_wait_no_flush_ns += wait_ns;
-                ++call_stats->fid_wait_calls;
+                {
+                    const uint64_t wait_ns = ring->wait_one_wait_ns_only();
+                    call_stats->fid_wait_ns += wait_ns;
+                    call_stats->iaa_fid_wait_no_flush_ns += wait_ns;
+                    ++call_stats->fid_wait_calls;
+                }
                 poll_ready_jobs();
             }
         }
@@ -2240,12 +2259,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_range_filter
         // Keep pruning effective: if no accepted result exists yet, wait for at least one
         // FID completion to avoid over-expanding candidate_set with lower_bound=inf.
         if (top_candidates.empty() && !temp_result_buffer.empty() && ring->has_pending()) {
-            const auto fid_wait_start = std::chrono::steady_clock::now();
-            ring->wait_one();
-            if (kMeasureInSearchStats) {
-                call_stats->iaa_fid_wait_no_flush_ns += static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - fid_wait_start).count());
+            {
+                const uint64_t wait_ns = ring->wait_one_wait_ns_only();
+                if (kMeasureInSearchStats) {
+                    call_stats->iaa_fid_wait_no_flush_ns += wait_ns;
+                }
             }
             poll_ready_jobs();
             retry_temp_buffer_once();

@@ -1154,12 +1154,9 @@ bool fid_match_node(
             throw std::runtime_error(
                 "FID block is not ready and no pending async jobs exist");
         }
-        const auto wait_start = std::chrono::steady_clock::now();
-        ring->wait_one();
+        const uint64_t wait_ns = ring->wait_one_wait_ns_only();
         if (fid_wait_ns != nullptr) {
-            *fid_wait_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - wait_start).count());
+            *fid_wait_ns += wait_ns;
         }
     }
     if (metrics != nullptr) {
@@ -1557,22 +1554,20 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                 if (!ring->has_pending()) {
                     break;
                 }
-                const auto fid_wait_start = std::chrono::steady_clock::now();
-                ring->wait_one();
-                if (kMeasureInSearchStats) {
-                    call_stats->iaa_fid_wait_ns += static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - fid_wait_start).count());
+                {
+                    const uint64_t wait_ns = ring->wait_one_wait_ns_only();
+                    if (kMeasureInSearchStats) {
+                        call_stats->iaa_fid_wait_ns += wait_ns;
+                    }
                 }
                 continue;
             }
             if (ring->has_pending()) {
-                const auto fid_wait_start = std::chrono::steady_clock::now();
-                ring->wait_one();
-                if (kMeasureInSearchStats) {
-                    call_stats->iaa_fid_wait_ns += static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - fid_wait_start).count());
+                {
+                    const uint64_t wait_ns = ring->wait_one_wait_ns_only();
+                    if (kMeasureInSearchStats) {
+                        call_stats->iaa_fid_wait_ns += wait_ns;
+                    }
                 }
                 continue;
             }
@@ -1603,12 +1598,11 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_eq_filter(
                 break;
             }
             if (ring->has_pending()) {
-                const auto fid_wait_start = std::chrono::steady_clock::now();
-                ring->wait_one();
-                if (kMeasureInSearchStats) {
-                    call_stats->iaa_fid_wait_ns += static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - fid_wait_start).count());
+                {
+                    const uint64_t wait_ns = ring->wait_one_wait_ns_only();
+                    if (kMeasureInSearchStats) {
+                        call_stats->iaa_fid_wait_ns += wait_ns;
+                    }
                 }
                 continue;
             }

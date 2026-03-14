@@ -707,6 +707,10 @@ public:
         wait_oldest(1);
     }
 
+    uint64_t wait_one_wait_ns_only() {
+        return wait_oldest_wait_ns_only(1);
+    }
+
     bool has_pending() const {
         return !pending_slots_.empty();
     }
@@ -767,6 +771,29 @@ private:
             }
             complete_slot(slot_id);
         }
+    }
+
+    uint64_t wait_oldest_wait_ns_only(size_t count) {
+        const size_t wait_count = std::min(count, pending_slots_.size());
+        uint64_t wait_ns_total = 0;
+        for (size_t i = 0; i < wait_count; ++i) {
+            const size_t slot_id = pending_slots_.front();
+            pending_slots_.pop_front();
+            Slot& slot = slots_[slot_id];
+
+            const auto wait_start = std::chrono::steady_clock::now();
+            const qpl_status wait_status = qpl_wait_job(slot.job);
+            const auto wait_end = std::chrono::steady_clock::now();
+            if (wait_status != QPL_STS_OK) {
+                throw std::runtime_error(
+                    "AsyncJobRing: qpl_wait_job failed with status " +
+                    std::to_string(static_cast<int>(wait_status)));
+            }
+            wait_ns_total += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count());
+            complete_slot(slot_id);
+        }
+        return wait_ns_total;
     }
 
     void complete_slot(size_t slot_id) {
@@ -1501,11 +1528,7 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
                 throw std::runtime_error("TB query mask is not ready and no pending async jobs exist");
             }
             if (kMeasureInSearchStats) ++call_stats->job_wait_calls;
-            const auto wait_start = std::chrono::steady_clock::now();
-            ring->wait_one();
-            const uint64_t wait_ns = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - wait_start).count());
+            const uint64_t wait_ns = ring->wait_one_wait_ns_only();
             if (kMeasureInSearchStats) call_stats->tb_prefetch_wait_ns += wait_ns;
             if (kMeasureInSearchStats) call_stats->tb_wait_time_ns += wait_ns;
         }
@@ -1559,12 +1582,9 @@ std::vector<std::pair<DistT, hnswlib::labeltype>> search_with_async_multi_eq_fil
 
     auto wait_one_job = [&]() {
         if (kMeasureInSearchStats) ++call_stats->job_wait_calls;
-        const auto wait_start = std::chrono::steady_clock::now();
-        ring->wait_one();
+        const uint64_t wait_ns = ring->wait_one_wait_ns_only();
         if (kMeasureInSearchStats) {
-            call_stats->fid_wait_time_ns += static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - wait_start).count());
+            call_stats->fid_wait_time_ns += wait_ns;
         }
     };
 
