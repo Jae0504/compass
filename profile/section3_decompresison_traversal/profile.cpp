@@ -20,6 +20,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -106,8 +107,10 @@ struct CompressedMetadata {
 struct QueryTiming {
     uint64_t lz4_naive_ns = 0;
     uint64_t lz4_common_ns = 0;
+    uint64_t lz4_grouped_ns = 0;
     uint64_t deflate_naive_ns = 0;
     uint64_t deflate_common_ns = 0;
+    uint64_t deflate_grouped_ns = 0;
 
     uint64_t upper_traversal_ns = 0;
     uint64_t upper_distance_ns = 0;
@@ -554,8 +557,10 @@ QueryTiming profile_single_query(
         uint64_t loop_candidate_ns = 0;
         uint64_t loop_lz4_naive_ns = 0;
         uint64_t loop_lz4_common_ns = 0;
+        uint64_t loop_lz4_grouped_ns = 0;
         uint64_t loop_deflate_naive_ns = 0;
         uint64_t loop_deflate_common_ns = 0;
+        uint64_t loop_deflate_grouped_ns = 0;
 
         const auto loop_t0 = Clock::now();
 
@@ -572,13 +577,17 @@ QueryTiming profile_single_query(
             const auto loop_t1 = Clock::now();
             const uint64_t loop_total_ns = elapsed_ns(loop_t0, loop_t1);
             const uint64_t loop_decomp_ns = loop_lz4_naive_ns + loop_lz4_common_ns +
-                                            loop_deflate_naive_ns + loop_deflate_common_ns;
+                                            loop_lz4_grouped_ns +
+                                            loop_deflate_naive_ns + loop_deflate_common_ns +
+                                            loop_deflate_grouped_ns;
             qt.level0_distance_ns += loop_dist_ns;
             qt.candidate_update_ns += loop_candidate_ns;
             qt.lz4_naive_ns += loop_lz4_naive_ns;
             qt.lz4_common_ns += loop_lz4_common_ns;
+            qt.lz4_grouped_ns += loop_lz4_grouped_ns;
             qt.deflate_naive_ns += loop_deflate_naive_ns;
             qt.deflate_common_ns += loop_deflate_common_ns;
+            qt.deflate_grouped_ns += loop_deflate_grouped_ns;
             const uint64_t non_trav_ns = loop_dist_ns + loop_candidate_ns + loop_decomp_ns;
             qt.level0_traversal_ns += (loop_total_ns >= non_trav_ns) ? (loop_total_ns - non_trav_ns) : 0;
             break;
@@ -617,6 +626,23 @@ QueryTiming profile_single_query(
             loop_deflate_common_ns += decompress_deflate_block(cm, bid, deflate_scratch);
         }
 
+        // Grouped: group neighbors by block_id, decompress each block once.
+        // Includes the grouping overhead (building the map).
+        // If all neighbors fall in one block, only one decompression.
+        {
+            std::unordered_map<size_t, std::vector<hnswlib::tableint>> block_groups;
+            block_groups.reserve(unique_blocks.size());
+            for (size_t j = 1; j <= size; ++j) {
+                const hnswlib::tableint nid = static_cast<hnswlib::tableint>(*(data + j));
+                const size_t bid = block_id_for_node(static_cast<size_t>(nid), block_size, cm.num_blocks);
+                block_groups[bid].push_back(nid);
+            }
+            for (auto& [bid, _group] : block_groups) {
+                loop_lz4_grouped_ns += decompress_lz4_block(cm, bid, lz4_scratch);
+                loop_deflate_grouped_ns += decompress_deflate_block(cm, bid, deflate_scratch);
+            }
+        }
+
         for (size_t j = 1; j <= size; ++j) {
             const hnswlib::tableint candidate_id = static_cast<hnswlib::tableint>(*(data + j));
 
@@ -651,14 +677,18 @@ QueryTiming profile_single_query(
         const auto loop_t1 = Clock::now();
         const uint64_t loop_total_ns = elapsed_ns(loop_t0, loop_t1);
         const uint64_t loop_decomp_ns = loop_lz4_naive_ns + loop_lz4_common_ns +
-                                        loop_deflate_naive_ns + loop_deflate_common_ns;
+                                        loop_lz4_grouped_ns +
+                                        loop_deflate_naive_ns + loop_deflate_common_ns +
+                                        loop_deflate_grouped_ns;
 
         qt.level0_distance_ns += loop_dist_ns;
         qt.candidate_update_ns += loop_candidate_ns;
         qt.lz4_naive_ns += loop_lz4_naive_ns;
         qt.lz4_common_ns += loop_lz4_common_ns;
+        qt.lz4_grouped_ns += loop_lz4_grouped_ns;
         qt.deflate_naive_ns += loop_deflate_naive_ns;
         qt.deflate_common_ns += loop_deflate_common_ns;
+        qt.deflate_grouped_ns += loop_deflate_grouped_ns;
 
         const uint64_t non_trav_ns = loop_dist_ns + loop_candidate_ns + loop_decomp_ns;
         qt.level0_traversal_ns += (loop_total_ns >= non_trav_ns) ? (loop_total_ns - non_trav_ns) : 0;
@@ -731,7 +761,9 @@ void write_log(const std::string& preferred_path, const AggregateTiming& agg) {
     out << "(1) naive_lz4_ns: " << agg.total.lz4_naive_ns << " (" << ns_to_ms(agg.total.lz4_naive_ns) << " ms)\n";
     out << "(1) naive_deflate_ns: " << agg.total.deflate_naive_ns << " (" << ns_to_ms(agg.total.deflate_naive_ns) << " ms)\n";
     out << "(2) common_lz4_ns: " << agg.total.lz4_common_ns << " (" << ns_to_ms(agg.total.lz4_common_ns) << " ms)\n";
-    out << "(2) common_deflate_ns: " << agg.total.deflate_common_ns << " (" << ns_to_ms(agg.total.deflate_common_ns) << " ms)\n\n";
+    out << "(2) common_deflate_ns: " << agg.total.deflate_common_ns << " (" << ns_to_ms(agg.total.deflate_common_ns) << " ms)\n";
+    out << "(2g) grouped_lz4_ns: " << agg.total.lz4_grouped_ns << " (" << ns_to_ms(agg.total.lz4_grouped_ns) << " ms)\n";
+    out << "(2g) grouped_deflate_ns: " << agg.total.deflate_grouped_ns << " (" << ns_to_ms(agg.total.deflate_grouped_ns) << " ms)\n\n";
 
     out << "[Totals - Traversal Pipeline]\n";
     out << "(3) graph_traversal_ns: " << traversal_ns << " (" << ns_to_ms(traversal_ns) << " ms)\n";
@@ -751,7 +783,9 @@ void write_log(const std::string& preferred_path, const AggregateTiming& agg) {
     out << "naive_lz4 / baseline_sum: " << pct(agg.total.lz4_naive_ns, baseline_ns) << "%\n";
     out << "naive_deflate / baseline_sum: " << pct(agg.total.deflate_naive_ns, baseline_ns) << "%\n";
     out << "common_lz4 / baseline_sum: " << pct(agg.total.lz4_common_ns, baseline_ns) << "%\n";
-    out << "common_deflate / baseline_sum: " << pct(agg.total.deflate_common_ns, baseline_ns) << "%\n\n";
+    out << "common_deflate / baseline_sum: " << pct(agg.total.deflate_common_ns, baseline_ns) << "%\n";
+    out << "grouped_lz4 / baseline_sum: " << pct(agg.total.lz4_grouped_ns, baseline_ns) << "%\n";
+    out << "grouped_deflate / baseline_sum: " << pct(agg.total.deflate_grouped_ns, baseline_ns) << "%\n\n";
 
     out << "[Traversal/Distance/Candidate Percentage of Baseline Sum]\n";
     out << "(3) graph_traversal_pct: " << pct(traversal_ns, baseline_ns) << "%\n";
@@ -765,6 +799,8 @@ void write_log(const std::string& preferred_path, const AggregateTiming& agg) {
     out << "(1) naive_deflate_ns_per_node: " << (agg.total.deflate_naive_ns / node_accesses) << "\n";
     out << "(2) common_lz4_ns_per_node: " << (agg.total.lz4_common_ns / node_accesses) << "\n";
     out << "(2) common_deflate_ns_per_node: " << (agg.total.deflate_common_ns / node_accesses) << "\n";
+    out << "(2g) grouped_lz4_ns_per_node: " << (agg.total.lz4_grouped_ns / node_accesses) << "\n";
+    out << "(2g) grouped_deflate_ns_per_node: " << (agg.total.deflate_grouped_ns / node_accesses) << "\n";
     out << "(3) graph_traversal_ns_per_node: " << (agg.total.level0_traversal_ns / node_accesses) << "\n";
     out << "(4) distance_calculation_ns_per_node: " << (agg.total.level0_distance_ns / node_accesses) << "\n";
     out << "(5) candidate_update_ns_per_node: " << (agg.total.candidate_update_ns / node_accesses) << "\n\n";
@@ -775,6 +811,8 @@ void write_log(const std::string& preferred_path, const AggregateTiming& agg) {
     out << "avg_naive_deflate_ns: " << (agg.total.deflate_naive_ns / q) << "\n";
     out << "avg_common_lz4_ns: " << (agg.total.lz4_common_ns / q) << "\n";
     out << "avg_common_deflate_ns: " << (agg.total.deflate_common_ns / q) << "\n";
+    out << "avg_grouped_lz4_ns: " << (agg.total.lz4_grouped_ns / q) << "\n";
+    out << "avg_grouped_deflate_ns: " << (agg.total.deflate_grouped_ns / q) << "\n";
     out << "avg_upper_traversal_ns: " << (agg.total.upper_traversal_ns / q) << "\n";
     out << "avg_level0_traversal_ns: " << (agg.total.level0_traversal_ns / q) << "\n";
     out << "avg_upper_distance_ns: " << (agg.total.upper_distance_ns / q) << "\n";
@@ -851,8 +889,10 @@ int main(int argc, char** argv) {
 
                 agg.total.lz4_naive_ns += qt.lz4_naive_ns;
                 agg.total.lz4_common_ns += qt.lz4_common_ns;
+                agg.total.lz4_grouped_ns += qt.lz4_grouped_ns;
                 agg.total.deflate_naive_ns += qt.deflate_naive_ns;
                 agg.total.deflate_common_ns += qt.deflate_common_ns;
+                agg.total.deflate_grouped_ns += qt.deflate_grouped_ns;
                 agg.total.upper_traversal_ns += qt.upper_traversal_ns;
                 agg.total.upper_distance_ns += qt.upper_distance_ns;
                 agg.total.level0_traversal_ns += qt.level0_traversal_ns;
@@ -921,8 +961,10 @@ int main(int argc, char** argv) {
 
                 agg.total.lz4_naive_ns += qt.lz4_naive_ns;
                 agg.total.lz4_common_ns += qt.lz4_common_ns;
+                agg.total.lz4_grouped_ns += qt.lz4_grouped_ns;
                 agg.total.deflate_naive_ns += qt.deflate_naive_ns;
                 agg.total.deflate_common_ns += qt.deflate_common_ns;
+                agg.total.deflate_grouped_ns += qt.deflate_grouped_ns;
                 agg.total.upper_traversal_ns += qt.upper_traversal_ns;
                 agg.total.upper_distance_ns += qt.upper_distance_ns;
                 agg.total.level0_traversal_ns += qt.level0_traversal_ns;

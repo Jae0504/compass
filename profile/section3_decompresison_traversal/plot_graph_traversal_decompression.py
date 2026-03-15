@@ -93,90 +93,43 @@ def _try_plot_matplotlib(
         "candidate": "#47D45A",
     }
 
-    # Break: bottom panel 0–0.1
-    #        top panel: up to max deflate value
-    #        jump character drawn on y-axis between the two panels.
-    bottom_max = 0.105
-    max_deflate = max(common_deflate) if common_deflate else 1.0
-    top_min    = max_deflate * 0.88
-    top_max    = max_deflate * 1.05
-
-    # Taller bottom panel (more data range) than top panel.
-    fig = plt.figure(figsize=(16.0 / 2.54, 4.5 / 2.54))
-    gs = fig.add_gridspec(2, 1, height_ratios=[1, 2], hspace=0.0)
-    ax_top    = fig.add_subplot(gs[0])
-    ax_bottom = fig.add_subplot(gs[1], sharex=ax_top)
+    fig, ax = plt.subplots(figsize=(16.0 / 2.54, 4.5 / 2.54))
 
     stack_x   = [v - 1 * w for v in x]
     lz4_x     = [v + 0 * w for v in x]
     deflate_x = [v + 1 * w for v in x]
 
-    def draw_bars(ax, with_legend: bool) -> None:
-        trav_bottom = [dist[i] for i in range(len(dist))]
-        cand_bottom = [dist[i] + trav[i] for i in range(len(dist))]
-        ax.bar(stack_x,   dist,            width=w, bottom=0,           label="Dist. Calc."  if with_legend else "_nolegend_", color=colors["distance"])
-        ax.bar(stack_x,   trav,            width=w, bottom=trav_bottom, label="Graph Trav."  if with_legend else "_nolegend_", color=colors["traversal"])
-        ax.bar(stack_x,   cand,            width=w, bottom=cand_bottom, label="Cand. Update" if with_legend else "_nolegend_", color=colors["candidate"])
-        ax.bar(lz4_x,     common_lz4,     width=w, bottom=0,           label="(D) LZ4"      if with_legend else "_nolegend_", color=colors["common_lz4"])
-        ax.bar(deflate_x, common_deflate, width=w, bottom=0,           label="(D) Deflate"  if with_legend else "_nolegend_", color=colors["common_deflate"])
+    trav_bottom = [dist[i] for i in range(len(dist))]
+    cand_bottom = [dist[i] + trav[i] for i in range(len(dist))]
+    ax.bar(stack_x,   dist,            width=w, bottom=0,           label="Dist. Calc.",  color=colors["distance"])
+    ax.bar(stack_x,   trav,            width=w, bottom=trav_bottom, label="Graph Trav.",  color=colors["traversal"])
+    ax.bar(stack_x,   cand,            width=w, bottom=cand_bottom, label="Cand. Update", color=colors["candidate"])
+    ax.bar(lz4_x,     common_lz4,     width=w, bottom=0,           label="(D) LZ4",      color=colors["common_lz4"])
+    ax.bar(deflate_x, common_deflate, width=w, bottom=0,           label="(D) Deflate",  color=colors["common_deflate"])
 
-    draw_bars(ax_bottom, with_legend=True)
-    draw_bars(ax_top,    with_legend=False)
+    ax.set_yscale("log")
 
-    ax_bottom.set_ylim(0.0, bottom_max)
-    ax_top.set_ylim(top_min, top_max)
-
-    # Y-ticks.
-    fmt = FuncFormatter(lambda val, _: f"{val:.1f}")
-    ax_bottom.set_yticks([0.0, 0.1])
-    ax_bottom.yaxis.set_major_formatter(fmt)
-    ax_bottom.yaxis.set_minor_locator(AutoMinorLocator(5))
-    ax_bottom.tick_params(axis="y", which="minor", left=False, right=False, labelleft=False)
-    # Round max deflate to nearest 0.5 for a clean tick
-    deflate_tick = round(max_deflate * 2) / 2
-    ax_top.set_yticks([deflate_tick])
-    ax_top.yaxis.set_major_formatter(fmt)
-    ax_top.tick_params(axis="y", which="minor", left=False, right=False, labelleft=False)
+    # Y-axis range: pad below smallest bar, above tallest bar
+    all_vals = common_lz4 + common_deflate + [dist[i] + trav[i] + cand[i] for i in range(len(dist))]
+    y_lo = min(v for v in all_vals if v > 0) * 0.5
+    y_hi = max(all_vals) * 2.0
+    ax.set_ylim(y_lo, y_hi)
 
     # X labels and axis titles.
-    ax_bottom.set_xticks(x)
-    ax_bottom.set_xticklabels(bench_names)
-    ax_top.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
-    ax_bottom.set_xlabel("Benchmark", labelpad=-1, fontsize=12, fontweight="bold", fontfamily="Arial")
-    fig.text(0.02, 0.50, "Latency (ms)", rotation=90, va="center", ha="center",
-             fontsize=12, fontweight="bold", fontfamily="Arial")
+    ax.set_xticks(x)
+    ax.set_xticklabels(bench_names)
+    ax.set_xlabel("Benchmark", labelpad=-1, fontsize=12, fontweight="bold", fontfamily="Arial")
+    ax.set_ylabel("Latency (ms)", fontsize=12, fontweight="bold", fontfamily="Arial", labelpad=2)
 
     # Styling.
-    for axis in (ax_top, ax_bottom):
-        for label in axis.get_xticklabels() + axis.get_yticklabels():
-            label.set_fontweight("bold")
-        axis.grid(axis="y", which="major", linestyle=":", alpha=0.35, linewidth=1.0)
-        axis.grid(axis="y", which="minor", linestyle=":", alpha=0.22, linewidth=0.8)
-
-    # # White break stripe on bars — at the same data y as the two slashes.
-    # stripe_y_data = (top_min + top_max) / 2   # matches y_mid in figure coords
-    # stripe_h_data = (top_max - top_min) * 0.03
-    # all_bar_x   = stack_x + lz4_x + deflate_x
-    # all_bar_vals = (
-    #     [dist[i] + trav[i] + cand[i] for i in range(len(dist))]
-    #     + list(common_lz4)
-    #     + list(common_deflate)
-    # )
-    # for bx, val in zip(all_bar_x, all_bar_vals):
-    #     if val >= top_min:   # bar reaches into the top panel
-    #         ax_top.add_patch(plt.Rectangle(
-    #             (bx - w / 2, stripe_y_data - stripe_h_data),
-    #             w, stripe_h_data * 2,
-    #             color="white", zorder=5, clip_on=True, transform=ax_top.transData,
-    #         ))
-
-    # Broken-axis spines.
-    ax_top.spines["bottom"].set_visible(False)
-    ax_bottom.spines["top"].set_visible(False)
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        label.set_fontweight("bold")
+    ax.grid(axis="y", which="major", linestyle=":", alpha=0.35, linewidth=1.0)
+    ax.grid(axis="y", which="minor", linestyle=":", alpha=0.22, linewidth=0.8)
 
     # Legend.
     legend_order = ["Graph Trav.", "Dist. Calc.", "Cand. Update", "(D) LZ4", "(D) Deflate"]
-    handles, labels = ax_bottom.get_legend_handles_labels()
+    handles, labels = ax.get_legend_handles_labels()
     label_to_handle = {lbl: h for h, lbl in zip(handles, labels)}
     ordered_handles = [label_to_handle[l] for l in legend_order if l in label_to_handle]
     ordered_labels  = [l for l in legend_order if l in label_to_handle]
@@ -189,22 +142,7 @@ def _try_plot_matplotlib(
     )
 
     fig.subplots_adjust(left=0.095, right=0.995, bottom=0.19, top=0.868)
-    ax_bottom.tick_params(axis="x", pad=1)
-
-    # Zigzag (double-slash) jump markers on the y-axis — drawn once at the seam.
-    fig.canvas.draw()
-    dw, dh = 0.018, 0.014
-    lkw = dict(transform=fig.transFigure, color="k", clip_on=False,
-               linewidth=1.0, solid_capstyle="round")
-    bbox_top = ax_top.get_position()
-    y_mid  = (bbox_top.y0 + bbox_top.y1) / 2   # middle of the top panel
-    x0 = bbox_top.x0
-    # for shift_x in (-dw * 0.3, dw * 0.3):
-    #     fig.add_artist(plt.Line2D(
-    #         [x0 + shift_x - dw / 2, x0 + shift_x + dw / 2],
-    #         [y_mid - dh / 2,         y_mid + dh / 2],
-    #         **lkw,
-    #     ))
+    ax.tick_params(axis="x", pad=1)
 
     fig.savefig(out_path, dpi=200)
     return True

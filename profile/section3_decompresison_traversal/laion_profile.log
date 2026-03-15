@@ -12,55 +12,63 @@ ef_search_effective: 64
 block_size: 8192
 
 [Totals - Decompression]
-(1) naive_lz4_ns: 711703608 (711.703608 ms)
-(1) naive_deflate_ns: 9053531546 (9053.531546 ms)
-(2) common_lz4_ns: 532467636 (532.467636 ms)
-(2) common_deflate_ns: 7556794551 (7556.794551 ms)
+(1) naive_lz4_ns: 683536076 (683.536076 ms)
+(1) naive_deflate_ns: 9103566945 (9103.566945 ms)
+(2) common_lz4_ns: 528759780 (528.759780 ms)
+(2) common_deflate_ns: 7609884524 (7609.884524 ms)
+(2g) grouped_lz4_ns: 533433158 (533.433158 ms)
+(2g) grouped_deflate_ns: 7597175698 (7597.175698 ms)
 
 [Totals - Traversal Pipeline]
-(3) graph_traversal_ns: 35911783 (35.911783 ms)
-    upper_traversal_ns: 232814 (0.232814 ms)
-    level0_traversal_ns: 35678969 (35.678969 ms)
-(4) distance_calculation_ns: 185674809 (185.674809 ms)
-    upper_distance_ns: 5823538 (5.823538 ms)
-    level0_distance_ns: 179851271 (179.851271 ms)
-(5) candidate_update_ns: 2937522 (2.937522 ms)
-baseline_sum_ns=(3)+(4)+(5): 224524114 (224.524114 ms)
+(3) graph_traversal_ns: 67460417 (67.460417 ms)
+    upper_traversal_ns: 242418 (0.242418 ms)
+    level0_traversal_ns: 67217999 (67.217999 ms)
+(4) distance_calculation_ns: 205209298 (205.209298 ms)
+    upper_distance_ns: 6106538 (6.106538 ms)
+    level0_distance_ns: 199102760 (199.102760 ms)
+(5) candidate_update_ns: 3417854 (3.417854 ms)
+baseline_sum_ns=(3)+(4)+(5): 276087569 (276.087569 ms)
 
 [Node Access Counts]
 expanded_nodes_upper: 460
 expanded_nodes_level0: 6639
 
 [Portion of Decompression vs Baseline Sum]
-naive_lz4 / baseline_sum: 316.983150%
-naive_deflate / baseline_sum: 4032.320353%
-common_lz4 / baseline_sum: 237.153875%
-common_deflate / baseline_sum: 3365.693963%
+naive_lz4 / baseline_sum: 247.579447%
+naive_deflate / baseline_sum: 3297.347642%
+common_lz4 / baseline_sum: 191.518866%
+common_deflate / baseline_sum: 2756.330012%
+grouped_lz4 / baseline_sum: 193.211581%
+grouped_deflate / baseline_sum: 2751.726825%
 
 [Traversal/Distance/Candidate Percentage of Baseline Sum]
-(3) graph_traversal_pct: 15.994622%
-(4) distance_calculation_pct: 82.697046%
-(5) candidate_update_pct: 1.308333%
+(3) graph_traversal_pct: 24.434428%
+(4) distance_calculation_pct: 74.327612%
+(5) candidate_update_pct: 1.237960%
 
 [Per-Node Access Averages (Level-0)]
 node_access_denominator: 6639
-(1) naive_lz4_ns_per_node: 107200
-(1) naive_deflate_ns_per_node: 1363689
-(2) common_lz4_ns_per_node: 80202
-(2) common_deflate_ns_per_node: 1138242
-(3) graph_traversal_ns_per_node: 5374
-(4) distance_calculation_ns_per_node: 27090
-(5) candidate_update_ns_per_node: 442
+(1) naive_lz4_ns_per_node: 102957
+(1) naive_deflate_ns_per_node: 1371225
+(2) common_lz4_ns_per_node: 79644
+(2) common_deflate_ns_per_node: 1146239
+(2g) grouped_lz4_ns_per_node: 80348
+(2g) grouped_deflate_ns_per_node: 1144325
+(3) graph_traversal_ns_per_node: 10124
+(4) distance_calculation_ns_per_node: 29989
+(5) candidate_update_ns_per_node: 514
 
 [Per-Query Averages]
-avg_naive_lz4_ns: 7117036
-avg_naive_deflate_ns: 90535315
-avg_common_lz4_ns: 5324676
-avg_common_deflate_ns: 75567945
-avg_upper_traversal_ns: 2328
-avg_level0_traversal_ns: 356789
-avg_upper_distance_ns: 58235
-avg_level0_distance_ns: 1798512
-avg_candidate_update_ns: 29375
+avg_naive_lz4_ns: 6835360
+avg_naive_deflate_ns: 91035669
+avg_common_lz4_ns: 5287597
+avg_common_deflate_ns: 76098845
+avg_grouped_lz4_ns: 5334331
+avg_grouped_deflate_ns: 75971756
+avg_upper_traversal_ns: 2424
+avg_level0_traversal_ns: 672179
+avg_upper_distance_ns: 61065
+avg_level0_distance_ns: 1991027
+avg_candidate_update_ns: 34178
 avg_expanded_nodes_upper: 4
 avg_expanded_nodes_level0: 66
