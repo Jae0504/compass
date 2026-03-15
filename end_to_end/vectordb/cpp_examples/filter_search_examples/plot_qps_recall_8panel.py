@@ -49,7 +49,7 @@ DATASET_LAYOUT = [
     [("laion", "(c) LAION"), ("hnm", "(d) H&M")],
 ]
 FIG_W_CM = 33.0
-FIG_H_CM = 22.0
+FIG_H_CM = 18.0
 # 254 DPI = 100 px/cm exactly, so 33x24 cm maps to exactly 3300x2400 pixels.
 SAVE_DPI = 254
 
@@ -188,10 +188,10 @@ def add_pair_labels(fig, axes):
     bot_pair2_x = (axes[1][2].get_position().x0 + axes[1][3].get_position().x1) * 0.5
 
     # Pair-level Recall and dataset captions (a/b/c/d).
-    top_caption_y = top_left.y0 - 0.065
+    top_caption_y = top_left.y0 - 0.085
     top_recall_y = top_caption_y + 0.022
 
-    bottom_caption_y = max(0.02, bot_right.y0 - 0.065)
+    bottom_caption_y = max(0.02, bot_right.y0 - 0.085)
     bottom_recall_y = bottom_caption_y + 0.022
 
     fig.text(top_pair1_x, top_recall_y, "Recall", ha="center", va="center", fontweight="bold")
@@ -232,7 +232,7 @@ def build_legend(fig, all_series):
         handles,
         labels,
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.0),
+        bbox_to_anchor=(0.5, 1.02),
         ncol=max(1, min(len(labels), 6)),
         frameon=False,
     )
@@ -253,8 +253,8 @@ def plot_figure(dataset_series_map, output_path):
 
     gs = GridSpec(
         2, 4, figure=fig,
-        left=0.06, right=0.995, top=0.930, bottom=0.063,
-        wspace=0.25, hspace=0.34,
+        left=0.06, right=0.995, top=0.94, bottom=0.063,
+        wspace=0.25, hspace=0.45,
     )
     axes = np.array([[fig.add_subplot(gs[row, col]) for col in range(4)] for row in range(2)])
 
