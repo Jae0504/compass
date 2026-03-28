@@ -3,6 +3,7 @@
 
 #include <lz4.h>
 #include <zlib.h>
+#include "iaa_decomp.h"
 
 #include <algorithm>
 #include <array>
@@ -101,7 +102,9 @@ struct CompressedMetadata {
     std::vector<size_t> raw_block_sizes;
     std::vector<std::vector<char>> lz4_blocks;
     std::vector<std::vector<uint8_t>> deflate_blocks;
+    std::vector<std::vector<uint8_t>> iaa_blocks;
     size_t num_blocks = 0;
+    bool iaa_available = false;
 };
 
 struct QueryTiming {
@@ -111,6 +114,9 @@ struct QueryTiming {
     uint64_t deflate_naive_ns = 0;
     uint64_t deflate_common_ns = 0;
     uint64_t deflate_grouped_ns = 0;
+    uint64_t iaa_naive_ns = 0;
+    uint64_t iaa_common_ns = 0;
+    uint64_t iaa_grouped_ns = 0;
 
     uint64_t upper_traversal_ns = 0;
     uint64_t upper_distance_ns = 0;
@@ -393,6 +399,21 @@ CompressedMetadata compress_metadata_blocks(const std::vector<uint8_t>& metadata
         out.deflate_blocks[bid].resize(static_cast<size_t>(deflate_bound));
     }
 
+    // IAA (hardware deflate) compression — via separate compilation unit
+    // that uses the real QPL without conflicting with the hnswlib stub.
+    {
+        std::vector<const uint8_t*> ptrs(nblocks);
+        std::vector<uint32_t>       sizes(nblocks);
+        for (size_t bid = 0; bid < nblocks; ++bid) {
+            const size_t start = bid * block_size;
+            ptrs[bid]  = metadata.data() + start;
+            sizes[bid] = static_cast<uint32_t>(out.raw_block_sizes[bid]);
+        }
+        out.iaa_available = iaa_compress_blocks(ptrs, sizes, out.iaa_blocks);
+        if (!out.iaa_available)
+            std::cerr << "[warn] IAA hardware unavailable; IAA timings will be 0\n";
+    }
+
     return out;
 }
 
@@ -449,6 +470,18 @@ uint64_t decompress_deflate_block(
     return elapsed_ns(t0, t1);
 }
 
+uint64_t decompress_iaa_block(
+    const CompressedMetadata& cm,
+    size_t block_id,
+    std::vector<uint8_t>& scratch,
+    IaaDecompHandle* h) {
+    const size_t raw_len = cm.raw_block_sizes[block_id];
+    const auto& comp = cm.iaa_blocks[block_id];
+    return iaa_decomp_block(h,
+        comp.data(),   static_cast<uint32_t>(comp.size()),
+        scratch.data(),static_cast<uint32_t>(raw_len));
+}
+
 size_t block_id_for_node(size_t node_id, size_t block_size, size_t num_blocks) {
     // Hash-scatter: break HNSW neighbor locality so that nearby node IDs
     // land in different blocks, matching real large-dataset behavior.
@@ -466,6 +499,8 @@ QueryTiming profile_single_query(
     const CompressedMetadata& cm,
     std::vector<uint8_t>& lz4_scratch,
     std::vector<uint8_t>& deflate_scratch,
+    std::vector<uint8_t>& iaa_scratch,
+    IaaDecompHandle* iaa_job,
     size_t block_size) {
     QueryTiming qt;
 
@@ -561,6 +596,9 @@ QueryTiming profile_single_query(
         uint64_t loop_deflate_naive_ns = 0;
         uint64_t loop_deflate_common_ns = 0;
         uint64_t loop_deflate_grouped_ns = 0;
+        uint64_t loop_iaa_naive_ns = 0;
+        uint64_t loop_iaa_common_ns = 0;
+        uint64_t loop_iaa_grouped_ns = 0;
 
         const auto loop_t0 = Clock::now();
 
@@ -579,7 +617,9 @@ QueryTiming profile_single_query(
             const uint64_t loop_decomp_ns = loop_lz4_naive_ns + loop_lz4_common_ns +
                                             loop_lz4_grouped_ns +
                                             loop_deflate_naive_ns + loop_deflate_common_ns +
-                                            loop_deflate_grouped_ns;
+                                            loop_deflate_grouped_ns +
+                                            loop_iaa_naive_ns + loop_iaa_common_ns +
+                                            loop_iaa_grouped_ns;
             qt.level0_distance_ns += loop_dist_ns;
             qt.candidate_update_ns += loop_candidate_ns;
             qt.lz4_naive_ns += loop_lz4_naive_ns;
@@ -588,6 +628,9 @@ QueryTiming profile_single_query(
             qt.deflate_naive_ns += loop_deflate_naive_ns;
             qt.deflate_common_ns += loop_deflate_common_ns;
             qt.deflate_grouped_ns += loop_deflate_grouped_ns;
+            qt.iaa_naive_ns += loop_iaa_naive_ns;
+            qt.iaa_common_ns += loop_iaa_common_ns;
+            qt.iaa_grouped_ns += loop_iaa_grouped_ns;
             const uint64_t non_trav_ns = loop_dist_ns + loop_candidate_ns + loop_decomp_ns;
             qt.level0_traversal_ns += (loop_total_ns >= non_trav_ns) ? (loop_total_ns - non_trav_ns) : 0;
             break;
@@ -619,11 +662,15 @@ QueryTiming profile_single_query(
 
             loop_lz4_naive_ns += decompress_lz4_block(cm, bid, lz4_scratch);
             loop_deflate_naive_ns += decompress_deflate_block(cm, bid, deflate_scratch);
+            if (cm.iaa_available && iaa_job)
+                loop_iaa_naive_ns += decompress_iaa_block(cm, bid, iaa_scratch, iaa_job);
         }
 
         for (size_t bid : unique_blocks) {
             loop_lz4_common_ns += decompress_lz4_block(cm, bid, lz4_scratch);
             loop_deflate_common_ns += decompress_deflate_block(cm, bid, deflate_scratch);
+            if (cm.iaa_available && iaa_job)
+                loop_iaa_common_ns += decompress_iaa_block(cm, bid, iaa_scratch, iaa_job);
         }
 
         // Grouped: group neighbors by block_id, decompress each block once.
@@ -640,6 +687,8 @@ QueryTiming profile_single_query(
             for (auto& [bid, _group] : block_groups) {
                 loop_lz4_grouped_ns += decompress_lz4_block(cm, bid, lz4_scratch);
                 loop_deflate_grouped_ns += decompress_deflate_block(cm, bid, deflate_scratch);
+                if (cm.iaa_available && iaa_job)
+                    loop_iaa_grouped_ns += decompress_iaa_block(cm, bid, iaa_scratch, iaa_job);
             }
         }
 
@@ -679,7 +728,9 @@ QueryTiming profile_single_query(
         const uint64_t loop_decomp_ns = loop_lz4_naive_ns + loop_lz4_common_ns +
                                         loop_lz4_grouped_ns +
                                         loop_deflate_naive_ns + loop_deflate_common_ns +
-                                        loop_deflate_grouped_ns;
+                                        loop_deflate_grouped_ns +
+                                        loop_iaa_naive_ns + loop_iaa_common_ns +
+                                        loop_iaa_grouped_ns;
 
         qt.level0_distance_ns += loop_dist_ns;
         qt.candidate_update_ns += loop_candidate_ns;
@@ -689,6 +740,9 @@ QueryTiming profile_single_query(
         qt.deflate_naive_ns += loop_deflate_naive_ns;
         qt.deflate_common_ns += loop_deflate_common_ns;
         qt.deflate_grouped_ns += loop_deflate_grouped_ns;
+        qt.iaa_naive_ns += loop_iaa_naive_ns;
+        qt.iaa_common_ns += loop_iaa_common_ns;
+        qt.iaa_grouped_ns += loop_iaa_grouped_ns;
 
         const uint64_t non_trav_ns = loop_dist_ns + loop_candidate_ns + loop_decomp_ns;
         qt.level0_traversal_ns += (loop_total_ns >= non_trav_ns) ? (loop_total_ns - non_trav_ns) : 0;
@@ -760,10 +814,13 @@ void write_log(const std::string& preferred_path, const AggregateTiming& agg) {
     out << "[Totals - Decompression]\n";
     out << "(1) naive_lz4_ns: " << agg.total.lz4_naive_ns << " (" << ns_to_ms(agg.total.lz4_naive_ns) << " ms)\n";
     out << "(1) naive_deflate_ns: " << agg.total.deflate_naive_ns << " (" << ns_to_ms(agg.total.deflate_naive_ns) << " ms)\n";
+    out << "(1) naive_iaa_ns: " << agg.total.iaa_naive_ns << " (" << ns_to_ms(agg.total.iaa_naive_ns) << " ms)\n";
     out << "(2) common_lz4_ns: " << agg.total.lz4_common_ns << " (" << ns_to_ms(agg.total.lz4_common_ns) << " ms)\n";
     out << "(2) common_deflate_ns: " << agg.total.deflate_common_ns << " (" << ns_to_ms(agg.total.deflate_common_ns) << " ms)\n";
+    out << "(2) common_iaa_ns: " << agg.total.iaa_common_ns << " (" << ns_to_ms(agg.total.iaa_common_ns) << " ms)\n";
     out << "(2g) grouped_lz4_ns: " << agg.total.lz4_grouped_ns << " (" << ns_to_ms(agg.total.lz4_grouped_ns) << " ms)\n";
-    out << "(2g) grouped_deflate_ns: " << agg.total.deflate_grouped_ns << " (" << ns_to_ms(agg.total.deflate_grouped_ns) << " ms)\n\n";
+    out << "(2g) grouped_deflate_ns: " << agg.total.deflate_grouped_ns << " (" << ns_to_ms(agg.total.deflate_grouped_ns) << " ms)\n";
+    out << "(2g) grouped_iaa_ns: " << agg.total.iaa_grouped_ns << " (" << ns_to_ms(agg.total.iaa_grouped_ns) << " ms)\n\n";
 
     out << "[Totals - Traversal Pipeline]\n";
     out << "(3) graph_traversal_ns: " << traversal_ns << " (" << ns_to_ms(traversal_ns) << " ms)\n";
@@ -782,10 +839,13 @@ void write_log(const std::string& preferred_path, const AggregateTiming& agg) {
     out << "[Portion of Decompression vs Baseline Sum]\n";
     out << "naive_lz4 / baseline_sum: " << pct(agg.total.lz4_naive_ns, baseline_ns) << "%\n";
     out << "naive_deflate / baseline_sum: " << pct(agg.total.deflate_naive_ns, baseline_ns) << "%\n";
+    out << "naive_iaa / baseline_sum: " << pct(agg.total.iaa_naive_ns, baseline_ns) << "%\n";
     out << "common_lz4 / baseline_sum: " << pct(agg.total.lz4_common_ns, baseline_ns) << "%\n";
     out << "common_deflate / baseline_sum: " << pct(agg.total.deflate_common_ns, baseline_ns) << "%\n";
+    out << "common_iaa / baseline_sum: " << pct(agg.total.iaa_common_ns, baseline_ns) << "%\n";
     out << "grouped_lz4 / baseline_sum: " << pct(agg.total.lz4_grouped_ns, baseline_ns) << "%\n";
-    out << "grouped_deflate / baseline_sum: " << pct(agg.total.deflate_grouped_ns, baseline_ns) << "%\n\n";
+    out << "grouped_deflate / baseline_sum: " << pct(agg.total.deflate_grouped_ns, baseline_ns) << "%\n";
+    out << "grouped_iaa / baseline_sum: " << pct(agg.total.iaa_grouped_ns, baseline_ns) << "%\n\n";
 
     out << "[Traversal/Distance/Candidate Percentage of Baseline Sum]\n";
     out << "(3) graph_traversal_pct: " << pct(traversal_ns, baseline_ns) << "%\n";
@@ -797,10 +857,13 @@ void write_log(const std::string& preferred_path, const AggregateTiming& agg) {
     out << "node_access_denominator: " << agg.total.expanded_nodes_level0 << "\n";
     out << "(1) naive_lz4_ns_per_node: " << (agg.total.lz4_naive_ns / node_accesses) << "\n";
     out << "(1) naive_deflate_ns_per_node: " << (agg.total.deflate_naive_ns / node_accesses) << "\n";
+    out << "(1) naive_iaa_ns_per_node: " << (agg.total.iaa_naive_ns / node_accesses) << "\n";
     out << "(2) common_lz4_ns_per_node: " << (agg.total.lz4_common_ns / node_accesses) << "\n";
     out << "(2) common_deflate_ns_per_node: " << (agg.total.deflate_common_ns / node_accesses) << "\n";
+    out << "(2) common_iaa_ns_per_node: " << (agg.total.iaa_common_ns / node_accesses) << "\n";
     out << "(2g) grouped_lz4_ns_per_node: " << (agg.total.lz4_grouped_ns / node_accesses) << "\n";
     out << "(2g) grouped_deflate_ns_per_node: " << (agg.total.deflate_grouped_ns / node_accesses) << "\n";
+    out << "(2g) grouped_iaa_ns_per_node: " << (agg.total.iaa_grouped_ns / node_accesses) << "\n";
     out << "(3) graph_traversal_ns_per_node: " << (agg.total.level0_traversal_ns / node_accesses) << "\n";
     out << "(4) distance_calculation_ns_per_node: " << (agg.total.level0_distance_ns / node_accesses) << "\n";
     out << "(5) candidate_update_ns_per_node: " << (agg.total.candidate_update_ns / node_accesses) << "\n\n";
@@ -809,10 +872,13 @@ void write_log(const std::string& preferred_path, const AggregateTiming& agg) {
     out << "[Per-Query Averages]\n";
     out << "avg_naive_lz4_ns: " << (agg.total.lz4_naive_ns / q) << "\n";
     out << "avg_naive_deflate_ns: " << (agg.total.deflate_naive_ns / q) << "\n";
+    out << "avg_naive_iaa_ns: " << (agg.total.iaa_naive_ns / q) << "\n";
     out << "avg_common_lz4_ns: " << (agg.total.lz4_common_ns / q) << "\n";
     out << "avg_common_deflate_ns: " << (agg.total.deflate_common_ns / q) << "\n";
+    out << "avg_common_iaa_ns: " << (agg.total.iaa_common_ns / q) << "\n";
     out << "avg_grouped_lz4_ns: " << (agg.total.lz4_grouped_ns / q) << "\n";
     out << "avg_grouped_deflate_ns: " << (agg.total.deflate_grouped_ns / q) << "\n";
+    out << "avg_grouped_iaa_ns: " << (agg.total.iaa_grouped_ns / q) << "\n";
     out << "avg_upper_traversal_ns: " << (agg.total.upper_traversal_ns / q) << "\n";
     out << "avg_level0_traversal_ns: " << (agg.total.level0_traversal_ns / q) << "\n";
     out << "avg_upper_distance_ns: " << (agg.total.upper_distance_ns / q) << "\n";
@@ -828,6 +894,11 @@ int main(int argc, char** argv) {
     try {
         const Args args = parse_args(argc, argv);
         AggregateTiming agg;
+
+        // Initialize IAA decompression handle (reused across all blocks).
+        IaaDecompHandle* iaa_djob = iaa_decomp_create();
+        if (!iaa_djob)
+            std::cerr << "[warn] IAA hardware not available; IAA timings will be 0\n";
 
         if (ends_with(args.query_path, ".fvecs")) {
             DenseFvecs queries = load_queries_fvecs(args.query_path);
@@ -874,6 +945,7 @@ int main(int argc, char** argv) {
 
             std::vector<uint8_t> lz4_scratch(args.block_size, 0);
             std::vector<uint8_t> deflate_scratch(args.block_size, 0);
+            std::vector<uint8_t> iaa_scratch(args.block_size, 0);
 
             for (size_t qid = 0; qid < queries_to_run; ++qid) {
                 const float* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
@@ -885,6 +957,8 @@ int main(int argc, char** argv) {
                     cm,
                     lz4_scratch,
                     deflate_scratch,
+                    iaa_scratch,
+                    iaa_djob,
                     args.block_size);
 
                 agg.total.lz4_naive_ns += qt.lz4_naive_ns;
@@ -893,6 +967,9 @@ int main(int argc, char** argv) {
                 agg.total.deflate_naive_ns += qt.deflate_naive_ns;
                 agg.total.deflate_common_ns += qt.deflate_common_ns;
                 agg.total.deflate_grouped_ns += qt.deflate_grouped_ns;
+                agg.total.iaa_naive_ns += qt.iaa_naive_ns;
+                agg.total.iaa_common_ns += qt.iaa_common_ns;
+                agg.total.iaa_grouped_ns += qt.iaa_grouped_ns;
                 agg.total.upper_traversal_ns += qt.upper_traversal_ns;
                 agg.total.upper_distance_ns += qt.upper_distance_ns;
                 agg.total.level0_traversal_ns += qt.level0_traversal_ns;
@@ -946,6 +1023,7 @@ int main(int argc, char** argv) {
 
             std::vector<uint8_t> lz4_scratch(args.block_size, 0);
             std::vector<uint8_t> deflate_scratch(args.block_size, 0);
+            std::vector<uint8_t> iaa_scratch(args.block_size, 0);
 
             for (size_t qid = 0; qid < queries_to_run; ++qid) {
                 const uint8_t* qptr = queries.values.data() + qid * static_cast<size_t>(queries.dim);
@@ -957,6 +1035,8 @@ int main(int argc, char** argv) {
                     cm,
                     lz4_scratch,
                     deflate_scratch,
+                    iaa_scratch,
+                    iaa_djob,
                     args.block_size);
 
                 agg.total.lz4_naive_ns += qt.lz4_naive_ns;
@@ -965,6 +1045,9 @@ int main(int argc, char** argv) {
                 agg.total.deflate_naive_ns += qt.deflate_naive_ns;
                 agg.total.deflate_common_ns += qt.deflate_common_ns;
                 agg.total.deflate_grouped_ns += qt.deflate_grouped_ns;
+                agg.total.iaa_naive_ns += qt.iaa_naive_ns;
+                agg.total.iaa_common_ns += qt.iaa_common_ns;
+                agg.total.iaa_grouped_ns += qt.iaa_grouped_ns;
                 agg.total.upper_traversal_ns += qt.upper_traversal_ns;
                 agg.total.upper_distance_ns += qt.upper_distance_ns;
                 agg.total.level0_traversal_ns += qt.level0_traversal_ns;
@@ -976,6 +1059,8 @@ int main(int argc, char** argv) {
         } else {
             throw std::runtime_error("query file must end with .fvecs or .bvecs");
         }
+
+        iaa_decomp_destroy(iaa_djob);
 
         const std::string preferred_log = args.log_out.empty()
             ? resolve_log_path()
